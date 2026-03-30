@@ -1,0 +1,48 @@
+# =============================================================================
+# Bonded .gitignore
+# =============================================================================
+
+# ----- Rust (server) -----
+server/target/
+**/*.rs.bk
+
+# ----- Flutter (client) -----
+client/.dart_tool/
+client/.packages
+client/.pub-cache/
+client/.pub/
+client/build/
+client/.flutter-plugins
+client/.flutter-plugins-dependencies
+client/android/.gradle/
+client/android/local.properties
+client/android/app/debug/
+client/android/app/profile/
+client/android/app/release/
+client/ios/Pods/
+client/ios/.symlinks/
+client/ios/Flutter/Flutter.framework
+client/ios/Flutter/Flutter.podspec
+client/macos/Pods/
+client/macos/Flutter/ephemeral/
+client/windows/flutter/ephemeral/
+
+# ----- IDE -----
+.idea/
+.vscode/settings.json
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ----- Environment -----
+.env
+.env.*
+!.env.example
+
+# ----- Docker -----
+docker-compose.override.yml
+
+# ----- OS -----
+*.log
