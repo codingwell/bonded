@@ -2,12 +2,14 @@ use std::path::PathBuf;
 
 mod auth_handshake;
 mod authorized_keys;
+mod health;
 mod invite_tokens;
 
 use auth_handshake::perform_auth_handshake;
 use authorized_keys::{AuthorizedKeysStore, AuthorizedKeysWatcher};
 use bonded_core::config::{load_server_config, ServerConfig, DEFAULT_SERVER_CONFIG_PATH};
 use clap::Parser;
+use health::run_health_server;
 use invite_tokens::ensure_startup_invite;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn, Level};
@@ -50,6 +52,13 @@ async fn main() -> anyhow::Result<()> {
         token = %invite.token,
         "startup invite token ready"
     );
+
+    let health_bind = cfg.server.health_bind.clone();
+    tokio::spawn(async move {
+        if let Err(err) = run_health_server(&health_bind).await {
+            error!(bind = %health_bind, error = %err, "health listener terminated");
+        }
+    });
 
     info!(bind = %cfg.server.bind, "bonded-server starting");
     run_server(&cfg.server.bind, authorized_keys).await

@@ -259,7 +259,7 @@ Build the server binary on top of `bonded-core`.
 | 2.6 | Return traffic — read from internet, write back to correct client session | not-started | |
 | 2.7 | Invite token creation (on admin request / startup) | completed | Added startup invite-token bootstrap that reuses existing usable token or creates/persists a new single-use token |
 | 2.8 | QR code generation and emission to logs | not-started | SRV-9, CR-6a |
-| 2.9 | Health check endpoint (HTTP) | not-started | SRV-6 |
+| 2.9 | Health check endpoint (HTTP) | completed | Added lightweight HTTP 200 `OK` endpoint on configured `health_bind`, started alongside NaiveTCP listener |
 | 2.10 | Configurable log verbosity | completed | Startup tracing level now maps from server config `log_level` (with `BONDED_LOG_LEVEL` override) |
 | 2.11 | Dockerfile update for new workspace structure | not-started | |
 | 2.12 | Integration test: server starts, accepts connection, forwards traffic | not-started | |
@@ -378,6 +378,7 @@ Decisions made during implementation that aren't in the requirements docs.
 | Authorized keys are stored in a path-indexed in-memory map and reloaded via `notify` watcher callbacks | 2026-03-31 | Enables revocation by editing file without process restart |
 | Initial server auth handshake uses newline-delimited JSON messages over NaiveTCP before session traffic | 2026-03-31 | Keeps first auth exchange debuggable while validating challenge-signature flow |
 | Server startup ensures at least one usable invite token exists in `invite_tokens.toml` | 2026-03-31 | Supports immediate pairing bootstrap before admin tooling exists |
+| Health check endpoint uses a minimal raw-TCP HTTP responder returning `200 OK` with body `OK` | 2026-03-31 | Keeps health probe dependency-free and easy to container-check |
 
 ---
 
