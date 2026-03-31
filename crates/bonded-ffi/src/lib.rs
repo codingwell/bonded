@@ -28,6 +28,15 @@ pub extern "C" fn bonded_ffi_api_version() -> u32 {
     1
 }
 
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_bonded_bonded_1app_MainActivity_nativeApiVersion(
+    _env: *mut jni_sys::JNIEnv,
+    _clazz: jni_sys::jclass,
+) -> jni_sys::jint {
+    bonded_ffi_api_version() as jni_sys::jint
+}
+
 #[unsafe(no_mangle)]
 /// # Safety
 ///

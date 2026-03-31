@@ -9,3 +9,6 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 bonded-core = { path = "../bonded-core" }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni-sys = "0.4"
