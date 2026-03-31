@@ -4,13 +4,16 @@ mod auth_handshake;
 mod authorized_keys;
 mod health;
 mod invite_tokens;
+mod session_registry;
 
 use auth_handshake::perform_auth_handshake;
 use authorized_keys::{AuthorizedKeysStore, AuthorizedKeysWatcher};
 use bonded_core::config::{load_server_config, ServerConfig, DEFAULT_SERVER_CONFIG_PATH};
+use bonded_core::transport::{NaiveTcpTransport, Transport};
 use clap::Parser;
 use health::run_health_server;
 use invite_tokens::ensure_startup_invite;
+use session_registry::SessionRegistry;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn, Level};
 
@@ -61,10 +64,19 @@ async fn main() -> anyhow::Result<()> {
     });
 
     info!(bind = %cfg.server.bind, "bonded-server starting");
-    run_server(&cfg.server.bind, authorized_keys).await
+    run_server(
+        &cfg.server.bind,
+        authorized_keys,
+        SessionRegistry::default(),
+    )
+    .await
 }
 
-async fn run_server(bind: &str, authorized_keys: AuthorizedKeysStore) -> anyhow::Result<()> {
+async fn run_server(
+    bind: &str,
+    authorized_keys: AuthorizedKeysStore,
+    sessions: SessionRegistry,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(bind).await?;
     info!(bind = %bind, "naive tcp listener bound");
 
@@ -78,10 +90,47 @@ async fn run_server(bind: &str, authorized_keys: AuthorizedKeysStore) -> anyhow:
         };
 
         let authorized_keys = authorized_keys.clone();
+        let sessions = sessions.clone();
         tokio::spawn(async move {
             match perform_auth_handshake(stream, authorized_keys).await {
-                Ok(public_key) => {
-                    info!(peer = %peer, public_key = %public_key, "client authenticated");
+                Ok((public_key, stream)) => {
+                    let handle = sessions.register_client(public_key.clone());
+                    info!(
+                        peer = %peer,
+                        public_key = %public_key,
+                        session_id = handle.session_id,
+                        active_sessions = sessions.active_sessions(),
+                        "client authenticated"
+                    );
+
+                    let mut transport = NaiveTcpTransport::from_stream(stream);
+                    loop {
+                        match transport.recv().await {
+                            Ok(frame) => {
+                                info!(
+                                    peer = %peer,
+                                    public_key = %public_key,
+                                    session_id = handle.session_id,
+                                    connection_id = frame.header.connection_id,
+                                    sequence = frame.header.sequence,
+                                    payload_len = frame.payload.len(),
+                                    "received session frame"
+                                );
+                            }
+                            Err(err) => {
+                                info!(
+                                    peer = %peer,
+                                    public_key = %public_key,
+                                    session_id = handle.session_id,
+                                    error = %err,
+                                    "client session ended"
+                                );
+                                break;
+                            }
+                        }
+                    }
+
+                    sessions.unregister_client(&public_key);
                 }
                 Err(err) => {
                     warn!(peer = %peer, error = %err, "client authentication failed");

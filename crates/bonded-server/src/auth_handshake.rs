@@ -29,7 +29,7 @@ struct ServerAuthResult {
 pub async fn perform_auth_handshake(
     stream: TcpStream,
     authorized_keys: AuthorizedKeysStore,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, TcpStream)> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
@@ -72,7 +72,12 @@ pub async fn perform_auth_handshake(
     )
     .await?;
 
-    Ok(hello.public_key_b64)
+    let read_half = reader.into_inner();
+    let stream = read_half
+        .reunite(write_half)
+        .map_err(|_| anyhow::anyhow!("failed to reunite tcp stream after handshake"))?;
+
+    Ok((hello.public_key_b64, stream))
 }
 
 async fn read_json_line<T>(
@@ -147,9 +152,10 @@ mod tests {
 
         let server_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept should succeed");
-            perform_auth_handshake(stream, store)
+            let (public_key, _stream) = perform_auth_handshake(stream, store)
                 .await
-                .expect("auth handshake should succeed")
+                .expect("auth handshake should succeed");
+            public_key
         });
 
         let stream = TcpStream::connect(addr)

@@ -254,7 +254,7 @@ Build the server binary on top of `bonded-core`.
 | 2.1 | Server config loading (env vars + config file) | completed | Server loads TOML via `BONDED_CONFIG`/`--config`, falls back to defaults on read failure, and applies env overrides for bind/public/health/log/protocol/key paths |
 | 2.2 | Authorized keys file — load, watch for changes, reload | completed | Added server authorized key store loading from TOML plus `notify` file watcher that reloads key state on file changes |
 | 2.3 | Accept NaiveTCP connections, perform auth handshake | completed | Added NaiveTCP listener accept loop and line-delimited JSON challenge-signature handshake with authorized-key enforcement |
-| 2.4 | Server-side session management (multiple concurrent clients) | not-started | SRV-2 |
+| 2.4 | Server-side session management (multiple concurrent clients) | completed | Added concurrent session registry keyed by authenticated client key with unique server session IDs and per-connection frame receive loop lifecycle |
 | 2.5 | IP packet forwarding — read from session, write to internet (TUN or raw socket) | not-started | SRV-3 |
 | 2.6 | Return traffic — read from internet, write back to correct client session | not-started | |
 | 2.7 | Invite token creation (on admin request / startup) | completed | Added startup invite-token bootstrap that reuses existing usable token or creates/persists a new single-use token |
@@ -379,6 +379,7 @@ Decisions made during implementation that aren't in the requirements docs.
 | Initial server auth handshake uses newline-delimited JSON messages over NaiveTCP before session traffic | 2026-03-31 | Keeps first auth exchange debuggable while validating challenge-signature flow |
 | Server startup ensures at least one usable invite token exists in `invite_tokens.toml` | 2026-03-31 | Supports immediate pairing bootstrap before admin tooling exists |
 | Health check endpoint uses a minimal raw-TCP HTTP responder returning `200 OK` with body `OK` | 2026-03-31 | Keeps health probe dependency-free and easy to container-check |
+| Server session IDs are assigned from an in-memory registry keyed by authenticated client key | 2026-03-31 | Allows concurrent client session tracking before full packet-forwarding pipeline is wired |
 
 ---
 
