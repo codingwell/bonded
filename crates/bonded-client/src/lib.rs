@@ -53,6 +53,14 @@ struct ServerAuthResult {
     status: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct PairingPayload {
+    pub server_public_address: String,
+    pub invite_token: String,
+    pub server_public_key: String,
+    pub supported_protocols: Vec<String>,
+}
+
 pub async fn establish_naive_tcp_session(config: &ClientConfig) -> anyhow::Result<TcpStream> {
     if config.client.server_public_address.trim().is_empty() {
         anyhow::bail!("server_public_address is required for NaiveTCP connection");
@@ -155,6 +163,17 @@ fn expand_home_path(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+pub fn apply_pairing_payload(config: &mut ClientConfig, payload_json: &str) -> anyhow::Result<()> {
+    let payload: PairingPayload = serde_json::from_str(payload_json)?;
+    config.client.server_public_address = payload.server_public_address;
+    config.client.server_public_key = payload.server_public_key;
+    config.client.invite_token = payload.invite_token;
+    if !payload.supported_protocols.is_empty() {
+        config.client.preferred_protocols = payload.supported_protocols;
+    }
+    Ok(())
+}
+
 pub fn enumerate_interfaces() -> Vec<NetworkInterface> {
     pnet_datalink::interfaces()
 }
@@ -179,6 +198,7 @@ mod tests {
     use super::{enumerate_interfaces, load_or_create_device_keypair};
     use bonded_core::auth::verify_auth_challenge;
     use bonded_core::auth::{create_auth_challenge, DeviceKeypair};
+    use bonded_core::config::ClientConfig;
     use serde_json::json;
     use std::fs;
     use std::path::PathBuf;
@@ -281,5 +301,22 @@ mod tests {
             .expect("auth handshake should succeed");
 
         server_task.await.expect("server task should join");
+    }
+
+    #[test]
+    fn pairing_payload_updates_client_config() {
+        let mut cfg = ClientConfig::default();
+        let payload = r#"{
+            "server_public_address": "bonded.example.com:8080",
+            "invite_token": "token-abc",
+            "server_public_key": "server-pub",
+            "supported_protocols": ["naive_tcp", "wss"]
+        }"#;
+
+        super::apply_pairing_payload(&mut cfg, payload).expect("payload should apply");
+        assert_eq!(cfg.client.server_public_address, "bonded.example.com:8080");
+        assert_eq!(cfg.client.invite_token, "token-abc");
+        assert_eq!(cfg.client.server_public_key, "server-pub");
+        assert_eq!(cfg.client.preferred_protocols, vec!["naive_tcp", "wss"]);
     }
 }
