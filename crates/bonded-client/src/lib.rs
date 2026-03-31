@@ -32,16 +32,21 @@ impl ClientRuntime {
             "detected network interfaces for client runtime"
         );
 
-        let stream = establish_naive_tcp_session(&self.config).await?;
+        let max_paths = interfaces.len().clamp(1, 2);
+        let streams = establish_naive_tcp_sessions(&self.config, max_paths).await?;
+        info!(
+            paths = streams.len(),
+            "authenticated transport paths established"
+        );
 
         #[cfg(target_os = "linux")]
         {
-            run_linux_packet_loop(&self.config.client.tun_name, stream).await?;
+            run_linux_packet_loop(&self.config.client.tun_name, streams).await?;
         }
 
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = stream;
+            let _ = streams;
         }
 
         info!(
@@ -82,6 +87,18 @@ pub async fn establish_naive_tcp_session(config: &ClientConfig) -> anyhow::Resul
 
     let stream = TcpStream::connect(&config.client.server_public_address).await?;
     perform_auth_handshake(stream, &keypair).await
+}
+
+pub async fn establish_naive_tcp_sessions(
+    config: &ClientConfig,
+    count: usize,
+) -> anyhow::Result<Vec<TcpStream>> {
+    let target = count.max(1);
+    let mut streams = Vec::with_capacity(target);
+    for _ in 0..target {
+        streams.push(establish_naive_tcp_session(config).await?);
+    }
+    Ok(streams)
 }
 
 async fn perform_auth_handshake(
@@ -195,10 +212,14 @@ fn build_tun_config(tun_name: &str) -> Configuration {
 }
 
 #[cfg(target_os = "linux")]
-async fn run_linux_packet_loop(tun_name: &str, stream: TcpStream) -> anyhow::Result<()> {
+async fn run_linux_packet_loop(tun_name: &str, streams: Vec<TcpStream>) -> anyhow::Result<()> {
     let config = build_tun_config(tun_name);
     let device = tun::create_as_async(&config)?;
-    let mut transport = NaiveTcpTransport::from_stream(stream);
+    let mut transports: Vec<NaiveTcpTransport> = streams
+        .into_iter()
+        .map(NaiveTcpTransport::from_stream)
+        .collect();
+    let mut active_index = 0_usize;
     let mut state = SessionState::new(1);
     let mut tun_buf = vec![0_u8; 8192];
 
@@ -211,13 +232,40 @@ async fn run_linux_packet_loop(tun_name: &str, stream: TcpStream) -> anyhow::Res
                 }
 
                 let frame = state.create_outbound_frame(Bytes::copy_from_slice(&tun_buf[..read]), 0);
-                transport.send(frame).await?;
+                match transports[active_index].send(frame).await {
+                    Ok(()) => {}
+                    Err(err) => {
+                        if transports.len() == 1 {
+                            return Err(err);
+                        }
+
+                        transports.remove(active_index);
+                        if active_index >= transports.len() {
+                            active_index = 0;
+                        }
+                        info!(active_path = active_index, remaining_paths = transports.len(), "switched active path after send failure");
+                    }
+                }
             }
-            frame_result = transport.recv() => {
-                let frame = frame_result?;
-                let ready = state.ingest_inbound(frame)?;
-                for packet in ready {
-                    let _ = device.send(&packet.payload).await?;
+            frame_result = transports[active_index].recv() => {
+                match frame_result {
+                    Ok(frame) => {
+                        let ready = state.ingest_inbound(frame)?;
+                        for packet in ready {
+                            let _ = device.send(&packet.payload).await?;
+                        }
+                    }
+                    Err(err) => {
+                        if transports.len() == 1 {
+                            return Err(err);
+                        }
+
+                        transports.remove(active_index);
+                        if active_index >= transports.len() {
+                            active_index = 0;
+                        }
+                        info!(active_path = active_index, remaining_paths = transports.len(), "switched active path after recv failure");
+                    }
                 }
             }
         }
