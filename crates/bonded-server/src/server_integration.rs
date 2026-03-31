@@ -23,6 +23,7 @@ fn temp_file_path(name: &str) -> PathBuf {
 async fn authenticated_client_can_exchange_session_frame() {
     let keypair = DeviceKeypair::generate();
     let path = temp_file_path("server-e2e");
+    let invites = temp_file_path("server-e2e-invites");
     fs::write(
         &path,
         format!(
@@ -31,6 +32,15 @@ async fn authenticated_client_can_exchange_session_frame() {
         ),
     )
     .expect("authorized keys file should be written");
+    fs::write(
+        &invites,
+        r#"[[tokens]]
+token = "pair-me"
+expires_at = "unix:9999999999"
+uses_remaining = 1
+"#,
+    )
+    .expect("invite tokens file should be written");
 
     let store = AuthorizedKeysStore::load(&path).expect("authorized keys should load");
 
@@ -39,9 +49,10 @@ async fn authenticated_client_can_exchange_session_frame() {
         .expect("listener should bind");
     let addr = listener.local_addr().expect("local address should resolve");
 
+    let invites_for_server = invites.clone();
     let server_task = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("accept should succeed");
-        let (public_key, stream) = perform_auth_handshake(stream, store)
+        let (public_key, stream) = perform_auth_handshake(stream, store, &invites_for_server)
             .await
             .expect("handshake should succeed");
         let mut transport = NaiveTcpTransport::from_stream(stream);
@@ -57,6 +68,7 @@ async fn authenticated_client_can_exchange_session_frame() {
 
     let hello = serde_json::json!({
         "public_key_b64": keypair.public_key_b64,
+        "invite_token": "",
     });
     write_half
         .write_all(format!("{}\n", hello).as_bytes())
@@ -116,4 +128,5 @@ async fn authenticated_client_can_exchange_session_frame() {
     assert_eq!(&received.payload[..], b"frame-payload");
 
     let _ = fs::remove_file(path);
+    let _ = fs::remove_file(invites);
 }

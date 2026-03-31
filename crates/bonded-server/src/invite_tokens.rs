@@ -32,6 +32,17 @@ pub fn ensure_startup_invite(path: impl AsRef<Path>) -> anyhow::Result<InviteTok
     Ok(created)
 }
 
+pub fn redeem_invite_token(path: impl AsRef<Path>, token: &str) -> anyhow::Result<bool> {
+    let path = path.as_ref();
+    let mut manager = load_manager(path)?;
+    let redeemed = manager.redeem(token).is_ok();
+    if redeemed {
+        persist_manager(path, &manager)?;
+    }
+
+    Ok(redeemed)
+}
+
 fn load_manager(path: &Path) -> anyhow::Result<InviteTokenManager> {
     if !path.exists() {
         return Ok(InviteTokenManager::default());
@@ -64,7 +75,7 @@ fn unix_timestamp_after(offset: Duration) -> anyhow::Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_startup_invite;
+    use super::{ensure_startup_invite, redeem_invite_token};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -104,6 +115,25 @@ uses_remaining = 1
 
         let token = ensure_startup_invite(&path).expect("existing token should be reused");
         assert_eq!(token.token, "existing");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn redeem_invite_token_decrements_and_persists() {
+        let path = temp_file_path("invite-redeem");
+        fs::write(
+            &path,
+            r#"[[tokens]]
+token = "one-shot"
+expires_at = "unix:9999999999"
+uses_remaining = 1
+"#,
+        )
+        .expect("seed token file should be written");
+
+        assert!(redeem_invite_token(&path, "one-shot").expect("redeem should succeed"));
+        assert!(!redeem_invite_token(&path, "one-shot").expect("second redeem should fail"));
 
         let _ = fs::remove_file(path);
     }

@@ -282,7 +282,7 @@ Build the Linux client on top of `bonded-core` + a thin `bonded-client` lib.
 | 3.1 | TUN device setup on Linux | in-progress | Added Linux TUN initialization in runtime startup using `tun` crate; full root-required end-to-end validation pending integration phase |
 | 3.2 | Network interface detection and enumeration | completed | Added interface enumeration via `pnet_datalink` with unit test coverage in `bonded-client` |
 | 3.3 | Client config (server address, auth token or keypair path) | completed | Client runtime now consumes configured server address and key paths, with home-directory expansion and on-demand keypair persistence |
-| 3.4 | Pairing flow — redeem invite token, register keypair | in-progress | Client now ingests QR pairing payload and persists invite token/server identity data; server-side invite redemption endpoint still required for full registration flow |
+| 3.4 | Pairing flow — redeem invite token, register keypair | completed | Client now includes invite token in auth hello; server redeems single-use invite token, persists the client public key into authorized-keys state, reloads store, and continues authenticated session on the same connection |
 | 3.5 | Establish NaiveTCP path to server, perform auth handshake | completed | Added client-side NaiveTCP challenge-signature handshake compatible with server protocol and covered by mock-server unit test |
 | 3.6 | Capture traffic from TUN → session layer → transport → server | completed | Added async Linux loop that reads packets from TUN and sends framed payloads over authenticated NaiveTCP transport |
 | 3.7 | Receive traffic from server → session layer → TUN | completed | Added reverse async loop that ingests framed payloads from transport and writes packets back to Linux TUN via session reassembly |
@@ -390,6 +390,7 @@ Decisions made during implementation that aren't in the requirements docs.
 | Linux packet loop uses `tun::create_as_async` + `tokio::select!` to bridge TUN packets and NaiveTCP session frames | 2026-03-31 | Establishes bidirectional TUN transport plumbing in a single runtime loop |
 | Linux multipath uses active-primary with failover-to-survivor strategy for first implementation | 2026-03-31 | Delivers CR-1/CR-2 behavior without introducing concurrent scheduler complexity in the initial client loop |
 | Linux failover integration tests treat first-path send closure as acceptable and assert survivor-path continuity | 2026-03-31 | Avoids flaky timing assumptions while still validating failover behavior under path loss |
+| Invite redemption is handled inline during auth hello when key is unknown and invite token is present | 2026-03-31 | Allows first-time pairing and key registration without a separate control endpoint in initial NaiveTCP milestone |
 
 ---
 

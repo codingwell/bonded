@@ -89,7 +89,7 @@ pub async fn establish_naive_tcp_session(config: &ClientConfig) -> anyhow::Resul
     )?;
 
     let stream = TcpStream::connect(&config.client.server_public_address).await?;
-    perform_auth_handshake(stream, &keypair).await
+    perform_auth_handshake(stream, &keypair, &config.client.invite_token).await
 }
 
 pub async fn establish_naive_tcp_sessions(
@@ -107,12 +107,14 @@ pub async fn establish_naive_tcp_sessions(
 async fn perform_auth_handshake(
     stream: TcpStream,
     keypair: &DeviceKeypair,
+    invite_token: &str,
 ) -> anyhow::Result<TcpStream> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
     let hello = json!({
         "public_key_b64": keypair.public_key_b64,
+        "invite_token": invite_token,
     });
     write_half
         .write_all(format!("{}\n", hello).as_bytes())
@@ -378,7 +380,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr)
             .await
             .expect("client should connect");
-        super::perform_auth_handshake(stream, &keypair)
+        super::perform_auth_handshake(stream, &keypair, "")
             .await
             .expect("auth handshake should succeed");
 

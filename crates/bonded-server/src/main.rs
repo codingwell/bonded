@@ -82,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
     run_server(
         &cfg.server.bind,
         &cfg.server.upstream_tcp_target,
+        &cfg.server.invite_tokens_file,
         authorized_keys,
         SessionRegistry::default(),
     )
@@ -91,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
 async fn run_server(
     bind: &str,
     upstream_tcp_target: &str,
+    invite_tokens_file: &str,
     authorized_keys: AuthorizedKeysStore,
     sessions: SessionRegistry,
 ) -> anyhow::Result<()> {
@@ -109,8 +111,15 @@ async fn run_server(
         let authorized_keys = authorized_keys.clone();
         let sessions = sessions.clone();
         let upstream_tcp_target = upstream_tcp_target.to_owned();
+        let invite_tokens_file = invite_tokens_file.to_owned();
         tokio::spawn(async move {
-            match perform_auth_handshake(stream, authorized_keys).await {
+            match perform_auth_handshake(
+                stream,
+                authorized_keys,
+                std::path::Path::new(&invite_tokens_file),
+            )
+            .await
+            {
                 Ok((public_key, stream)) => {
                     let handle = sessions.register_client(public_key.clone());
                     info!(

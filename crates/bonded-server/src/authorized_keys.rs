@@ -4,17 +4,17 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AuthorizedDevice {
     pub device_id: String,
     pub public_key: String,
     pub added_at: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 struct AuthorizedKeysFile {
     #[serde(default)]
     devices: Vec<AuthorizedDevice>,
@@ -65,15 +65,50 @@ impl AuthorizedKeysStore {
     }
 }
 
+pub fn authorize_device_key(path: impl AsRef<Path>, public_key: &str) -> anyhow::Result<bool> {
+    let path = path.as_ref();
+    let mut doc = load_devices_file(path)?;
+
+    if doc.devices.iter().any(|device| device.public_key == public_key) {
+        return Ok(false);
+    }
+
+    doc.devices.push(AuthorizedDevice {
+        device_id: format!("device-{}", &public_key.chars().take(8).collect::<String>()),
+        public_key: public_key.to_owned(),
+        added_at: None,
+    });
+    persist_devices_file(path, &doc)?;
+    Ok(true)
+}
+
 fn load_devices_map(path: &Path) -> anyhow::Result<HashMap<String, AuthorizedDevice>> {
-    let raw = fs::read_to_string(path)?;
-    let parsed: AuthorizedKeysFile = toml::from_str(&raw)?;
+    let parsed = load_devices_file(path)?;
     let devices = parsed
         .devices
         .into_iter()
         .map(|device| (device.public_key.clone(), device))
         .collect();
     Ok(devices)
+}
+
+fn load_devices_file(path: &Path) -> anyhow::Result<AuthorizedKeysFile> {
+    if !path.exists() {
+        return Ok(AuthorizedKeysFile::default());
+    }
+
+    let raw = fs::read_to_string(path)?;
+    Ok(toml::from_str(&raw)?)
+}
+
+fn persist_devices_file(path: &Path, doc: &AuthorizedKeysFile) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let raw = toml::to_string_pretty(doc)?;
+    fs::write(path, raw)?;
+    Ok(())
 }
 
 pub struct AuthorizedKeysWatcher {
@@ -104,7 +139,7 @@ impl AuthorizedKeysWatcher {
 
 #[cfg(test)]
 mod tests {
-    use super::AuthorizedKeysStore;
+    use super::{authorize_device_key, AuthorizedKeysStore};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -170,6 +205,24 @@ public_key = "pub-b"
         store.reload().expect("reload should succeed");
         assert!(!store.is_authorized("pub-a"));
         assert!(store.is_authorized("pub-b"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn authorize_device_key_persists_new_key() {
+        let path = temp_file_path("authorized-add");
+        fs::write(&path, "devices = []\n").expect("seed file should be written");
+
+        let added = authorize_device_key(&path, "pub-new").expect("key should be added");
+        assert!(added);
+
+        let store = AuthorizedKeysStore::load(&path).expect("store should load");
+        assert!(store.is_authorized("pub-new"));
+
+        let added_again =
+            authorize_device_key(&path, "pub-new").expect("duplicate add should succeed");
+        assert!(!added_again);
 
         let _ = fs::remove_file(path);
     }
