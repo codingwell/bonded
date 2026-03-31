@@ -2,8 +2,12 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio_rustls::{server::TlsStream as ServerTlsStream, TlsAcceptor};
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{accept_async, connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{
+    accept_async, connect_async, connect_async_tls_with_config, Connector, MaybeTlsStream,
+    WebSocketStream,
+};
 
 use crate::session::SessionFrame;
 
@@ -28,6 +32,7 @@ pub struct NaiveTcpTransport {
 enum WebSocketStreamInner {
     Client(WebSocketStream<MaybeTlsStream<TcpStream>>),
     Server(WebSocketStream<TcpStream>),
+    ServerTls(WebSocketStream<ServerTlsStream<TcpStream>>),
 }
 
 pub struct WebSocketTlsTransport {
@@ -53,10 +58,26 @@ impl WebSocketTlsTransport {
         })
     }
 
+    pub async fn connect_with_connector(url: &str, connector: Connector) -> anyhow::Result<Self> {
+        let (stream, _response) =
+            connect_async_tls_with_config(url, None, false, Some(connector)).await?;
+        Ok(Self {
+            stream: WebSocketStreamInner::Client(stream),
+        })
+    }
+
     pub async fn accept(stream: TcpStream) -> anyhow::Result<Self> {
         let stream = accept_async(stream).await?;
         Ok(Self {
             stream: WebSocketStreamInner::Server(stream),
+        })
+    }
+
+    pub async fn accept_tls(stream: TcpStream, acceptor: TlsAcceptor) -> anyhow::Result<Self> {
+        let tls_stream = acceptor.accept(stream).await?;
+        let ws_stream = accept_async(tls_stream).await?;
+        Ok(Self {
+            stream: WebSocketStreamInner::ServerTls(ws_stream),
         })
     }
 
@@ -68,6 +89,9 @@ impl WebSocketTlsTransport {
             WebSocketStreamInner::Server(stream) => {
                 stream.send(Message::Text(text.to_owned())).await?;
             }
+            WebSocketStreamInner::ServerTls(stream) => {
+                stream.send(Message::Text(text.to_owned())).await?;
+            }
         }
         Ok(())
     }
@@ -77,6 +101,7 @@ impl WebSocketTlsTransport {
             let next = match &mut self.stream {
                 WebSocketStreamInner::Client(stream) => stream.next().await,
                 WebSocketStreamInner::Server(stream) => stream.next().await,
+                WebSocketStreamInner::ServerTls(stream) => stream.next().await,
             };
 
             match next {
@@ -132,6 +157,9 @@ impl Transport for WebSocketTlsTransport {
             WebSocketStreamInner::Server(stream) => {
                 stream.send(Message::Binary(payload)).await?;
             }
+            WebSocketStreamInner::ServerTls(stream) => {
+                stream.send(Message::Binary(payload)).await?;
+            }
         }
         Ok(())
     }
@@ -141,6 +169,7 @@ impl Transport for WebSocketTlsTransport {
             let next = match &mut self.stream {
                 WebSocketStreamInner::Client(stream) => stream.next().await,
                 WebSocketStreamInner::Server(stream) => stream.next().await,
+                WebSocketStreamInner::ServerTls(stream) => stream.next().await,
             };
 
             match next {

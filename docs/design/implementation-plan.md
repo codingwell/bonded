@@ -333,8 +333,8 @@ Add a production transport protocol and harden.
 
 | # | Task | Status | Notes |
 |---|------|--------|-------|
-| 5.1 | Implement WebSocket over TLS (wss://) transport | in-progress | Added shared `WebSocketTlsTransport` in `bonded-core`, websocket auth handshake path, and server websocket listener; transport supports `ws://` and `wss://` client URLs, while server-side TLS termination/certificate configuration is still pending |
-| 5.2 | Test WSS transport end-to-end (Linux client + server) | in-progress | Added websocket end-to-end frame exchange integration coverage in both client and server crates; full TLS-enabled WSS server integration remains pending |
+| 5.1 | Implement WebSocket over TLS (wss://) transport | completed | Added shared `WebSocketTlsTransport` with TLS accept/connect support, plus server rustls-based WSS termination driven by configurable cert/key file paths (`BONDED_WEBSOCKET_TLS_CERT_FILE`, `BONDED_WEBSOCKET_TLS_KEY_FILE`) |
+| 5.2 | Test WSS transport end-to-end (Linux client + server) | completed | Added TLS-enabled websocket integration test in `bonded-server` using self-signed cert trust bootstrap and authenticated framed traffic exchange over `wss://` |
 | 5.3 | Test mixed transports (one path NaiveTCP, one path WSS) | completed | Added client integration test that establishes one NaiveTCP path and one websocket path, then verifies framed traffic exchange on both |
 | 5.4 | QUIC transport (evaluate `quinn` crate) | completed | Evaluated QUIC scope and deferred implementation until WSS TLS endpoint and certificate lifecycle are stabilized; tracked as next transport hardening step |
 | 5.5 | Server advertises supported protocols in QR code | completed | Pairing QR payload already advertises configured `supported_protocols`; websocket protocol can now be included and consumed by clients |
@@ -398,6 +398,8 @@ Decisions made during implementation that aren't in the requirements docs.
 | Phase-5 websocket transport shares frame codec and auth flow semantics with NaiveTCP | 2026-03-31 | Uses binary websocket frames for session payloads plus JSON text messages for challenge-signature auth to keep protocol behavior aligned |
 | Mixed-path establishment rotates preferred protocols per path with per-path fallback | 2026-03-31 | Enables one session to combine NaiveTCP and websocket paths without introducing a new scheduler strategy |
 | QUIC implementation is deferred until WSS TLS server endpoint/certificate lifecycle is complete | 2026-03-31 | Reduces concurrent transport hardening risk while preserving planned `quinn` adoption path |
+| Server WSS termination uses rustls with PEM certificate/key configuration and optional enablement | 2026-03-31 | Websocket listener remains `ws://` when TLS files are unset and upgrades to `wss://` when both files are provided |
+| WSS integration tests use generated self-signed certificates with explicit client trust roots | 2026-03-31 | Validates authenticated frame exchange over true TLS websocket without relying on external PKI in CI |
 
 ---
 

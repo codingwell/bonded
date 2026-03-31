@@ -22,7 +22,10 @@ use health::run_health_server;
 use invite_tokens::ensure_startup_invite;
 use pairing_qr::emit_pairing_qr;
 use session_registry::SessionRegistry;
+use std::io::BufReader;
+use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, warn, Level};
 
 #[derive(Debug, Parser)]
@@ -84,6 +87,10 @@ async fn main() -> anyhow::Result<()> {
     let websocket_invites = cfg.server.invite_tokens_file.clone();
     let websocket_sessions = SessionRegistry::default();
     let websocket_keys = authorized_keys.clone();
+    let websocket_tls_acceptor = load_websocket_tls_acceptor(
+        &cfg.server.websocket_tls_cert_file,
+        &cfg.server.websocket_tls_key_file,
+    )?;
     tokio::spawn(async move {
         if let Err(err) = run_websocket_server(
             &websocket_bind,
@@ -91,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
             &websocket_invites,
             websocket_keys,
             websocket_sessions,
+            websocket_tls_acceptor,
         )
         .await
         {
@@ -114,6 +122,7 @@ async fn run_websocket_server(
     invite_tokens_file: &str,
     authorized_keys: AuthorizedKeysStore,
     sessions: SessionRegistry,
+    tls_acceptor: Option<TlsAcceptor>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(bind).await?;
     info!(bind = %bind, "websocket listener bound");
@@ -131,15 +140,30 @@ async fn run_websocket_server(
         let sessions = sessions.clone();
         let upstream_tcp_target = upstream_tcp_target.to_owned();
         let invite_tokens_file = invite_tokens_file.to_owned();
+        let tls_acceptor = tls_acceptor.clone();
         tokio::spawn(async move {
-            let mut transport =
-                match bonded_core::transport::WebSocketTlsTransport::accept(stream).await {
+            let mut transport = match tls_acceptor {
+                Some(acceptor) => {
+                    match bonded_core::transport::WebSocketTlsTransport::accept_tls(
+                        stream, acceptor,
+                    )
+                    .await
+                    {
+                        Ok(value) => value,
+                        Err(err) => {
+                            warn!(peer = %peer, error = %err, "wss upgrade failed");
+                            return;
+                        }
+                    }
+                }
+                None => match bonded_core::transport::WebSocketTlsTransport::accept(stream).await {
                     Ok(value) => value,
                     Err(err) => {
                         warn!(peer = %peer, error = %err, "websocket upgrade failed");
                         return;
                     }
-                };
+                },
+            };
 
             match perform_websocket_auth_handshake(
                 &mut transport,
@@ -216,6 +240,50 @@ async fn run_websocket_server(
             }
         });
     }
+}
+
+fn load_websocket_tls_acceptor(
+    cert_file: &str,
+    key_file: &str,
+) -> anyhow::Result<Option<TlsAcceptor>> {
+    if cert_file.trim().is_empty() || key_file.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let cert_reader = std::fs::File::open(cert_file)?;
+    let mut cert_reader = BufReader::new(cert_reader);
+    let cert_chain: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+    if cert_chain.is_empty() {
+        anyhow::bail!("no certificates found in websocket tls cert file");
+    }
+
+    let key = load_private_key(key_file)?;
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, key)?;
+
+    Ok(Some(TlsAcceptor::from(Arc::new(config))))
+}
+
+fn load_private_key(path: &str) -> anyhow::Result<rustls::pki_types::PrivateKeyDer<'static>> {
+    let pkcs8_file = std::fs::File::open(path)?;
+    let mut pkcs8_reader = BufReader::new(pkcs8_file);
+    let mut pkcs8_keys: Vec<rustls::pki_types::PrivatePkcs8KeyDer<'static>> =
+        rustls_pemfile::pkcs8_private_keys(&mut pkcs8_reader).collect::<Result<Vec<_>, _>>()?;
+    if let Some(key) = pkcs8_keys.pop() {
+        return Ok(rustls::pki_types::PrivateKeyDer::Pkcs8(key));
+    }
+
+    let rsa_file = std::fs::File::open(path)?;
+    let mut rsa_reader = BufReader::new(rsa_file);
+    let mut rsa_keys: Vec<rustls::pki_types::PrivatePkcs1KeyDer<'static>> =
+        rustls_pemfile::rsa_private_keys(&mut rsa_reader).collect::<Result<Vec<_>, _>>()?;
+    if let Some(key) = rsa_keys.pop() {
+        return Ok(rustls::pki_types::PrivateKeyDer::Pkcs1(key));
+    }
+
+    anyhow::bail!("no supported private key found in websocket tls key file");
 }
 
 async fn run_server(
@@ -330,6 +398,12 @@ where
     if let Some(websocket_bind) = read_env("BONDED_WEBSOCKET_BIND") {
         cfg.server.websocket_bind = websocket_bind;
     }
+    if let Some(websocket_tls_cert_file) = read_env("BONDED_WEBSOCKET_TLS_CERT_FILE") {
+        cfg.server.websocket_tls_cert_file = websocket_tls_cert_file;
+    }
+    if let Some(websocket_tls_key_file) = read_env("BONDED_WEBSOCKET_TLS_KEY_FILE") {
+        cfg.server.websocket_tls_key_file = websocket_tls_key_file;
+    }
     if let Some(public_address) =
         read_env("BONDED_PUBLIC_ADDRESS").or_else(|| read_env("PUBLIC_ADDRESS"))
     {
@@ -387,6 +461,8 @@ mod tests {
         let env = [
             ("BONDED_BIND", "127.0.0.1:9000"),
             ("BONDED_WEBSOCKET_BIND", "127.0.0.1:9443"),
+            ("BONDED_WEBSOCKET_TLS_CERT_FILE", "/tmp/wss.crt"),
+            ("BONDED_WEBSOCKET_TLS_KEY_FILE", "/tmp/wss.key"),
             ("BONDED_PUBLIC_ADDRESS", "bonded.example.com:9000"),
             ("BONDED_HEALTH_BIND", "127.0.0.1:9001"),
             ("BONDED_UPSTREAM_TCP_TARGET", "127.0.0.1:9100"),
@@ -404,6 +480,8 @@ mod tests {
 
         assert_eq!(cfg.server.bind, "127.0.0.1:9000");
         assert_eq!(cfg.server.websocket_bind, "127.0.0.1:9443");
+        assert_eq!(cfg.server.websocket_tls_cert_file, "/tmp/wss.crt");
+        assert_eq!(cfg.server.websocket_tls_key_file, "/tmp/wss.key");
         assert_eq!(cfg.server.public_address, "bonded.example.com:9000");
         assert_eq!(cfg.server.health_bind, "127.0.0.1:9001");
         assert_eq!(cfg.server.upstream_tcp_target, "127.0.0.1:9100");

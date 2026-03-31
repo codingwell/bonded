@@ -6,17 +6,49 @@ use bonded_core::transport::{NaiveTcpTransport, Transport, WebSocketTlsTransport
 use bytes::Bytes;
 use serde_json::Value;
 use std::fs;
-use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsAcceptor;
+use tokio_tungstenite::Connector;
 
-fn temp_file_path(name: &str) -> PathBuf {
+fn temp_file_path(name: &str) -> std::path::PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock should be valid")
         .as_nanos();
     std::env::temp_dir().join(format!("bonded-{name}-{stamp}.toml"))
+}
+
+fn test_tls_configs() -> (TlsAcceptor, Connector) {
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+        .expect("test cert should generate");
+    let cert_der = certified.cert.der().to_vec();
+    let key_der = certified.key_pair.serialize_der();
+
+    let server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![rustls::pki_types::CertificateDer::from(cert_der.clone())],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+                key_der,
+            )),
+        )
+        .expect("server config should build");
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(cert_der))
+        .expect("root cert should add");
+    let client_config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+    (
+        TlsAcceptor::from(Arc::new(server_config)),
+        Connector::Rustls(Arc::new(client_config)),
+    )
 }
 
 #[tokio::test]
@@ -160,13 +192,14 @@ uses_remaining = 1
         .await
         .expect("listener should bind");
     let addr = listener.local_addr().expect("local address should resolve");
+    let (tls_acceptor, tls_connector) = test_tls_configs();
 
     let invites_for_server = invites.clone();
     let server_task = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("accept should succeed");
-        let mut transport = WebSocketTlsTransport::accept(stream)
+        let mut transport = WebSocketTlsTransport::accept_tls(stream, tls_acceptor)
             .await
-            .expect("websocket should accept");
+            .expect("wss should accept");
         let public_key = crate::auth_handshake::perform_websocket_auth_handshake(
             &mut transport,
             store,
@@ -182,9 +215,12 @@ uses_remaining = 1
         (public_key, frame)
     });
 
-    let mut transport = WebSocketTlsTransport::connect(&format!("ws://{addr}"))
-        .await
-        .expect("client websocket should connect");
+    let mut transport = WebSocketTlsTransport::connect_with_connector(
+        &format!("wss://localhost:{}", addr.port()),
+        tls_connector,
+    )
+    .await
+    .expect("client websocket should connect");
 
     let hello = serde_json::json!({
         "public_key_b64": keypair.public_key_b64,

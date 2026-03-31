@@ -36,6 +36,8 @@ impl Default for ServerConfig {
 pub struct ServerSection {
     pub bind: String,
     pub websocket_bind: String,
+    pub websocket_tls_cert_file: String,
+    pub websocket_tls_key_file: String,
     pub public_address: String,
     pub health_bind: String,
     pub upstream_tcp_target: String,
@@ -50,6 +52,8 @@ impl Default for ServerSection {
         Self {
             bind: "0.0.0.0:8080".to_owned(),
             websocket_bind: "0.0.0.0:8443".to_owned(),
+            websocket_tls_cert_file: String::new(),
+            websocket_tls_key_file: String::new(),
             public_address: String::new(),
             health_bind: "0.0.0.0:8081".to_owned(),
             upstream_tcp_target: String::new(),
@@ -123,5 +127,7 @@ mod tests {
         assert_eq!(cfg.server.supported_protocols, vec!["naive_tcp"]);
         assert!(cfg.server.upstream_tcp_target.is_empty());
         assert_eq!(cfg.server.websocket_bind, "0.0.0.0:8443");
+        assert!(cfg.server.websocket_tls_cert_file.is_empty());
+        assert!(cfg.server.websocket_tls_key_file.is_empty());
     }
 }
