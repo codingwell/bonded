@@ -2,23 +2,25 @@
 
 Rust-based aggregation server for Bonded.
 
+The primary server crate now lives at `crates/bonded-server` in the workspace root. This directory is kept for Docker assets and migration compatibility.
+
 ## Building
 
 ```bash
-cargo build          # debug
-cargo build --release # release
+cargo build -p bonded-server           # debug
+cargo build -p bonded-server --release # release
 ```
 
 ## Running
 
 ```bash
-cargo run
+cargo run -p bonded-server
 ```
 
 ## Docker
 
 ```bash
-docker build -t bonded-server .
+docker build -f server/Dockerfile -t bonded-server .
 docker run -p 8080:8080 bonded-server
 ```
 

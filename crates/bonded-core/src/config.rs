@@ -1,0 +1,117 @@
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::Path;
+use thiserror::Error;
+
+pub const DEFAULT_SERVER_CONFIG_PATH: &str = "/etc/bonded/server.toml";
+pub const DEFAULT_AUTHORIZED_KEYS_PATH: &str = "/var/lib/bonded/authorized_keys.toml";
+pub const DEFAULT_INVITE_TOKENS_PATH: &str = "/var/lib/bonded/invite_tokens.toml";
+
+pub const DEFAULT_CLIENT_CONFIG_PATH: &str = "~/.config/bonded/client.toml";
+pub const DEFAULT_CLIENT_PRIVATE_KEY_PATH: &str = "~/.local/share/bonded/device-key.pem";
+pub const DEFAULT_CLIENT_PUBLIC_KEY_PATH: &str = "~/.local/share/bonded/device-key.pub";
+
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("failed to read config file: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("failed to parse TOML config: {0}")]
+    Toml(#[from] toml::de::Error),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerConfig {
+    pub server: ServerSection,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            server: ServerSection::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerSection {
+    pub bind: String,
+    pub public_address: String,
+    pub health_bind: String,
+    pub log_level: String,
+    pub supported_protocols: Vec<String>,
+    pub authorized_keys_file: String,
+    pub invite_tokens_file: String,
+}
+
+impl Default for ServerSection {
+    fn default() -> Self {
+        Self {
+            bind: "0.0.0.0:8080".to_owned(),
+            public_address: String::new(),
+            health_bind: "0.0.0.0:8081".to_owned(),
+            log_level: "info".to_owned(),
+            supported_protocols: vec!["naive_tcp".to_owned()],
+            authorized_keys_file: DEFAULT_AUTHORIZED_KEYS_PATH.to_owned(),
+            invite_tokens_file: DEFAULT_INVITE_TOKENS_PATH.to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientConfig {
+    pub client: ClientSection,
+}
+
+impl Default for ClientConfig {
+    fn default() -> Self {
+        Self {
+            client: ClientSection::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientSection {
+    pub device_name: String,
+    pub tun_name: String,
+    pub server_public_address: String,
+    pub server_public_key: String,
+    pub preferred_protocols: Vec<String>,
+    pub private_key_path: String,
+    pub public_key_path: String,
+}
+
+impl Default for ClientSection {
+    fn default() -> Self {
+        Self {
+            device_name: "linux-cli".to_owned(),
+            tun_name: "bonded0".to_owned(),
+            server_public_address: String::new(),
+            server_public_key: String::new(),
+            preferred_protocols: vec!["naive_tcp".to_owned()],
+            private_key_path: DEFAULT_CLIENT_PRIVATE_KEY_PATH.to_owned(),
+            public_key_path: DEFAULT_CLIENT_PUBLIC_KEY_PATH.to_owned(),
+        }
+    }
+}
+
+pub fn load_server_config(path: &Path) -> Result<ServerConfig, ConfigError> {
+    let data = fs::read_to_string(path)?;
+    Ok(toml::from_str(&data)?)
+}
+
+pub fn load_client_config(path: &Path) -> Result<ClientConfig, ConfigError> {
+    let data = fs::read_to_string(path)?;
+    Ok(toml::from_str(&data)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServerConfig;
+
+    #[test]
+    fn default_server_config_has_naive_tcp_protocol() {
+        let cfg = ServerConfig::default();
+        assert_eq!(cfg.server.supported_protocols, vec!["naive_tcp"]);
+    }
+}

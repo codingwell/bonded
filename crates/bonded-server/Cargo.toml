@@ -1,0 +1,14 @@
+[package]
+name = "bonded-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bonded server binary"
+
+[dependencies]
+anyhow.workspace = true
+bonded-core = { path = "../bonded-core" }
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

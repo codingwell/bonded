@@ -27,45 +27,45 @@
 git clone https://github.com/<org>/bonded.git
 cd bonded
 
-# Server
-cd server
-cargo build
-cargo test
-
-# Client
-cd ../client
-flutter pub get
-flutter test
+# Workspace baseline
+cargo build --workspace
+cargo test --workspace
 ```
+
+The Rust workspace scaffolding is present. Android scaffold is planned and not yet created.
 
 ## Running Locally
 
 ### Server
 
 ```bash
-cd server
-
-# Direct
-cargo run
+# Direct from workspace root
+cargo run -p bonded-server
 
 # Docker
-docker build -t bonded-server .
+docker build -f server/Dockerfile -t bonded-server .
 docker run -p 8080:8080 bonded-server
 ```
 
-### Client
+### Planned Validation Flow
 
 ```bash
-cd client
+# Workspace baseline once migrated
+cargo fmt --all --check
+cargo test --workspace
 
-# Run on connected device / emulator
-flutter run
-
-# Run on specific platform
-flutter run -d windows
-flutter run -d macos
-flutter run -d chrome  # for quick iteration (web not a target but useful for dev)
+# Android smoke build once scaffolded
+cd android
+flutter pub get
+flutter build apk --debug
 ```
+
+There is not yet a Flutter client scaffold in the repository. The implementation order is:
+
+1. Shared Rust core
+2. Server
+3. Linux CLI client
+4. Android client
 
 ## IDE Recommendations
 

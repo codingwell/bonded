@@ -14,11 +14,11 @@ Complete these before broad implementation begins.
 | # | Item | Status | Notes |
 |---|------|--------|-------|
 | P1 | Create implementation instructions for the coding agent | completed | See `AGENTS.md` |
-| P2 | Confirm repo structure migration plan (`server/` to workspace crates) | not-started | Decide whether to migrate immediately or stage it |
+| P2 | Confirm repo structure migration plan (`server/` to workspace crates) | completed | Migrate immediately in the first implementation checkpoint |
 | P3 | Define first runnable milestone | completed | Server + Linux client over NaiveTCP |
-| P4 | Define validation commands for each phase | not-started | Build, test, integration, Android smoke test |
-| P5 | Decide config file format and locations | not-started | Server config, authorized keys, client keypair |
-| P6 | Decide initial Rust crypto and TUN libraries | not-started | Record in `Key Implementation Decisions` |
+| P4 | Define validation commands for each phase | completed | See `Validation Commands` |
+| P5 | Decide config file format and locations | completed | See `Configuration Conventions` |
+| P6 | Decide initial Rust crypto and TUN libraries | completed | See `Initial Library Decisions` |
 | P7 | Define how progress is resumed after interruption | completed | Update this file every session |
 
 ---
@@ -30,6 +30,138 @@ The first mandatory milestone is:
 `Linux CLI client pairs with server, creates a NaiveTCP path, establishes a TUN-backed session, and successfully sends traffic through the server.`
 
 Do not treat Android work as the first proof point. Linux is the primary test harness for validating the shared core.
+
+---
+
+## Bootstrap Decisions
+
+- Migrate to a Cargo workspace immediately. Do not continue building out the legacy top-level `server/` crate structure.
+- Keep NaiveTCP as the only required transport until the first Linux end-to-end milestone passes.
+- Defer peer-sharing implementation even though it is in v1 scope; build it only after base server + Linux client tunneling is stable.
+- Keep Android implementation thin initially: QR pairing, VPN service, one connect/disconnect flow, one path if necessary for first proof.
+
+---
+
+## Configuration Conventions
+
+Use TOML for all human-edited configuration/state files in v1.
+
+Server files:
+
+- Primary config path: `/etc/bonded/server.toml`
+- Override via env: `BONDED_CONFIG`
+- Authorized keys path default: `/var/lib/bonded/authorized_keys.toml`
+- Invite tokens path default: `/var/lib/bonded/invite_tokens.toml`
+
+Recommended server config shape:
+
+```toml
+[server]
+bind = "0.0.0.0:8080"
+public_address = "bonded.example.com:8080"
+health_bind = "0.0.0.0:8081"
+log_level = "info"
+supported_protocols = ["naive_tcp"]
+authorized_keys_file = "/var/lib/bonded/authorized_keys.toml"
+invite_tokens_file = "/var/lib/bonded/invite_tokens.toml"
+```
+
+Recommended authorized keys shape:
+
+```toml
+[[devices]]
+device_id = "android-phone"
+public_key = "base64-ed25519-public-key"
+added_at = "2026-03-30T00:00:00Z"
+```
+
+Recommended invite token shape:
+
+```toml
+[[tokens]]
+token = "base64url-token"
+expires_at = "2026-03-31T00:00:00Z"
+uses_remaining = 1
+```
+
+Linux client files:
+
+- Config path: `~/.config/bonded/client.toml`
+- Private key path: `~/.local/share/bonded/device-key.pem`
+- Public key path: `~/.local/share/bonded/device-key.pub`
+
+Recommended Linux client config shape:
+
+```toml
+[client]
+device_name = "linux-cli"
+tun_name = "bonded0"
+server_public_address = "bonded.example.com:8080"
+server_public_key = "base64-ed25519-public-key"
+preferred_protocols = ["naive_tcp"]
+private_key_path = "~/.local/share/bonded/device-key.pem"
+public_key_path = "~/.local/share/bonded/device-key.pub"
+```
+
+Android stores paired server metadata and client keypair in app-private storage. Do not require user-editable config files on Android.
+
+---
+
+## Initial Library Decisions
+
+- Framing buffers: `bytes`
+- Async utilities / codecs: `tokio-util`
+- Config serialization: `serde` + `toml`
+- File watching: `notify`
+- Device identity / signatures: `ed25519-dalek`
+- QR generation: `qrcode`
+- Linux TUN: `tun`
+- CLI parsing for Linux/server utilities: `clap`
+- Android Rust build: `cargo-ndk`
+- Android bridge approach: thin Kotlin JNI wrapper over shared Rust library, exposed to Flutter through platform channels
+
+If these choices prove unsuitable during implementation, update `Key Implementation Decisions` with the replacement and rationale.
+
+---
+
+## Validation Commands
+
+These are the commands the implementation should keep working as the repo evolves.
+
+Phase 1 baseline:
+
+```bash
+cargo fmt --all --check
+cargo test --workspace
+```
+
+Server checkpoint:
+
+```bash
+cargo build -p bonded-server
+cargo test -p bonded-server
+```
+
+Linux client checkpoint:
+
+```bash
+cargo build -p bonded-cli
+cargo test -p bonded-cli
+```
+
+End-to-end checkpoint target:
+
+```bash
+cargo test --workspace -- --nocapture
+```
+
+Android checkpoint target:
+
+```bash
+cd android && flutter pub get && flutter build apk --debug
+```
+
+The implementation agent may add more specific test commands later, but these are the minimum expected validation entry points.
 
 ---
 
@@ -90,19 +222,19 @@ Build `bonded-core` with the foundational protocol pieces. Everything in this ph
 
 | # | Task | Status | Notes |
 |---|------|--------|-------|
-| 1.1 | Set up Cargo workspace with `bonded-core`, `bonded-server`, `bonded-cli` crates | not-started | Migrate existing `server/` into workspace |
-| 1.2 | Define session frame format (connection ID, sequence number, payload, flags) | not-started | Binary protocol, consider using `bytes` crate |
-| 1.3 | Implement session layer — framing, sequencing, reassembly, connection ID tracking | not-started | Core of CR-10 |
-| 1.4 | Define `Transport` trait (async read/write framed packets) | not-started | CR-8 pluggable interface |
+| 1.1 | Set up Cargo workspace with `bonded-core`, `bonded-server`, `bonded-cli` crates | completed | Added root workspace with crates: bonded-core, bonded-client, bonded-server, bonded-cli |
+| 1.2 | Define session frame format (connection ID, sequence number, payload, flags) | completed | Added header + payload frame format in `bonded-core::session` using `bytes` |
+| 1.3 | Implement session layer — framing, sequencing, reassembly, connection ID tracking | in-progress | Encode/decode scaffolding implemented; full reassembly/path-state logic pending |
+| 1.4 | Define `Transport` trait (async read/write framed packets) | completed | Added async transport trait + protocol kind enum in `bonded-core::transport` |
 | 1.5 | Implement NaiveTCP transport (client + server sides) | not-started | First transport for testing |
-| 1.6 | Define `Scheduler` trait (given packet + available paths → chosen path) | not-started | CR-11 pluggable interface |
-| 1.7 | Implement round-robin scheduler | not-started | Simplest naive scheduler |
-| 1.8 | Implement active-standby failover scheduler | not-started | Primary use case for v1 |
+| 1.6 | Define `Scheduler` trait (given packet + available paths → chosen path) | completed | Added scheduler trait with path IDs in `bonded-core::scheduler` |
+| 1.7 | Implement round-robin scheduler | completed | Basic round-robin selection scaffold + unit test |
+| 1.8 | Implement active-standby failover scheduler | completed | Basic active-first selector scaffold |
 | 1.9 | Keypair generation and storage utilities | not-started | Ed25519 or X25519 |
 | 1.10 | Invite token generation and redemption protocol | not-started | OQ-1 decision |
 | 1.11 | Public key challenge authentication on reconnect | not-started | Post-pairing auth |
-| 1.12 | Unit tests for session layer (framing, reordering, reassembly) | not-started | |
-| 1.13 | Unit tests for transports and schedulers | not-started | |
+| 1.12 | Unit tests for session layer (framing, reordering, reassembly) | in-progress | Frame encode/decode roundtrip test added; reordering/reassembly tests pending |
+| 1.13 | Unit tests for transports and schedulers | in-progress | Scheduler unit tests added; transport tests pending NaiveTCP |
 
 Acceptance gate:
 
@@ -233,7 +365,11 @@ Decisions made during implementation that aren't in the requirements docs.
 
 | Decision | Date | Notes |
 |----------|------|-------|
-| | | |
+| Immediate Cargo workspace migration | 2026-03-30 | Move to `crates/` before substantial feature work |
+| TOML for server/client config and simple persisted state | 2026-03-30 | Includes server config, authorized keys, invite tokens |
+| `ed25519-dalek` for device identity and signing | 2026-03-30 | Matches invite-token plus per-device public-key auth model |
+| `tun` crate for Linux TUN support | 2026-03-30 | Thin Linux-specific layer over shared client core |
+| Thin Kotlin JNI wrapper for Android bridge | 2026-03-30 | Flutter uses platform channels; avoid introducing a second cross-platform bridge layer early |
 
 ---
 

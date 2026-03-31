@@ -4,6 +4,7 @@
 
 # ----- Rust (server) -----
 server/target/
+target/
 **/*.rs.bk
 
 # ----- Flutter (client) -----

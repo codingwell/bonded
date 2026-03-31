@@ -38,26 +38,17 @@ Bonded aggregates several internet connections (Wi-Fi, cellular, Ethernet, etc.)
 
 ```
 bonded/
-├── server/             # Current Rust server prototype
+├── crates/
+│   ├── bonded-core/    # Shared protocol/session/auth/scheduler primitives
+│   ├── bonded-server/  # Server binary
+│   ├── bonded-client/  # Shared client runtime
+│   └── bonded-cli/     # Linux CLI client binary
+├── server/             # Docker and migration compatibility assets
 ├── docs/
 │   ├── requirements/   # Product requirements and specifications
 │   ├── design/         # Technical design documents
 │   └── guides/         # Developer guides and onboarding
 └── AGENTS.md           # Implementation instructions for coding agents
-```
-
-Planned near-term structure:
-
-```
-bonded/
-├── crates/
-│   ├── bonded-core/
-│   ├── bonded-server/
-│   ├── bonded-client/
-│   └── bonded-cli/
-├── android/
-├── docs/
-└── AGENTS.md
 ```
 
 ## Getting Started
@@ -72,12 +63,14 @@ bonded/
 ### Building
 
 ```bash
-# Current server prototype
-cd server
-cargo build
+# Workspace (server + linux cli + shared core)
+cargo build --workspace
+
+# Or build server only
+cargo build -p bonded-server
 ```
 
-Planned clients are not scaffolded yet. Implementation order is:
+Android scaffold is planned but not created yet. Implementation order is:
 
 1. Shared Rust core
 2. Server
