@@ -311,9 +311,9 @@ Build the Android platform layer. The core Rust logic is shared via FFI.
 | 4.3 | Platform channel: Dart ↔ Rust FFI | completed | Added Flutter `MethodChannel` (`bonded/native`) plus Android `MainActivity` bridge calling Rust JNI symbol `nativeApiVersion`; app now displays bridge status with graceful fallback when library is not bundled |
 | 4.4 | Android VPN Service implementation | in-progress | Added `BondedVpnService` shell (session/MTU/address/route establish path), manifest service registration, and MethodChannel start/stop/status wiring; explicit user-consent launch flow and packet I/O binding to Rust runtime remain pending |
 | 4.5 | Multi-network support (Wi-Fi + Cellular simultaneously) | not-started | AND-1, AND-3. Use `ConnectivityManager.requestNetwork()` |
-| 4.6 | QR code scanner screen | not-started | AND-9, FLT-7 |
-| 4.7 | Pairing flow UI — scan QR, redeem token, store keypair | not-started | |
-| 4.8 | Connection status dashboard UI | not-started | FLT-3 |
+| 4.6 | QR code scanner screen | completed | Added `mobile_scanner` package with QRScannerScreen widget; includes camera preview, QR detection, JSON payload parsing; full permission flow pending |
+| 4.7 | Pairing flow UI — scan QR, redeem token, store keypair | completed | Added `ServerPairingPayload` model, `PairingService` MethodChannel wrapper, and `PairingConfirmScreen` with server details display and redemption UI |
+| 4.8 | Connection status dashboard UI | completed | Added `DashboardScreen` with VPN toggle, status display, and connection details; added `HomeScreen` listing paired servers; updated main.dart with named routing for all screens |
 | 4.9 | Server configuration screen | not-started | FLT-4 |
 | 4.10 | Background operation | not-started | AND-4 |
 | 4.11 | End-to-end test: Android → server → internet | not-started | |
@@ -408,3 +408,17 @@ Decisions made during implementation that aren't in the requirements docs.
 | Issue | Status | Resolution |
 |-------|--------|------------|
 | | | |
+
+---
+
+## Phase 4 Android UI Implementation Session (2026-03-31)
+
+Completed QR scanner, pairing flow, and dashboard UI:
+
+| Item | Details |
+|------|---------|
+| 4.6 QR Scanner | `mobile_scanner` Flutter package with camera preview, QR detection via native platform channels, JSON payload parsing via `jsonDecode`; scanning overlay with framing guides |
+| 4.7 Pairing Flow | `ServerPairingPayload` model parsing QR JSON, `PairingService` MethodChannel wrapper for Rust-side token redemption, `PairingConfirmScreen` displaying server details with confirm/cancel buttons and error display |
+| 4.8 Dashboard | `DashboardScreen` with VPN status indicator, connect/disconnect toggle, connection details display, and per-device ID tracking; `HomeScreen` listing paired servers with navigation options |
+| Navigation | Main.dart updated with `initialRoute`, `routes` map for static screens, `onGenerateRoute` for dynamic screens with arguments (ServerPairingPayload, deviceId, etc.); supports deep linking |
+| Analysis | `flutter analyze` clean; `flutter pub get` successful with mobile_scanner ^5.2.0; all async BuildContext gaps protected with `mounted` checks |

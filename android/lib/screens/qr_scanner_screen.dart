@@ -1,0 +1,180 @@
+import 'package:flutter/material.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
+import '../models/pairing_model.dart';
+
+class QRScannerScreen extends StatefulWidget {
+  const QRScannerScreen({super.key});
+
+  @override
+  State<QRScannerScreen> createState() => _QRScannerScreenState();
+}
+
+class _QRScannerScreenState extends State<QRScannerScreen> {
+  late MobileScannerController controller;
+  bool hasPermission = false;
+  bool isLoading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    controller = MobileScannerController();
+    _checkPermission();
+  }
+
+  Future<void> _checkPermission() async {
+    // For now, assume permission is granted. In production, request actual camera permission.
+    setState(() {
+      hasPermission = true;
+      isLoading = false;
+    });
+  }
+
+  @override
+  void dispose() {
+    controller.dispose();
+    super.dispose();
+  }
+
+  void _onDetect(BarcodeCapture capture) {
+    final List<Barcode> barcodes = capture.barcodes;
+    
+    for (final barcode in barcodes) {
+      if (barcode.rawValue != null) {
+        final String qrData = barcode.rawValue!;
+        final ServerPairingPayload? payload =
+            ServerPairingPayload.parseQrData(qrData);
+
+        if (payload != null) {
+          // Successfully parsed QR code, navigate to pairing confirmation
+          Navigator.of(context).pushReplacementNamed(
+            '/pairing-confirm',
+            arguments: payload,
+          );
+        } else {
+          // Show error - invalid QR code format
+          _showError('Invalid Bonded QR code. Please try again.');
+        }
+      }
+    }
+  }
+
+  void _showError(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: Colors.red,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (isLoading) {
+      return Scaffold(
+        appBar: AppBar(
+          title: const Text('Scan Server QR Code'),
+        ),
+        body: const Center(
+          child: CircularProgressIndicator(),
+        ),
+      );
+    }
+
+    if (!hasPermission) {
+      return Scaffold(
+        appBar: AppBar(
+          title: const Text('Scan Server QR Code'),
+        ),
+        body: Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const Icon(Icons.camera_alt, size: 64, color: Colors.grey),
+              const SizedBox(height: 16),
+              const Text(
+                'Camera permission required',
+                style: TextStyle(fontSize: 18),
+              ),
+              const SizedBox(height: 32),
+              ElevatedButton(
+                onPressed: _checkPermission,
+                child: const Text('Grant Permission'),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Scan Server QR Code'),
+      ),
+      body: Stack(
+        children: [
+          MobileScanner(
+            controller: controller,
+            onDetect: _onDetect,
+          ),
+          // Scanning overlay
+          Container(
+            color: Colors.black26,
+            child: Stack(
+              children: [
+                // Dark overlay on sides and top/bottom
+                Container(
+                  color: Colors.black.withAlpha(200),
+                ),
+                // Clear rectangle in the center
+                Center(
+                  child: Container(
+                    width: 280,
+                    height: 280,
+                    decoration: BoxDecoration(
+                      border: Border.all(
+                        color: Colors.white,
+                        width: 2,
+                      ),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          // Instructions at bottom
+          Positioned(
+            bottom: 0,
+            left: 0,
+            right: 0,
+            child: Container(
+              color: Colors.black.withAlpha(180),
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                children: [
+                  const Text(
+                    'Position QR code within the frame',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 16,
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  ElevatedButton.icon(
+                    onPressed: () => Navigator.of(context).pop(),
+                    icon: const Icon(Icons.arrow_back),
+                    label: const Text('Cancel'),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.grey[700],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
