@@ -315,7 +315,7 @@ Build the Android platform layer. The core Rust logic is shared via FFI.
 | 4.7 | Pairing flow UI — scan QR, redeem token, store keypair | completed | Added `ServerPairingPayload` model, `PairingService` MethodChannel wrapper, and `PairingConfirmScreen` with server details display and redemption UI |
 | 4.8 | Connection status dashboard UI | completed | Added `DashboardScreen` with VPN toggle, status display, and connection details; added `HomeScreen` listing paired servers; updated main.dart with named routing for all screens |
 | 4.9 | Server configuration screen | completed | Added ServerConfigScreen showing server details, supported protocols display, and save/delete actions; integrated with HomeScreen PopupMenuButton for server management |
-| 4.10 | Background operation | not-started | AND-4 |
+| 4.10 | Background operation | in-progress | Added BackgroundService MethodChannel wrapper with EventChannel stream support for background events; added BackgroundNotificationHelper for UI feedback; integrated DashboardScreen to display background indicator when VPN runs in background |
 | 4.11 | End-to-end test: Android → server → internet | not-started | |
 
 Acceptance gate:
