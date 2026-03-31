@@ -30,4 +30,4 @@ tokio-util = "0.7"
 toml = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
-tun = "0.7"
+tun = { version = "0.7", features = ["async"] }

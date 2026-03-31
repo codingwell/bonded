@@ -1,5 +1,8 @@
 use bonded_core::auth::{sign_auth_challenge, DeviceKeypair};
 use bonded_core::config::ClientConfig;
+use bonded_core::session::SessionState;
+use bonded_core::transport::{NaiveTcpTransport, Transport};
+use bytes::Bytes;
 use pnet_datalink::NetworkInterface;
 use serde::Deserialize;
 use serde_json::json;
@@ -7,6 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+use tokio::select;
 use tracing::info;
 #[cfg(target_os = "linux")]
 use tun::Configuration;
@@ -28,12 +32,17 @@ impl ClientRuntime {
             "detected network interfaces for client runtime"
         );
 
+        let stream = establish_naive_tcp_session(&self.config).await?;
+
         #[cfg(target_os = "linux")]
         {
-            initialize_tun(&self.config.client.tun_name)?;
+            run_linux_packet_loop(&self.config.client.tun_name, stream).await?;
         }
 
-        let _stream = establish_naive_tcp_session(&self.config).await?;
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = stream;
+        }
 
         info!(
             device = %self.config.client.device_name,
@@ -179,18 +188,40 @@ pub fn enumerate_interfaces() -> Vec<NetworkInterface> {
 }
 
 #[cfg(target_os = "linux")]
-fn initialize_tun(tun_name: &str) -> anyhow::Result<()> {
+fn build_tun_config(tun_name: &str) -> Configuration {
     let mut config = Configuration::default();
     config.tun_name(tun_name).up();
-
-    let _device = tun::create(&config)?;
-    info!(tun_name = %tun_name, "linux TUN device initialized");
-    Ok(())
+    config
 }
 
-#[cfg(not(target_os = "linux"))]
-fn initialize_tun(_tun_name: &str) -> anyhow::Result<()> {
-    Ok(())
+#[cfg(target_os = "linux")]
+async fn run_linux_packet_loop(tun_name: &str, stream: TcpStream) -> anyhow::Result<()> {
+    let config = build_tun_config(tun_name);
+    let device = tun::create_as_async(&config)?;
+    let mut transport = NaiveTcpTransport::from_stream(stream);
+    let mut state = SessionState::new(1);
+    let mut tun_buf = vec![0_u8; 8192];
+
+    loop {
+        select! {
+            tun_result = device.recv(&mut tun_buf) => {
+                let read = tun_result?;
+                if read == 0 {
+                    continue;
+                }
+
+                let frame = state.create_outbound_frame(Bytes::copy_from_slice(&tun_buf[..read]), 0);
+                transport.send(frame).await?;
+            }
+            frame_result = transport.recv() => {
+                let frame = frame_result?;
+                let ready = state.ingest_inbound(frame)?;
+                for packet in ready {
+                    let _ = device.send(&packet.payload).await?;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
