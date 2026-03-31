@@ -8,6 +8,7 @@ description = "Bonded server binary"
 [dependencies]
 anyhow.workspace = true
 bonded-core = { path = "../bonded-core" }
+bytes.workspace = true
 clap.workspace = true
 notify.workspace = true
 qrcode.workspace = true

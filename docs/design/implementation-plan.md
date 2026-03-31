@@ -262,7 +262,7 @@ Build the server binary on top of `bonded-core`.
 | 2.9 | Health check endpoint (HTTP) | completed | Added lightweight HTTP 200 `OK` endpoint on configured `health_bind`, started alongside NaiveTCP listener |
 | 2.10 | Configurable log verbosity | completed | Startup tracing level now maps from server config `log_level` (with `BONDED_LOG_LEVEL` override) |
 | 2.11 | Dockerfile update for new workspace structure | completed | Updated Docker build to target workspace crates, expose app+health ports, and set runtime config/state defaults under `/etc/bonded` and `/var/lib/bonded` |
-| 2.12 | Integration test: server starts, accepts connection, forwards traffic | not-started | |
+| 2.12 | Integration test: server starts, accepts connection, forwards traffic | completed | Added integration test that authenticates a client over NaiveTCP and verifies framed session payload exchange on the authenticated stream |
 
 Acceptance gate:
 
@@ -382,6 +382,7 @@ Decisions made during implementation that aren't in the requirements docs.
 | Server session IDs are assigned from an in-memory registry keyed by authenticated client key | 2026-03-31 | Allows concurrent client session tracking before full packet-forwarding pipeline is wired |
 | Pairing QR payload is JSON containing public address, invite token, server public key, and supported protocols | 2026-03-31 | Meets CR-6a/OQ-5 metadata requirements while keeping scanner parsing straightforward |
 | Container runtime defaults mount config/state at `/etc/bonded` and `/var/lib/bonded` | 2026-03-31 | Aligns image behavior with documented server file conventions |
+| Server integration tests exercise full auth handshake then framed payload exchange on the same TCP stream | 2026-03-31 | Ensures session traffic can continue immediately after authentication |
 
 ---
 

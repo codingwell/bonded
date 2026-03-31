@@ -7,6 +7,9 @@ mod invite_tokens;
 mod pairing_qr;
 mod session_registry;
 
+#[cfg(test)]
+mod server_integration;
+
 use auth_handshake::perform_auth_handshake;
 use authorized_keys::{AuthorizedKeysStore, AuthorizedKeysWatcher};
 use bonded_core::auth::DeviceKeypair;
