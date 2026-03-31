@@ -10,5 +10,7 @@ void main() {
     expect(find.text('Bonded Android Shell'), findsOneWidget);
     expect(find.text('Bridge status'), findsOneWidget);
     expect(find.text('Refresh bridge status'), findsOneWidget);
+    expect(find.text('Start VPN'), findsOneWidget);
+    expect(find.text('Stop VPN'), findsOneWidget);
   });
 }

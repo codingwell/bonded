@@ -309,7 +309,7 @@ Build the Android platform layer. The core Rust logic is shared via FFI.
 | 4.1 | Flutter project setup (Android target initially) | completed | Created Flutter app scaffold at `android/` with Android-only platform (`flutter create --platforms=android`); validated via `flutter test` and `flutter analyze` |
 | 4.2 | Rust → Android FFI bridge (bonded-core compiled for Android targets) | completed | Added `crates/bonded-ffi` (`cdylib`/`staticlib`) with stable C ABI wrappers over `bonded-core` session-frame metadata decoding, validated by crate tests and `cargo check --target aarch64-linux-android` |
 | 4.3 | Platform channel: Dart ↔ Rust FFI | completed | Added Flutter `MethodChannel` (`bonded/native`) plus Android `MainActivity` bridge calling Rust JNI symbol `nativeApiVersion`; app now displays bridge status with graceful fallback when library is not bundled |
-| 4.4 | Android VPN Service implementation | not-started | AND-2 |
+| 4.4 | Android VPN Service implementation | in-progress | Added `BondedVpnService` shell (session/MTU/address/route establish path), manifest service registration, and MethodChannel start/stop/status wiring; explicit user-consent launch flow and packet I/O binding to Rust runtime remain pending |
 | 4.5 | Multi-network support (Wi-Fi + Cellular simultaneously) | not-started | AND-1, AND-3. Use `ConnectivityManager.requestNetwork()` |
 | 4.6 | QR code scanner screen | not-started | AND-9, FLT-7 |
 | 4.7 | Pairing flow UI — scan QR, redeem token, store keypair | not-started | |
@@ -394,6 +394,7 @@ Decisions made during implementation that aren't in the requirements docs.
 | Android shell starts as Flutter project under `android/` with Android-only scaffold | 2026-03-31 | Keeps initial mobile scope thin while preserving a direct path to FLT/AND tasks in later Phase 4 steps |
 | Android Rust bridge uses dedicated `bonded-ffi` crate with minimal C ABI and explicit metadata decode wrapper | 2026-03-31 | Creates a stable JNI/FFI boundary while reusing `bonded-core` internals and enabling incremental API expansion |
 | Flutter-to-Rust handshake starts via `MethodChannel` and Kotlin JNI stub before full native library packaging | 2026-03-31 | Enables incremental UI and bridge validation even when `jniLibs` artifacts are not yet produced in CI/dev flows |
+| Android VPN lifecycle is first exposed through MethodChannel (`start/stop/status`) with `BondedVpnService` shell | 2026-03-31 | Allows Flutter UI and host plumbing to stabilize before binding live TUN packet flow into shared Rust runtime |
 
 ---
 

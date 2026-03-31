@@ -1,5 +1,6 @@
 package com.bonded.bonded_app
 
+import android.net.VpnService
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -39,6 +40,25 @@ class MainActivity : FlutterActivity() {
 						} catch (_: UnsatisfiedLinkError) {
 							result.success(-1)
 						}
+					}
+
+					"getVpnStatus" -> {
+						result.success(BondedVpnService.isRunning())
+					}
+
+					"startVpnService" -> {
+						val prepareIntent = VpnService.prepare(this)
+						if (prepareIntent != null) {
+							result.success("permission_required")
+						} else {
+							BondedVpnService.start(this)
+							result.success("started")
+						}
+					}
+
+					"stopVpnService" -> {
+						BondedVpnService.stop(this)
+						result.success("stopped")
 					}
 
 					else -> result.notImplemented()
