@@ -306,7 +306,7 @@ Build the Android platform layer. The core Rust logic is shared via FFI.
 
 | # | Task | Status | Notes |
 |---|------|--------|-------|
-| 4.1 | Flutter project setup (Android target initially) | not-started | |
+| 4.1 | Flutter project setup (Android target initially) | completed | Created Flutter app scaffold at `android/` with Android-only platform (`flutter create --platforms=android`); validated via `flutter test` and `flutter analyze` |
 | 4.2 | Rust → Android FFI bridge (bonded-core compiled for Android targets) | not-started | `cargo-ndk` or `uniffi` |
 | 4.3 | Platform channel: Dart ↔ Rust FFI | not-started | FLT-2 |
 | 4.4 | Android VPN Service implementation | not-started | AND-2 |
@@ -391,6 +391,7 @@ Decisions made during implementation that aren't in the requirements docs.
 | Linux multipath uses active-primary with failover-to-survivor strategy for first implementation | 2026-03-31 | Delivers CR-1/CR-2 behavior without introducing concurrent scheduler complexity in the initial client loop |
 | Linux failover integration tests treat first-path send closure as acceptable and assert survivor-path continuity | 2026-03-31 | Avoids flaky timing assumptions while still validating failover behavior under path loss |
 | Invite redemption is handled inline during auth hello when key is unknown and invite token is present | 2026-03-31 | Allows first-time pairing and key registration without a separate control endpoint in initial NaiveTCP milestone |
+| Android shell starts as Flutter project under `android/` with Android-only scaffold | 2026-03-31 | Keeps initial mobile scope thin while preserving a direct path to FLT/AND tasks in later Phase 4 steps |
 
 ---
 
