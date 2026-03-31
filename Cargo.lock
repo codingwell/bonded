@@ -190,6 +190,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bonded-ffi"
+version = "0.1.0"
+dependencies = [
+ "bonded-core",
+]
+
+[[package]]
 name = "bonded-server"
 version = "0.1.0"
 dependencies = [

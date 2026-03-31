@@ -1,16 +1,28 @@
-# bonded_app
+# Bonded Android Client
 
-A new Flutter project.
+This directory contains the Flutter Android client shell app.
 
-## Getting Started
+## Development Commands
 
-This project is a starting point for a Flutter application.
+```bash
+cd android
+flutter pub get
+flutter test
+flutter analyze
+```
 
-A few resources to get you started if this is your first Flutter project:
+## Rust FFI Bridge
 
-- [Lab: Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Cookbook: Useful Flutter samples](https://docs.flutter.dev/cookbook)
+Rust FFI code lives in the workspace crate `crates/bonded-ffi`.
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+Planned Android bridge build flow:
+
+```bash
+rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+cargo install cargo-ndk
+
+# from repository root
+cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -o android/android/app/src/main/jniLibs build -p bonded-ffi --release
+```
+
+The Flutter app will load this native library in Phase 4.3 via Dart FFI / platform bridge wiring.
