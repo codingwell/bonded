@@ -255,8 +255,8 @@ Build the server binary on top of `bonded-core`.
 | 2.2 | Authorized keys file — load, watch for changes, reload | completed | Added server authorized key store loading from TOML plus `notify` file watcher that reloads key state on file changes |
 | 2.3 | Accept NaiveTCP connections, perform auth handshake | completed | Added NaiveTCP listener accept loop and line-delimited JSON challenge-signature handshake with authorized-key enforcement |
 | 2.4 | Server-side session management (multiple concurrent clients) | completed | Added concurrent session registry keyed by authenticated client key with unique server session IDs and per-connection frame receive loop lifecycle |
-| 2.5 | IP packet forwarding — read from session, write to internet (TUN or raw socket) | not-started | SRV-3 |
-| 2.6 | Return traffic — read from internet, write back to correct client session | not-started | |
+| 2.5 | IP packet forwarding — read from session, write to internet (TUN or raw socket) | completed | Added initial frame-forwarding path that relays payload bytes to optional upstream TCP target (`BONDED_UPSTREAM_TCP_TARGET`) |
+| 2.6 | Return traffic — read from internet, write back to correct client session | completed | Forwarder now emits response frames back over the authenticated session transport, falling back to payload echo when no upstream is set |
 | 2.7 | Invite token creation (on admin request / startup) | completed | Added startup invite-token bootstrap that reuses existing usable token or creates/persists a new single-use token |
 | 2.8 | QR code generation and emission to logs | completed | Added startup pairing payload JSON + terminal QR emission; logs warning and skips QR when `public_address` is not configured |
 | 2.9 | Health check endpoint (HTTP) | completed | Added lightweight HTTP 200 `OK` endpoint on configured `health_bind`, started alongside NaiveTCP listener |
@@ -383,6 +383,7 @@ Decisions made during implementation that aren't in the requirements docs.
 | Pairing QR payload is JSON containing public address, invite token, server public key, and supported protocols | 2026-03-31 | Meets CR-6a/OQ-5 metadata requirements while keeping scanner parsing straightforward |
 | Container runtime defaults mount config/state at `/etc/bonded` and `/var/lib/bonded` | 2026-03-31 | Aligns image behavior with documented server file conventions |
 | Server integration tests exercise full auth handshake then framed payload exchange on the same TCP stream | 2026-03-31 | Ensures session traffic can continue immediately after authentication |
+| Initial server internet-forwarding mode is payload relay to optional upstream TCP target with echo fallback | 2026-03-31 | Provides deterministic end-to-end forward/return behavior before full TUN/raw-socket integration |
 
 ---
 

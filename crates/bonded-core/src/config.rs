@@ -37,6 +37,7 @@ pub struct ServerSection {
     pub bind: String,
     pub public_address: String,
     pub health_bind: String,
+    pub upstream_tcp_target: String,
     pub log_level: String,
     pub supported_protocols: Vec<String>,
     pub authorized_keys_file: String,
@@ -49,6 +50,7 @@ impl Default for ServerSection {
             bind: "0.0.0.0:8080".to_owned(),
             public_address: String::new(),
             health_bind: "0.0.0.0:8081".to_owned(),
+            upstream_tcp_target: String::new(),
             log_level: "info".to_owned(),
             supported_protocols: vec!["naive_tcp".to_owned()],
             authorized_keys_file: DEFAULT_AUTHORIZED_KEYS_PATH.to_owned(),
@@ -113,5 +115,6 @@ mod tests {
     fn default_server_config_has_naive_tcp_protocol() {
         let cfg = ServerConfig::default();
         assert_eq!(cfg.server.supported_protocols, vec!["naive_tcp"]);
+        assert!(cfg.server.upstream_tcp_target.is_empty());
     }
 }

@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 mod auth_handshake;
 mod authorized_keys;
+mod frame_forwarder;
 mod health;
 mod invite_tokens;
 mod pairing_qr;
@@ -16,6 +17,7 @@ use bonded_core::auth::DeviceKeypair;
 use bonded_core::config::{load_server_config, ServerConfig, DEFAULT_SERVER_CONFIG_PATH};
 use bonded_core::transport::{NaiveTcpTransport, Transport};
 use clap::Parser;
+use frame_forwarder::forward_frame;
 use health::run_health_server;
 use invite_tokens::ensure_startup_invite;
 use pairing_qr::emit_pairing_qr;
@@ -79,6 +81,7 @@ async fn main() -> anyhow::Result<()> {
     info!(bind = %cfg.server.bind, "bonded-server starting");
     run_server(
         &cfg.server.bind,
+        &cfg.server.upstream_tcp_target,
         authorized_keys,
         SessionRegistry::default(),
     )
@@ -87,6 +90,7 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run_server(
     bind: &str,
+    upstream_tcp_target: &str,
     authorized_keys: AuthorizedKeysStore,
     sessions: SessionRegistry,
 ) -> anyhow::Result<()> {
@@ -104,6 +108,7 @@ async fn run_server(
 
         let authorized_keys = authorized_keys.clone();
         let sessions = sessions.clone();
+        let upstream_tcp_target = upstream_tcp_target.to_owned();
         tokio::spawn(async move {
             match perform_auth_handshake(stream, authorized_keys).await {
                 Ok((public_key, stream)) => {
@@ -120,15 +125,39 @@ async fn run_server(
                     loop {
                         match transport.recv().await {
                             Ok(frame) => {
-                                info!(
-                                    peer = %peer,
-                                    public_key = %public_key,
-                                    session_id = handle.session_id,
-                                    connection_id = frame.header.connection_id,
-                                    sequence = frame.header.sequence,
-                                    payload_len = frame.payload.len(),
-                                    "received session frame"
-                                );
+                                let response = match forward_frame(
+                                    frame,
+                                    if upstream_tcp_target.is_empty() {
+                                        None
+                                    } else {
+                                        Some(upstream_tcp_target.as_str())
+                                    },
+                                )
+                                .await
+                                {
+                                    Ok(value) => value,
+                                    Err(err) => {
+                                        warn!(
+                                            peer = %peer,
+                                            public_key = %public_key,
+                                            session_id = handle.session_id,
+                                            error = %err,
+                                            "failed to forward session frame"
+                                        );
+                                        continue;
+                                    }
+                                };
+
+                                if let Err(err) = transport.send(response).await {
+                                    warn!(
+                                        peer = %peer,
+                                        public_key = %public_key,
+                                        session_id = handle.session_id,
+                                        error = %err,
+                                        "failed to return forwarded frame"
+                                    );
+                                    break;
+                                }
                             }
                             Err(err) => {
                                 info!(
@@ -167,6 +196,9 @@ where
     }
     if let Some(health_bind) = read_env("BONDED_HEALTH_BIND") {
         cfg.server.health_bind = health_bind;
+    }
+    if let Some(upstream_tcp_target) = read_env("BONDED_UPSTREAM_TCP_TARGET") {
+        cfg.server.upstream_tcp_target = upstream_tcp_target;
     }
     if let Some(log_level) = read_env("BONDED_LOG_LEVEL") {
         cfg.server.log_level = log_level;
@@ -215,6 +247,7 @@ mod tests {
             ("BONDED_BIND", "127.0.0.1:9000"),
             ("BONDED_PUBLIC_ADDRESS", "bonded.example.com:9000"),
             ("BONDED_HEALTH_BIND", "127.0.0.1:9001"),
+            ("BONDED_UPSTREAM_TCP_TARGET", "127.0.0.1:9100"),
             ("BONDED_LOG_LEVEL", "debug"),
             ("BONDED_AUTHORIZED_KEYS_FILE", "/tmp/auth.toml"),
             ("BONDED_INVITE_TOKENS_FILE", "/tmp/tokens.toml"),
@@ -230,6 +263,7 @@ mod tests {
         assert_eq!(cfg.server.bind, "127.0.0.1:9000");
         assert_eq!(cfg.server.public_address, "bonded.example.com:9000");
         assert_eq!(cfg.server.health_bind, "127.0.0.1:9001");
+        assert_eq!(cfg.server.upstream_tcp_target, "127.0.0.1:9100");
         assert_eq!(cfg.server.log_level, "debug");
         assert_eq!(cfg.server.authorized_keys_file, "/tmp/auth.toml");
         assert_eq!(cfg.server.invite_tokens_file, "/tmp/tokens.toml");
