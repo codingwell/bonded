@@ -1,7 +1,7 @@
 use bonded_core::auth::{sign_auth_challenge, DeviceKeypair};
 use bonded_core::config::ClientConfig;
 use bonded_core::session::SessionState;
-use bonded_core::transport::{NaiveTcpTransport, Transport};
+use bonded_core::transport::{NaiveTcpTransport, Transport, WebSocketTlsTransport};
 use bytes::Bytes;
 use pnet_datalink::NetworkInterface;
 use serde::Deserialize;
@@ -17,6 +17,27 @@ use tun::Configuration;
 
 #[cfg(test)]
 mod client_integration;
+
+enum ClientTransport {
+    NaiveTcp(NaiveTcpTransport),
+    WebSocket(WebSocketTlsTransport),
+}
+
+impl ClientTransport {
+    async fn send(&mut self, frame: bonded_core::session::SessionFrame) -> anyhow::Result<()> {
+        match self {
+            ClientTransport::NaiveTcp(inner) => inner.send(frame).await,
+            ClientTransport::WebSocket(inner) => inner.send(frame).await,
+        }
+    }
+
+    async fn recv(&mut self) -> anyhow::Result<bonded_core::session::SessionFrame> {
+        match self {
+            ClientTransport::NaiveTcp(inner) => inner.recv().await,
+            ClientTransport::WebSocket(inner) => inner.recv().await,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ClientRuntime {
@@ -36,20 +57,20 @@ impl ClientRuntime {
         );
 
         let max_paths = interfaces.len().clamp(1, 2);
-        let streams = establish_naive_tcp_sessions(&self.config, max_paths).await?;
+        let transports = establish_transport_paths(&self.config, max_paths).await?;
         info!(
-            paths = streams.len(),
+            paths = transports.len(),
             "authenticated transport paths established"
         );
 
         #[cfg(target_os = "linux")]
         {
-            run_linux_packet_loop(&self.config.client.tun_name, streams).await?;
+            run_linux_packet_loop(&self.config.client.tun_name, transports).await?;
         }
 
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = streams;
+            let _ = transports;
         }
 
         info!(
@@ -58,6 +79,58 @@ impl ClientRuntime {
         );
         Ok(())
     }
+}
+
+async fn establish_transport_paths(
+    config: &ClientConfig,
+    count: usize,
+) -> anyhow::Result<Vec<ClientTransport>> {
+    let protocols = if config.client.preferred_protocols.is_empty() {
+        vec!["naive_tcp".to_owned()]
+    } else {
+        config.client.preferred_protocols.clone()
+    };
+
+    let target = count.max(1);
+    let mut paths = Vec::with_capacity(target);
+    for path_index in 0..target {
+        let mut connected: Option<ClientTransport> = None;
+        for protocol in rotated_protocols(&protocols, path_index) {
+            let attempt = match protocol.as_str() {
+                "naive_tcp" => establish_naive_tcp_session(config)
+                    .await
+                    .map(NaiveTcpTransport::from_stream)
+                    .map(ClientTransport::NaiveTcp),
+                "wss" | "websocket_tls" => establish_websocket_session(config)
+                    .await
+                    .map(ClientTransport::WebSocket),
+                _ => continue,
+            };
+
+            if let Ok(path) = attempt {
+                connected = Some(path);
+                break;
+            }
+        }
+
+        let Some(path) = connected else {
+            anyhow::bail!("failed to establish path {path_index} with configured protocols");
+        };
+        paths.push(path);
+    }
+
+    Ok(paths)
+}
+
+fn rotated_protocols(protocols: &[String], start: usize) -> Vec<String> {
+    if protocols.is_empty() {
+        return Vec::new();
+    }
+
+    let len = protocols.len();
+    (0..len)
+        .map(|offset| protocols[(start + offset) % len].clone())
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,6 +175,36 @@ pub async fn establish_naive_tcp_sessions(
         streams.push(establish_naive_tcp_session(config).await?);
     }
     Ok(streams)
+}
+
+async fn establish_websocket_session(
+    config: &ClientConfig,
+) -> anyhow::Result<WebSocketTlsTransport> {
+    if config.client.server_public_address.trim().is_empty() {
+        anyhow::bail!("server_public_address is required for websocket connection");
+    }
+
+    let keypair = load_or_create_device_keypair(
+        &expand_home_path(&config.client.private_key_path),
+        &expand_home_path(&config.client.public_key_path),
+    )?;
+
+    let address = &config.client.server_public_address;
+    let websocket_address = if config.client.server_websocket_address.trim().is_empty() {
+        address
+    } else {
+        &config.client.server_websocket_address
+    };
+    let websocket_url =
+        if websocket_address.starts_with("ws://") || websocket_address.starts_with("wss://") {
+            websocket_address.clone()
+        } else {
+            format!("ws://{websocket_address}")
+        };
+
+    let mut transport = WebSocketTlsTransport::connect(&websocket_url).await?;
+    perform_websocket_auth_handshake(&mut transport, &keypair, &config.client.invite_token).await?;
+    Ok(transport)
 }
 
 async fn perform_auth_handshake(
@@ -157,6 +260,38 @@ async fn perform_auth_handshake(
     Ok(stream)
 }
 
+async fn perform_websocket_auth_handshake(
+    transport: &mut WebSocketTlsTransport,
+    keypair: &DeviceKeypair,
+    invite_token: &str,
+) -> anyhow::Result<()> {
+    let hello = json!({
+        "public_key_b64": keypair.public_key_b64,
+        "invite_token": invite_token,
+    });
+    transport.send_text(&hello.to_string()).await?;
+
+    let challenge_line = transport.recv_text().await?;
+    let challenge: ServerChallenge = serde_json::from_str(challenge_line.trim_end())?;
+    let signature_b64 = sign_auth_challenge(keypair, &challenge.challenge_b64)?;
+
+    let proof = json!({
+        "signature_b64": signature_b64,
+    });
+    transport.send_text(&proof.to_string()).await?;
+
+    let result_line = transport.recv_text().await?;
+    let result: ServerAuthResult = serde_json::from_str(result_line.trim_end())?;
+    if result.status != "ok" {
+        anyhow::bail!(
+            "server rejected websocket authentication with status {}",
+            result.status
+        );
+    }
+
+    Ok(())
+}
+
 fn load_or_create_device_keypair(
     private_key_path: &Path,
     public_key_path: &Path,
@@ -197,6 +332,7 @@ fn expand_home_path(path: &str) -> PathBuf {
 pub fn apply_pairing_payload(config: &mut ClientConfig, payload_json: &str) -> anyhow::Result<()> {
     let payload: PairingPayload = serde_json::from_str(payload_json)?;
     config.client.server_public_address = payload.server_public_address;
+    config.client.server_websocket_address = config.client.server_public_address.clone();
     config.client.server_public_key = payload.server_public_key;
     config.client.invite_token = payload.invite_token;
     if !payload.supported_protocols.is_empty() {
@@ -217,13 +353,13 @@ fn build_tun_config(tun_name: &str) -> Configuration {
 }
 
 #[cfg(target_os = "linux")]
-async fn run_linux_packet_loop(tun_name: &str, streams: Vec<TcpStream>) -> anyhow::Result<()> {
+async fn run_linux_packet_loop(
+    tun_name: &str,
+    transports: Vec<ClientTransport>,
+) -> anyhow::Result<()> {
     let config = build_tun_config(tun_name);
     let device = tun::create_as_async(&config)?;
-    let mut transports: Vec<NaiveTcpTransport> = streams
-        .into_iter()
-        .map(NaiveTcpTransport::from_stream)
-        .collect();
+    let mut transports = transports;
     let mut active_index = 0_usize;
     let mut state = SessionState::new(1);
     let mut tun_buf = vec![0_u8; 8192];

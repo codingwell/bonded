@@ -69,7 +69,11 @@ pub fn authorize_device_key(path: impl AsRef<Path>, public_key: &str) -> anyhow:
     let path = path.as_ref();
     let mut doc = load_devices_file(path)?;
 
-    if doc.devices.iter().any(|device| device.public_key == public_key) {
+    if doc
+        .devices
+        .iter()
+        .any(|device| device.public_key == public_key)
+    {
         return Ok(false);
     }
 

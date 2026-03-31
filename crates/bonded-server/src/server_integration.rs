@@ -2,7 +2,7 @@ use crate::auth_handshake::perform_auth_handshake;
 use crate::authorized_keys::AuthorizedKeysStore;
 use bonded_core::auth::{sign_auth_challenge, DeviceKeypair};
 use bonded_core::session::{SessionFrame, SessionHeader};
-use bonded_core::transport::{NaiveTcpTransport, Transport};
+use bonded_core::transport::{NaiveTcpTransport, Transport, WebSocketTlsTransport};
 use bytes::Bytes;
 use serde_json::Value;
 use std::fs;
@@ -126,6 +126,119 @@ uses_remaining = 1
     assert_eq!(received.header.connection_id, 77);
     assert_eq!(received.header.sequence, 0);
     assert_eq!(&received.payload[..], b"frame-payload");
+
+    let _ = fs::remove_file(path);
+    let _ = fs::remove_file(invites);
+}
+
+#[tokio::test]
+async fn authenticated_websocket_client_can_exchange_session_frame() {
+    let keypair = DeviceKeypair::generate();
+    let path = temp_file_path("server-ws-e2e");
+    let invites = temp_file_path("server-ws-e2e-invites");
+    fs::write(
+        &path,
+        format!(
+            "[[devices]]\ndevice_id = \"linux-cli\"\npublic_key = \"{}\"\n",
+            keypair.public_key_b64
+        ),
+    )
+    .expect("authorized keys file should be written");
+    fs::write(
+        &invites,
+        r#"[[tokens]]
+token = "pair-me"
+expires_at = "unix:9999999999"
+uses_remaining = 1
+"#,
+    )
+    .expect("invite tokens file should be written");
+
+    let store = AuthorizedKeysStore::load(&path).expect("authorized keys should load");
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let addr = listener.local_addr().expect("local address should resolve");
+
+    let invites_for_server = invites.clone();
+    let server_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept should succeed");
+        let mut transport = WebSocketTlsTransport::accept(stream)
+            .await
+            .expect("websocket should accept");
+        let public_key = crate::auth_handshake::perform_websocket_auth_handshake(
+            &mut transport,
+            store,
+            &invites_for_server,
+        )
+        .await
+        .expect("websocket handshake should succeed");
+
+        let frame = transport
+            .recv()
+            .await
+            .expect("server should receive websocket frame");
+        (public_key, frame)
+    });
+
+    let mut transport = WebSocketTlsTransport::connect(&format!("ws://{addr}"))
+        .await
+        .expect("client websocket should connect");
+
+    let hello = serde_json::json!({
+        "public_key_b64": keypair.public_key_b64,
+        "invite_token": "",
+    });
+    transport
+        .send_text(&hello.to_string())
+        .await
+        .expect("hello should be written");
+
+    let challenge_line = transport
+        .recv_text()
+        .await
+        .expect("challenge should be readable");
+    let challenge: Value =
+        serde_json::from_str(challenge_line.trim_end()).expect("challenge json should parse");
+    let challenge_b64 = challenge["challenge_b64"]
+        .as_str()
+        .expect("challenge should include challenge_b64");
+
+    let signature_b64 =
+        sign_auth_challenge(&keypair, challenge_b64).expect("challenge should be signable");
+    let proof = serde_json::json!({
+        "signature_b64": signature_b64,
+    });
+    transport
+        .send_text(&proof.to_string())
+        .await
+        .expect("proof should be written");
+
+    let result_line = transport
+        .recv_text()
+        .await
+        .expect("result should be readable");
+    let result: Value = serde_json::from_str(result_line.trim_end()).expect("result should parse");
+    assert_eq!(result["status"], "ok");
+
+    transport
+        .send(SessionFrame {
+            header: SessionHeader {
+                connection_id: 78,
+                sequence: 0,
+                flags: 0,
+            },
+            payload: Bytes::from_static(b"ws-frame-payload"),
+        })
+        .await
+        .expect("client should send websocket framed payload");
+
+    let (public_key, received) = server_task.await.expect("server task should join");
+    assert_eq!(public_key, keypair.public_key_b64);
+    assert_eq!(received.header.connection_id, 78);
+    assert_eq!(received.header.sequence, 0);
+    assert_eq!(&received.payload[..], b"ws-frame-payload");
 
     let _ = fs::remove_file(path);
     let _ = fs::remove_file(invites);

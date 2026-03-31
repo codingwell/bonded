@@ -35,6 +35,7 @@ impl Default for ServerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerSection {
     pub bind: String,
+    pub websocket_bind: String,
     pub public_address: String,
     pub health_bind: String,
     pub upstream_tcp_target: String,
@@ -48,6 +49,7 @@ impl Default for ServerSection {
     fn default() -> Self {
         Self {
             bind: "0.0.0.0:8080".to_owned(),
+            websocket_bind: "0.0.0.0:8443".to_owned(),
             public_address: String::new(),
             health_bind: "0.0.0.0:8081".to_owned(),
             upstream_tcp_target: String::new(),
@@ -77,6 +79,7 @@ pub struct ClientSection {
     pub device_name: String,
     pub tun_name: String,
     pub server_public_address: String,
+    pub server_websocket_address: String,
     pub server_public_key: String,
     pub invite_token: String,
     pub preferred_protocols: Vec<String>,
@@ -90,9 +93,10 @@ impl Default for ClientSection {
             device_name: "linux-cli".to_owned(),
             tun_name: "bonded0".to_owned(),
             server_public_address: String::new(),
+            server_websocket_address: String::new(),
             server_public_key: String::new(),
             invite_token: String::new(),
-            preferred_protocols: vec!["naive_tcp".to_owned()],
+            preferred_protocols: vec!["naive_tcp".to_owned(), "wss".to_owned()],
             private_key_path: DEFAULT_CLIENT_PRIVATE_KEY_PATH.to_owned(),
             public_key_path: DEFAULT_CLIENT_PUBLIC_KEY_PATH.to_owned(),
         }
@@ -118,5 +122,6 @@ mod tests {
         let cfg = ServerConfig::default();
         assert_eq!(cfg.server.supported_protocols, vec!["naive_tcp"]);
         assert!(cfg.server.upstream_tcp_target.is_empty());
+        assert_eq!(cfg.server.websocket_bind, "0.0.0.0:8443");
     }
 }

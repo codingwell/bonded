@@ -11,7 +11,7 @@ mod session_registry;
 #[cfg(test)]
 mod server_integration;
 
-use auth_handshake::perform_auth_handshake;
+use auth_handshake::{perform_auth_handshake, perform_websocket_auth_handshake};
 use authorized_keys::{AuthorizedKeysStore, AuthorizedKeysWatcher};
 use bonded_core::auth::DeviceKeypair;
 use bonded_core::config::{load_server_config, ServerConfig, DEFAULT_SERVER_CONFIG_PATH};
@@ -79,6 +79,25 @@ async fn main() -> anyhow::Result<()> {
     });
 
     info!(bind = %cfg.server.bind, "bonded-server starting");
+    let websocket_bind = cfg.server.websocket_bind.clone();
+    let websocket_upstream = cfg.server.upstream_tcp_target.clone();
+    let websocket_invites = cfg.server.invite_tokens_file.clone();
+    let websocket_sessions = SessionRegistry::default();
+    let websocket_keys = authorized_keys.clone();
+    tokio::spawn(async move {
+        if let Err(err) = run_websocket_server(
+            &websocket_bind,
+            &websocket_upstream,
+            &websocket_invites,
+            websocket_keys,
+            websocket_sessions,
+        )
+        .await
+        {
+            error!(bind = %websocket_bind, error = %err, "websocket listener terminated");
+        }
+    });
+
     run_server(
         &cfg.server.bind,
         &cfg.server.upstream_tcp_target,
@@ -87,6 +106,116 @@ async fn main() -> anyhow::Result<()> {
         SessionRegistry::default(),
     )
     .await
+}
+
+async fn run_websocket_server(
+    bind: &str,
+    upstream_tcp_target: &str,
+    invite_tokens_file: &str,
+    authorized_keys: AuthorizedKeysStore,
+    sessions: SessionRegistry,
+) -> anyhow::Result<()> {
+    let listener = TcpListener::bind(bind).await?;
+    info!(bind = %bind, "websocket listener bound");
+
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(value) => value,
+            Err(err) => {
+                error!(error = %err, "failed to accept incoming websocket connection");
+                continue;
+            }
+        };
+
+        let authorized_keys = authorized_keys.clone();
+        let sessions = sessions.clone();
+        let upstream_tcp_target = upstream_tcp_target.to_owned();
+        let invite_tokens_file = invite_tokens_file.to_owned();
+        tokio::spawn(async move {
+            let mut transport =
+                match bonded_core::transport::WebSocketTlsTransport::accept(stream).await {
+                    Ok(value) => value,
+                    Err(err) => {
+                        warn!(peer = %peer, error = %err, "websocket upgrade failed");
+                        return;
+                    }
+                };
+
+            match perform_websocket_auth_handshake(
+                &mut transport,
+                authorized_keys,
+                std::path::Path::new(&invite_tokens_file),
+            )
+            .await
+            {
+                Ok(public_key) => {
+                    let handle = sessions.register_client(public_key.clone());
+                    info!(
+                        peer = %peer,
+                        public_key = %public_key,
+                        session_id = handle.session_id,
+                        active_sessions = sessions.active_sessions(),
+                        "websocket client authenticated"
+                    );
+
+                    loop {
+                        match transport.recv().await {
+                            Ok(frame) => {
+                                let response = match forward_frame(
+                                    frame,
+                                    if upstream_tcp_target.is_empty() {
+                                        None
+                                    } else {
+                                        Some(upstream_tcp_target.as_str())
+                                    },
+                                )
+                                .await
+                                {
+                                    Ok(value) => value,
+                                    Err(err) => {
+                                        warn!(
+                                            peer = %peer,
+                                            public_key = %public_key,
+                                            session_id = handle.session_id,
+                                            error = %err,
+                                            "failed to forward websocket session frame"
+                                        );
+                                        continue;
+                                    }
+                                };
+
+                                if let Err(err) = transport.send(response).await {
+                                    warn!(
+                                        peer = %peer,
+                                        public_key = %public_key,
+                                        session_id = handle.session_id,
+                                        error = %err,
+                                        "failed to return websocket forwarded frame"
+                                    );
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                info!(
+                                    peer = %peer,
+                                    public_key = %public_key,
+                                    session_id = handle.session_id,
+                                    error = %err,
+                                    "websocket client session ended"
+                                );
+                                break;
+                            }
+                        }
+                    }
+
+                    sessions.unregister_client(&public_key);
+                }
+                Err(err) => {
+                    warn!(peer = %peer, error = %err, "websocket client authentication failed");
+                }
+            }
+        });
+    }
 }
 
 async fn run_server(
@@ -198,6 +327,9 @@ where
     if let Some(bind) = read_env("BONDED_BIND") {
         cfg.server.bind = bind;
     }
+    if let Some(websocket_bind) = read_env("BONDED_WEBSOCKET_BIND") {
+        cfg.server.websocket_bind = websocket_bind;
+    }
     if let Some(public_address) =
         read_env("BONDED_PUBLIC_ADDRESS").or_else(|| read_env("PUBLIC_ADDRESS"))
     {
@@ -254,6 +386,7 @@ mod tests {
         let mut cfg = ServerConfig::default();
         let env = [
             ("BONDED_BIND", "127.0.0.1:9000"),
+            ("BONDED_WEBSOCKET_BIND", "127.0.0.1:9443"),
             ("BONDED_PUBLIC_ADDRESS", "bonded.example.com:9000"),
             ("BONDED_HEALTH_BIND", "127.0.0.1:9001"),
             ("BONDED_UPSTREAM_TCP_TARGET", "127.0.0.1:9100"),
@@ -270,6 +403,7 @@ mod tests {
         });
 
         assert_eq!(cfg.server.bind, "127.0.0.1:9000");
+        assert_eq!(cfg.server.websocket_bind, "127.0.0.1:9443");
         assert_eq!(cfg.server.public_address, "bonded.example.com:9000");
         assert_eq!(cfg.server.health_bind, "127.0.0.1:9001");
         assert_eq!(cfg.server.upstream_tcp_target, "127.0.0.1:9100");

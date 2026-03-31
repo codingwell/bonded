@@ -1,5 +1,6 @@
 use anyhow::Context;
 use bonded_core::auth::{create_auth_challenge, verify_auth_challenge};
+use bonded_core::transport::WebSocketTlsTransport;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -98,6 +99,66 @@ pub async fn perform_auth_handshake(
         .map_err(|_| anyhow::anyhow!("failed to reunite tcp stream after handshake"))?;
 
     Ok((hello.public_key_b64, stream))
+}
+
+pub async fn perform_websocket_auth_handshake(
+    transport: &mut WebSocketTlsTransport,
+    authorized_keys: AuthorizedKeysStore,
+    invite_tokens_file: &Path,
+) -> anyhow::Result<String> {
+    let hello_line = transport
+        .recv_text()
+        .await
+        .context("failed to read websocket client hello")?;
+    let hello: ClientHello = serde_json::from_str(hello_line.trim_end())?;
+
+    if !authorized_keys.is_authorized(&hello.public_key_b64) {
+        let redeemed = if hello.invite_token.trim().is_empty() {
+            false
+        } else {
+            redeem_invite_token(invite_tokens_file, &hello.invite_token)
+                .context("failed to redeem invite token")?
+        };
+
+        if redeemed {
+            let _added = authorize_device_key(authorized_keys.path(), &hello.public_key_b64)
+                .context("failed to persist authorized key from invite redemption")?;
+            authorized_keys
+                .reload()
+                .context("failed to reload authorized keys after invite redemption")?;
+        } else {
+            transport
+                .send_text(&serde_json::to_string(&ServerAuthResult {
+                    status: "unauthorized".to_owned(),
+                })?)
+                .await?;
+            anyhow::bail!("client key is not authorized");
+        }
+    }
+
+    let challenge = create_auth_challenge();
+    transport
+        .send_text(&serde_json::to_string(&ServerChallenge {
+            challenge_b64: challenge.clone(),
+        })?)
+        .await?;
+
+    let proof_line = transport
+        .recv_text()
+        .await
+        .context("failed to read websocket client proof")?;
+    let proof: ClientProof = serde_json::from_str(proof_line.trim_end())?;
+
+    verify_auth_challenge(&hello.public_key_b64, &challenge, &proof.signature_b64)
+        .context("challenge signature verification failed")?;
+
+    transport
+        .send_text(&serde_json::to_string(&ServerAuthResult {
+            status: "ok".to_owned(),
+        })?)
+        .await?;
+
+    Ok(hello.public_key_b64)
 }
 
 async fn read_json_line<T>(
