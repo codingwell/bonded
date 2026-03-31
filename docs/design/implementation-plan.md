@@ -261,7 +261,7 @@ Build the server binary on top of `bonded-core`.
 | 2.8 | QR code generation and emission to logs | completed | Added startup pairing payload JSON + terminal QR emission; logs warning and skips QR when `public_address` is not configured |
 | 2.9 | Health check endpoint (HTTP) | completed | Added lightweight HTTP 200 `OK` endpoint on configured `health_bind`, started alongside NaiveTCP listener |
 | 2.10 | Configurable log verbosity | completed | Startup tracing level now maps from server config `log_level` (with `BONDED_LOG_LEVEL` override) |
-| 2.11 | Dockerfile update for new workspace structure | not-started | |
+| 2.11 | Dockerfile update for new workspace structure | completed | Updated Docker build to target workspace crates, expose app+health ports, and set runtime config/state defaults under `/etc/bonded` and `/var/lib/bonded` |
 | 2.12 | Integration test: server starts, accepts connection, forwards traffic | not-started | |
 
 Acceptance gate:
@@ -381,6 +381,7 @@ Decisions made during implementation that aren't in the requirements docs.
 | Health check endpoint uses a minimal raw-TCP HTTP responder returning `200 OK` with body `OK` | 2026-03-31 | Keeps health probe dependency-free and easy to container-check |
 | Server session IDs are assigned from an in-memory registry keyed by authenticated client key | 2026-03-31 | Allows concurrent client session tracking before full packet-forwarding pipeline is wired |
 | Pairing QR payload is JSON containing public address, invite token, server public key, and supported protocols | 2026-03-31 | Meets CR-6a/OQ-5 metadata requirements while keeping scanner parsing straightforward |
+| Container runtime defaults mount config/state at `/etc/bonded` and `/var/lib/bonded` | 2026-03-31 | Aligns image behavior with documented server file conventions |
 
 ---
 

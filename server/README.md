@@ -21,7 +21,11 @@ cargo run -p bonded-server
 
 ```bash
 docker build -f server/Dockerfile -t bonded-server .
-docker run -p 8080:8080 bonded-server
+docker run \
+	-p 8080:8080 -p 8081:8081 \
+	-v "$PWD/server.toml:/etc/bonded/server.toml:ro" \
+	-v "$PWD/data:/var/lib/bonded" \
+	bonded-server
 ```
 
 ## Configuration
