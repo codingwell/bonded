@@ -279,8 +279,8 @@ Build the Linux client on top of `bonded-core` + a thin `bonded-client` lib.
 
 | # | Task | Status | Notes |
 |---|------|--------|-------|
-| 3.1 | TUN device setup on Linux | not-started | LNX-3 |
-| 3.2 | Network interface detection and enumeration | not-started | LNX-1 |
+| 3.1 | TUN device setup on Linux | in-progress | Added Linux TUN initialization in runtime startup using `tun` crate; full root-required end-to-end validation pending integration phase |
+| 3.2 | Network interface detection and enumeration | completed | Added interface enumeration via `pnet_datalink` with unit test coverage in `bonded-client` |
 | 3.3 | Client config (server address, auth token or keypair path) | not-started | |
 | 3.4 | Pairing flow — redeem invite token, register keypair | not-started | |
 | 3.5 | Establish NaiveTCP path to server, perform auth handshake | not-started | |
@@ -384,6 +384,7 @@ Decisions made during implementation that aren't in the requirements docs.
 | Container runtime defaults mount config/state at `/etc/bonded` and `/var/lib/bonded` | 2026-03-31 | Aligns image behavior with documented server file conventions |
 | Server integration tests exercise full auth handshake then framed payload exchange on the same TCP stream | 2026-03-31 | Ensures session traffic can continue immediately after authentication |
 | Initial server internet-forwarding mode is payload relay to optional upstream TCP target with echo fallback | 2026-03-31 | Provides deterministic end-to-end forward/return behavior before full TUN/raw-socket integration |
+| Linux client interface enumeration uses `pnet_datalink`; TUN provisioning uses `tun` with explicit interface name | 2026-03-31 | Keeps Linux-specific plumbing isolated in shared client runtime |
 
 ---
 

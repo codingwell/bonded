@@ -8,4 +8,6 @@ description = "Shared client runtime for Bonded clients"
 [dependencies]
 anyhow.workspace = true
 bonded-core = { path = "../bonded-core" }
+pnet_datalink.workspace = true
 tracing.workspace = true
+tun.workspace = true
