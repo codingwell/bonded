@@ -1,7 +1,7 @@
 # Implementation Plan — Server, Linux Client, Android Client
 
-**Status:** Not Started
-**Last Updated:** 2026-03-30
+**Status:** In Progress
+**Last Updated:** 2026-03-31
 
 This is a living document. Update the status column and notes as work progresses.
 
@@ -224,17 +224,17 @@ Build `bonded-core` with the foundational protocol pieces. Everything in this ph
 |---|------|--------|-------|
 | 1.1 | Set up Cargo workspace with `bonded-core`, `bonded-server`, `bonded-cli` crates | completed | Added root workspace with crates: bonded-core, bonded-client, bonded-server, bonded-cli |
 | 1.2 | Define session frame format (connection ID, sequence number, payload, flags) | completed | Added header + payload frame format in `bonded-core::session` using `bytes` |
-| 1.3 | Implement session layer — framing, sequencing, reassembly, connection ID tracking | in-progress | Encode/decode scaffolding implemented; full reassembly/path-state logic pending |
+| 1.3 | Implement session layer — framing, sequencing, reassembly, connection ID tracking | completed | Added `SessionState` with per-connection TX/RX sequence tracking, out-of-order buffering, in-order flush behavior, and connection mismatch/stale sequence validation |
 | 1.4 | Define `Transport` trait (async read/write framed packets) | completed | Added async transport trait + protocol kind enum in `bonded-core::transport` |
-| 1.5 | Implement NaiveTCP transport (client + server sides) | not-started | First transport for testing |
+| 1.5 | Implement NaiveTCP transport (client + server sides) | completed | Added `NaiveTcpTransport` with length-prefixed frame I/O over Tokio `TcpStream` plus connect/from_stream constructors |
 | 1.6 | Define `Scheduler` trait (given packet + available paths → chosen path) | completed | Added scheduler trait with path IDs in `bonded-core::scheduler` |
 | 1.7 | Implement round-robin scheduler | completed | Basic round-robin selection scaffold + unit test |
 | 1.8 | Implement active-standby failover scheduler | completed | Basic active-first selector scaffold |
-| 1.9 | Keypair generation and storage utilities | not-started | Ed25519 or X25519 |
-| 1.10 | Invite token generation and redemption protocol | not-started | OQ-1 decision |
-| 1.11 | Public key challenge authentication on reconnect | not-started | Post-pairing auth |
-| 1.12 | Unit tests for session layer (framing, reordering, reassembly) | in-progress | Frame encode/decode roundtrip test added; reordering/reassembly tests pending |
-| 1.13 | Unit tests for transports and schedulers | in-progress | Scheduler unit tests added; transport tests pending NaiveTCP |
+| 1.9 | Keypair generation and storage utilities | completed | Added Ed25519 `DeviceKeypair` generation plus base64 private/public key serialization + parse helpers in `bonded-core::auth` |
+| 1.10 | Invite token generation and redemption protocol | completed | Added `InviteTokenManager` issue/redeem primitives with URL-safe random token generation and use-count decrement semantics |
+| 1.11 | Public key challenge authentication on reconnect | completed | Added challenge creation plus sign/verify helpers using Ed25519 signatures for reconnect auth handshake primitives |
+| 1.12 | Unit tests for session layer (framing, reordering, reassembly) | completed | Added tests for outbound sequence increments, out-of-order buffering + flush, connection ID mismatch, and stale sequence rejection |
+| 1.13 | Unit tests for transports and schedulers | completed | Added async NaiveTCP loopback exchange test and retained scheduler rotation coverage |
 
 Acceptance gate:
 
@@ -251,7 +251,7 @@ Build the server binary on top of `bonded-core`.
 
 | # | Task | Status | Notes |
 |---|------|--------|-------|
-| 2.1 | Server config loading (env vars + config file) | not-started | PUBLIC_ADDRESS, port, log level |
+| 2.1 | Server config loading (env vars + config file) | completed | Server loads TOML via `BONDED_CONFIG`/`--config`, falls back to defaults on read failure, and applies env overrides for bind/public/health/log/protocol/key paths |
 | 2.2 | Authorized keys file — load, watch for changes, reload | not-started | SRV-11, CR-12 |
 | 2.3 | Accept NaiveTCP connections, perform auth handshake | not-started | |
 | 2.4 | Server-side session management (multiple concurrent clients) | not-started | SRV-2 |
@@ -260,7 +260,7 @@ Build the server binary on top of `bonded-core`.
 | 2.7 | Invite token creation (on admin request / startup) | not-started | |
 | 2.8 | QR code generation and emission to logs | not-started | SRV-9, CR-6a |
 | 2.9 | Health check endpoint (HTTP) | not-started | SRV-6 |
-| 2.10 | Configurable log verbosity | not-started | SRV-7 |
+| 2.10 | Configurable log verbosity | completed | Startup tracing level now maps from server config `log_level` (with `BONDED_LOG_LEVEL` override) |
 | 2.11 | Dockerfile update for new workspace structure | not-started | |
 | 2.12 | Integration test: server starts, accepts connection, forwards traffic | not-started | |
 
@@ -370,6 +370,11 @@ Decisions made during implementation that aren't in the requirements docs.
 | `ed25519-dalek` for device identity and signing | 2026-03-30 | Matches invite-token plus per-device public-key auth model |
 | `tun` crate for Linux TUN support | 2026-03-30 | Thin Linux-specific layer over shared client core |
 | Thin Kotlin JNI wrapper for Android bridge | 2026-03-30 | Flutter uses platform channels; avoid introducing a second cross-platform bridge layer early |
+| Session reassembly model uses per-connection ordered buffer with stale-sequence rejection | 2026-03-31 | `SessionState` tracks next expected RX sequence and releases contiguous frames only |
+| Key material storage format is base64 string fields (private/public) in shared auth utilities | 2026-03-31 | Keeps config/state serialization straightforward for CLI and server TOML files |
+| Invite tokens use URL-safe, no-padding base64 random bytes with decrement-on-redeem semantics | 2026-03-31 | Aligns with single-use/limited-use token model from OQ-1 while staying transport-agnostic |
+| NaiveTCP framing uses 4-byte big-endian length prefix over TCP carrying `SessionFrame` bytes | 2026-03-31 | Keeps transport simple and deterministic for first end-to-end milestone |
+| Server config env override names use `BONDED_*` with `PUBLIC_ADDRESS` alias support | 2026-03-31 | Keeps backwards-compatible public endpoint injection while standardizing environment variable naming |
 
 ---
 
