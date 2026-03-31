@@ -68,6 +68,10 @@ impl InviteTokenManager {
     pub fn get(&self, token_value: &str) -> Option<&InviteToken> {
         self.tokens.get(token_value)
     }
+
+    pub fn all_tokens(&self) -> Vec<InviteToken> {
+        self.tokens.values().cloned().collect()
+    }
 }
 
 fn generate_invite_token_value() -> String {

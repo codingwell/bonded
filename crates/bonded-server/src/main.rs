@@ -1,8 +1,16 @@
 use std::path::PathBuf;
 
+mod auth_handshake;
+mod authorized_keys;
+mod invite_tokens;
+
+use auth_handshake::perform_auth_handshake;
+use authorized_keys::{AuthorizedKeysStore, AuthorizedKeysWatcher};
 use bonded_core::config::{load_server_config, ServerConfig, DEFAULT_SERVER_CONFIG_PATH};
 use clap::Parser;
-use tracing::{info, Level};
+use invite_tokens::ensure_startup_invite;
+use tokio::net::TcpListener;
+use tracing::{error, info, warn, Level};
 
 #[derive(Debug, Parser)]
 #[command(name = "bonded-server")]
@@ -29,10 +37,49 @@ async fn main() -> anyhow::Result<()> {
     apply_env_overrides(&mut cfg, |key| std::env::var(key).ok());
     init_tracing_from_level(&cfg.server.log_level);
 
-    info!(bind = %cfg.server.bind, "bonded-server starting");
+    let authorized_keys = AuthorizedKeysStore::load(&cfg.server.authorized_keys_file)?;
+    info!(
+        path = %cfg.server.authorized_keys_file,
+        devices = authorized_keys.device_count(),
+        "authorized keys loaded"
+    );
+    let _authorized_keys_watcher = AuthorizedKeysWatcher::spawn(authorized_keys.clone())?;
+    let invite = ensure_startup_invite(&cfg.server.invite_tokens_file)?;
+    info!(
+        path = %cfg.server.invite_tokens_file,
+        token = %invite.token,
+        "startup invite token ready"
+    );
 
-    // TODO: accept client connections, authenticate, and handle session frames.
-    Ok(())
+    info!(bind = %cfg.server.bind, "bonded-server starting");
+    run_server(&cfg.server.bind, authorized_keys).await
+}
+
+async fn run_server(bind: &str, authorized_keys: AuthorizedKeysStore) -> anyhow::Result<()> {
+    let listener = TcpListener::bind(bind).await?;
+    info!(bind = %bind, "naive tcp listener bound");
+
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(value) => value,
+            Err(err) => {
+                error!(error = %err, "failed to accept incoming connection");
+                continue;
+            }
+        };
+
+        let authorized_keys = authorized_keys.clone();
+        tokio::spawn(async move {
+            match perform_auth_handshake(stream, authorized_keys).await {
+                Ok(public_key) => {
+                    info!(peer = %peer, public_key = %public_key, "client authenticated");
+                }
+                Err(err) => {
+                    warn!(peer = %peer, error = %err, "client authentication failed");
+                }
+            }
+        });
+    }
 }
 
 fn apply_env_overrides<F>(cfg: &mut ServerConfig, mut read_env: F)

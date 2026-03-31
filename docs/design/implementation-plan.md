@@ -252,12 +252,12 @@ Build the server binary on top of `bonded-core`.
 | # | Task | Status | Notes |
 |---|------|--------|-------|
 | 2.1 | Server config loading (env vars + config file) | completed | Server loads TOML via `BONDED_CONFIG`/`--config`, falls back to defaults on read failure, and applies env overrides for bind/public/health/log/protocol/key paths |
-| 2.2 | Authorized keys file — load, watch for changes, reload | not-started | SRV-11, CR-12 |
-| 2.3 | Accept NaiveTCP connections, perform auth handshake | not-started | |
+| 2.2 | Authorized keys file — load, watch for changes, reload | completed | Added server authorized key store loading from TOML plus `notify` file watcher that reloads key state on file changes |
+| 2.3 | Accept NaiveTCP connections, perform auth handshake | completed | Added NaiveTCP listener accept loop and line-delimited JSON challenge-signature handshake with authorized-key enforcement |
 | 2.4 | Server-side session management (multiple concurrent clients) | not-started | SRV-2 |
 | 2.5 | IP packet forwarding — read from session, write to internet (TUN or raw socket) | not-started | SRV-3 |
 | 2.6 | Return traffic — read from internet, write back to correct client session | not-started | |
-| 2.7 | Invite token creation (on admin request / startup) | not-started | |
+| 2.7 | Invite token creation (on admin request / startup) | completed | Added startup invite-token bootstrap that reuses existing usable token or creates/persists a new single-use token |
 | 2.8 | QR code generation and emission to logs | not-started | SRV-9, CR-6a |
 | 2.9 | Health check endpoint (HTTP) | not-started | SRV-6 |
 | 2.10 | Configurable log verbosity | completed | Startup tracing level now maps from server config `log_level` (with `BONDED_LOG_LEVEL` override) |
@@ -375,6 +375,9 @@ Decisions made during implementation that aren't in the requirements docs.
 | Invite tokens use URL-safe, no-padding base64 random bytes with decrement-on-redeem semantics | 2026-03-31 | Aligns with single-use/limited-use token model from OQ-1 while staying transport-agnostic |
 | NaiveTCP framing uses 4-byte big-endian length prefix over TCP carrying `SessionFrame` bytes | 2026-03-31 | Keeps transport simple and deterministic for first end-to-end milestone |
 | Server config env override names use `BONDED_*` with `PUBLIC_ADDRESS` alias support | 2026-03-31 | Keeps backwards-compatible public endpoint injection while standardizing environment variable naming |
+| Authorized keys are stored in a path-indexed in-memory map and reloaded via `notify` watcher callbacks | 2026-03-31 | Enables revocation by editing file without process restart |
+| Initial server auth handshake uses newline-delimited JSON messages over NaiveTCP before session traffic | 2026-03-31 | Keeps first auth exchange debuggable while validating challenge-signature flow |
+| Server startup ensures at least one usable invite token exists in `invite_tokens.toml` | 2026-03-31 | Supports immediate pairing bootstrap before admin tooling exists |
 
 ---
 
