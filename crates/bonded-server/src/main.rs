@@ -4,15 +4,18 @@ mod auth_handshake;
 mod authorized_keys;
 mod health;
 mod invite_tokens;
+mod pairing_qr;
 mod session_registry;
 
 use auth_handshake::perform_auth_handshake;
 use authorized_keys::{AuthorizedKeysStore, AuthorizedKeysWatcher};
+use bonded_core::auth::DeviceKeypair;
 use bonded_core::config::{load_server_config, ServerConfig, DEFAULT_SERVER_CONFIG_PATH};
 use bonded_core::transport::{NaiveTcpTransport, Transport};
 use clap::Parser;
 use health::run_health_server;
 use invite_tokens::ensure_startup_invite;
+use pairing_qr::emit_pairing_qr;
 use session_registry::SessionRegistry;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn, Level};
@@ -54,6 +57,13 @@ async fn main() -> anyhow::Result<()> {
         path = %cfg.server.invite_tokens_file,
         token = %invite.token,
         "startup invite token ready"
+    );
+    let server_identity = DeviceKeypair::generate();
+    let _ = emit_pairing_qr(
+        &cfg.server.public_address,
+        &invite,
+        &server_identity.public_key_b64,
+        &cfg.server.supported_protocols,
     );
 
     let health_bind = cfg.server.health_bind.clone();

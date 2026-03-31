@@ -258,7 +258,7 @@ Build the server binary on top of `bonded-core`.
 | 2.5 | IP packet forwarding — read from session, write to internet (TUN or raw socket) | not-started | SRV-3 |
 | 2.6 | Return traffic — read from internet, write back to correct client session | not-started | |
 | 2.7 | Invite token creation (on admin request / startup) | completed | Added startup invite-token bootstrap that reuses existing usable token or creates/persists a new single-use token |
-| 2.8 | QR code generation and emission to logs | not-started | SRV-9, CR-6a |
+| 2.8 | QR code generation and emission to logs | completed | Added startup pairing payload JSON + terminal QR emission; logs warning and skips QR when `public_address` is not configured |
 | 2.9 | Health check endpoint (HTTP) | completed | Added lightweight HTTP 200 `OK` endpoint on configured `health_bind`, started alongside NaiveTCP listener |
 | 2.10 | Configurable log verbosity | completed | Startup tracing level now maps from server config `log_level` (with `BONDED_LOG_LEVEL` override) |
 | 2.11 | Dockerfile update for new workspace structure | not-started | |
@@ -380,6 +380,7 @@ Decisions made during implementation that aren't in the requirements docs.
 | Server startup ensures at least one usable invite token exists in `invite_tokens.toml` | 2026-03-31 | Supports immediate pairing bootstrap before admin tooling exists |
 | Health check endpoint uses a minimal raw-TCP HTTP responder returning `200 OK` with body `OK` | 2026-03-31 | Keeps health probe dependency-free and easy to container-check |
 | Server session IDs are assigned from an in-memory registry keyed by authenticated client key | 2026-03-31 | Allows concurrent client session tracking before full packet-forwarding pipeline is wired |
+| Pairing QR payload is JSON containing public address, invite token, server public key, and supported protocols | 2026-03-31 | Meets CR-6a/OQ-5 metadata requirements while keeping scanner parsing straightforward |
 
 ---
 
