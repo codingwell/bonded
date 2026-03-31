@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../services/pairing_service.dart';
+import '../models/pairing_model.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -88,7 +89,6 @@ class _HomeScreenState extends State<HomeScreen> {
             itemCount: pairedServers.length + 1,
             itemBuilder: (context, index) {
               if (index == pairedServers.length) {
-                // Add new server button at the end
                 return Padding(
                   padding: const EdgeInsets.symmetric(vertical: 16),
                   child: ElevatedButton.icon(
@@ -130,7 +130,29 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           ],
         ),
-        trailing: const Icon(Icons.arrow_forward),
+        trailing: PopupMenuButton(
+          itemBuilder: (context) => [
+            PopupMenuItem(
+              onTap: () {
+                Navigator.of(context).pushNamed(
+                  '/dashboard',
+                  arguments: {'deviceId': server['id'] ?? ''},
+                );
+              },
+              child: const Text('Connect'),
+            ),
+            PopupMenuItem(
+              onTap: () {
+                final pairedServer = PairedServer.fromJson(server);
+                Navigator.of(context).pushNamed(
+                  '/server-config',
+                  arguments: pairedServer,
+                );
+              },
+              child: const Text('Configure'),
+            ),
+          ],
+        ),
         onTap: () {
           Navigator.of(context).pushNamed(
             '/dashboard',
