@@ -165,6 +165,9 @@ dependencies = [
  "anyhow",
  "bonded-core",
  "pnet_datalink",
+ "serde",
+ "serde_json",
+ "tokio",
  "tracing",
  "tun",
 ]

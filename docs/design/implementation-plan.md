@@ -281,9 +281,9 @@ Build the Linux client on top of `bonded-core` + a thin `bonded-client` lib.
 |---|------|--------|-------|
 | 3.1 | TUN device setup on Linux | in-progress | Added Linux TUN initialization in runtime startup using `tun` crate; full root-required end-to-end validation pending integration phase |
 | 3.2 | Network interface detection and enumeration | completed | Added interface enumeration via `pnet_datalink` with unit test coverage in `bonded-client` |
-| 3.3 | Client config (server address, auth token or keypair path) | not-started | |
+| 3.3 | Client config (server address, auth token or keypair path) | completed | Client runtime now consumes configured server address and key paths, with home-directory expansion and on-demand keypair persistence |
 | 3.4 | Pairing flow — redeem invite token, register keypair | not-started | |
-| 3.5 | Establish NaiveTCP path to server, perform auth handshake | not-started | |
+| 3.5 | Establish NaiveTCP path to server, perform auth handshake | completed | Added client-side NaiveTCP challenge-signature handshake compatible with server protocol and covered by mock-server unit test |
 | 3.6 | Capture traffic from TUN → session layer → transport → server | not-started | |
 | 3.7 | Receive traffic from server → session layer → TUN | not-started | |
 | 3.8 | Multi-path: establish paths on multiple interfaces simultaneously | not-started | CR-1 |
@@ -385,6 +385,7 @@ Decisions made during implementation that aren't in the requirements docs.
 | Server integration tests exercise full auth handshake then framed payload exchange on the same TCP stream | 2026-03-31 | Ensures session traffic can continue immediately after authentication |
 | Initial server internet-forwarding mode is payload relay to optional upstream TCP target with echo fallback | 2026-03-31 | Provides deterministic end-to-end forward/return behavior before full TUN/raw-socket integration |
 | Linux client interface enumeration uses `pnet_datalink`; TUN provisioning uses `tun` with explicit interface name | 2026-03-31 | Keeps Linux-specific plumbing isolated in shared client runtime |
+| Linux client persists private/public key material to configured paths and reuses it for reconnect auth | 2026-03-31 | Aligns runtime behavior with per-device identity requirement and avoids regenerating identity each launch |
 
 ---
 
