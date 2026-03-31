@@ -288,8 +288,8 @@ Build the Linux client on top of `bonded-core` + a thin `bonded-client` lib.
 | 3.7 | Receive traffic from server → session layer → TUN | completed | Added reverse async loop that ingests framed payloads from transport and writes packets back to Linux TUN via session reassembly |
 | 3.8 | Multi-path: establish paths on multiple interfaces simultaneously | completed | Client runtime now establishes multiple authenticated NaiveTCP paths (bounded by detected interfaces) before entering packet loop |
 | 3.9 | Failover: detect path death, shift traffic to surviving paths | completed | Packet loop now removes failed active path and continues on surviving authenticated path when send/recv errors occur |
-| 3.10 | Integration test: client + server, ping through tunnel | not-started | |
-| 3.11 | Integration test: failover — kill one path, traffic continues | not-started | |
+| 3.10 | Integration test: client + server, ping through tunnel | in-progress | Added authenticated client/server integration test in `bonded-client` that performs handshake + framed payload exchange over NaiveTCP; full ICMP ping-through-TUN validation remains pending root-enabled end-to-end harness |
+| 3.11 | Integration test: failover — kill one path, traffic continues | completed | Added deterministic multipath integration test that drops path-0 after auth and verifies payload exchange continues over surviving path-1 |
 
 Acceptance gate:
 
@@ -389,6 +389,7 @@ Decisions made during implementation that aren't in the requirements docs.
 | Pairing payload ingestion updates client config with server endpoint/key/token and advertised protocols | 2026-03-31 | Lets Linux client bootstrap from QR payload even before full invite redemption API exists |
 | Linux packet loop uses `tun::create_as_async` + `tokio::select!` to bridge TUN packets and NaiveTCP session frames | 2026-03-31 | Establishes bidirectional TUN transport plumbing in a single runtime loop |
 | Linux multipath uses active-primary with failover-to-survivor strategy for first implementation | 2026-03-31 | Delivers CR-1/CR-2 behavior without introducing concurrent scheduler complexity in the initial client loop |
+| Linux failover integration tests treat first-path send closure as acceptable and assert survivor-path continuity | 2026-03-31 | Avoids flaky timing assumptions while still validating failover behavior under path loss |
 
 ---
 

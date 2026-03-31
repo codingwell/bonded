@@ -15,6 +15,9 @@ use tracing::info;
 #[cfg(target_os = "linux")]
 use tun::Configuration;
 
+#[cfg(test)]
+mod client_integration;
+
 #[derive(Debug, Clone)]
 pub struct ClientRuntime {
     pub config: ClientConfig,
