@@ -1,13 +1,11 @@
 import 'package:flutter/material.dart';
 import '../models/pairing_model.dart';
+import '../services/pairing_service.dart';
 
 class ServerConfigScreen extends StatefulWidget {
   final PairedServer server;
 
-  const ServerConfigScreen({
-    super.key,
-    required this.server,
-  });
+  const ServerConfigScreen({super.key, required this.server});
 
   @override
   State<ServerConfigScreen> createState() => _ServerConfigScreenState();
@@ -39,14 +37,34 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
   }
 
   Future<void> _saveConfiguration() async {
+    final updatedServer = PairedServer(
+      id: widget.server.id,
+      publicAddress: _serverAddressController.text.trim(),
+      serverPublicKey: _publicKeyController.text.trim(),
+      supportedProtocols: List<String>.from(_selectedProtocols),
+      pairedAt: widget.server.pairedAt,
+    );
+
+    if (updatedServer.publicAddress.isEmpty ||
+        updatedServer.serverPublicKey.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Server address and public key are required'),
+          backgroundColor: Colors.red,
+        ),
+      );
+      return;
+    }
+
     setState(() => _isSaving = true);
 
-    // TODO: Call MethodChannel to save configuration to native storage
-    // For now, just a local UI update
-    
-    await Future.delayed(const Duration(seconds: 1));
+    try {
+      await PairingService.updatePairedServer(updatedServer);
 
-    if (mounted) {
+      if (!mounted) {
+        return;
+      }
+
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text('Configuration saved'),
@@ -54,36 +72,94 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
         ),
       );
       setState(() => _isSaving = false);
-      Navigator.of(context).pop();
+      Navigator.of(context).pop(true);
+    } on PairingException catch (e) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() => _isSaving = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(e.message), backgroundColor: Colors.red),
+      );
+    } catch (e) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() => _isSaving = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Failed to save configuration: $e'),
+          backgroundColor: Colors.red,
+        ),
+      );
     }
   }
 
   Future<void> _deleteServer() async {
     final confirm = await showDialog<bool>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Delete Server?'),
-        content: Text(
-          'Remove ${widget.server.publicAddress} from paired servers?',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Cancel'),
+      builder:
+          (context) => AlertDialog(
+            title: const Text('Delete Server?'),
+            content: Text(
+              'Remove ${widget.server.publicAddress} from paired servers?',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Cancel'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text(
+                  'Delete',
+                  style: TextStyle(color: Colors.red),
+                ),
+              ),
+            ],
           ),
-          TextButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('Delete', style: TextStyle(color: Colors.red)),
-          ),
-        ],
-      ),
     );
 
-    if (confirm == true && mounted) {
-      // TODO: Call MethodChannel to delete server
-      Navigator.of(context).pop();
+    if (confirm != true || !mounted) {
+      return;
+    }
+
+    setState(() => _isSaving = true);
+
+    try {
+      await PairingService.deletePairedServer(widget.server.id);
+
+      if (!mounted) {
+        return;
+      }
+
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Server removed')));
+      setState(() => _isSaving = false);
+      Navigator.of(context).pop(true);
+    } on PairingException catch (e) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() => _isSaving = false);
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Server removed')),
+        SnackBar(content: Text(e.message), backgroundColor: Colors.red),
+      );
+    } catch (e) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() => _isSaving = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Failed to delete server: $e'),
+          backgroundColor: Colors.red,
+        ),
       );
     }
   }
@@ -91,9 +167,7 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Server Configuration'),
-      ),
+      appBar: AppBar(title: const Text('Server Configuration')),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -101,15 +175,11 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
           children: [
             const Text(
               'Server Address',
-              style: TextStyle(
-                fontSize: 14,
-                fontWeight: FontWeight.bold,
-              ),
+              style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 8),
             TextField(
               controller: _serverAddressController,
-              readOnly: true,
               decoration: InputDecoration(
                 hintText: 'Server address',
                 border: OutlineInputBorder(
@@ -122,15 +192,11 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
             const SizedBox(height: 24),
             const Text(
               'Server Public Key',
-              style: TextStyle(
-                fontSize: 14,
-                fontWeight: FontWeight.bold,
-              ),
+              style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 8),
             TextField(
               controller: _publicKeyController,
-              readOnly: true,
               maxLines: 3,
               decoration: InputDecoration(
                 hintText: 'Server public key (base64)',
@@ -144,34 +210,29 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
             const SizedBox(height: 24),
             const Text(
               'Supported Protocols',
-              style: TextStyle(
-                fontSize: 14,
-                fontWeight: FontWeight.bold,
-              ),
+              style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 12),
             Wrap(
               spacing: 8,
-              children: _selectedProtocols
-                  .map(
-                    (protocol) => Chip(
-                      label: Text(protocol),
-                      onDeleted: () {
-                        setState(() {
-                          _selectedProtocols.remove(protocol);
-                        });
-                      },
-                    ),
-                  )
-                  .toList(),
+              children:
+                  _selectedProtocols
+                      .map(
+                        (protocol) => Chip(
+                          label: Text(protocol),
+                          onDeleted: () {
+                            setState(() {
+                              _selectedProtocols.remove(protocol);
+                            });
+                          },
+                        ),
+                      )
+                      .toList(),
             ),
             const SizedBox(height: 32),
             const Text(
               'Device Information',
-              style: TextStyle(
-                fontSize: 14,
-                fontWeight: FontWeight.bold,
-              ),
+              style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 12),
             Container(
@@ -200,20 +261,19 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
               children: [
                 ElevatedButton.icon(
                   onPressed: _isSaving ? null : _saveConfiguration,
-                  icon: _isSaving
-                      ? const SizedBox(
-                          width: 20,
-                          height: 20,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.save),
+                  icon:
+                      _isSaving
+                          ? const SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                          : const Icon(Icons.save),
                   label: Text(_isSaving ? 'Saving...' : 'Save'),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.teal,
-                  ),
+                  style: ElevatedButton.styleFrom(backgroundColor: Colors.teal),
                 ),
                 OutlinedButton.icon(
-                  onPressed: _deleteServer,
+                  onPressed: _isSaving ? null : _deleteServer,
                   icon: const Icon(Icons.delete),
                   label: const Text('Delete'),
                   style: OutlinedButton.styleFrom(
@@ -233,21 +293,12 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
     return Row(
       mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: [
-        Text(
-          label,
-          style: const TextStyle(
-            fontSize: 12,
-            color: Colors.grey,
-          ),
-        ),
+        Text(label, style: const TextStyle(fontSize: 12, color: Colors.grey)),
         Flexible(
           child: Text(
             value,
             textAlign: TextAlign.end,
-            style: const TextStyle(
-              fontSize: 12,
-              fontWeight: FontWeight.w500,
-            ),
+            style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w500),
             maxLines: 2,
             overflow: TextOverflow.ellipsis,
           ),

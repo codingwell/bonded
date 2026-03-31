@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
+import 'package:permission_handler/permission_handler.dart';
+
 import '../models/pairing_model.dart';
 
 class QRScannerScreen extends StatefulWidget {
@@ -13,6 +15,7 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
   late MobileScannerController controller;
   bool hasPermission = false;
   bool isLoading = true;
+  bool _isNavigating = false;
 
   @override
   void initState() {
@@ -22,9 +25,11 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
   }
 
   Future<void> _checkPermission() async {
-    // For now, assume permission is granted. In production, request actual camera permission.
+    final status = await Permission.camera.request();
+    final granted = status.isGranted || status.isLimited;
+
     setState(() {
-      hasPermission = true;
+      hasPermission = granted;
       isLoading = false;
     });
   }
@@ -36,34 +41,40 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
   }
 
   void _onDetect(BarcodeCapture capture) {
+    if (_isNavigating) {
+      return;
+    }
+
     final List<Barcode> barcodes = capture.barcodes;
-    
+
     for (final barcode in barcodes) {
       if (barcode.rawValue != null) {
         final String qrData = barcode.rawValue!;
-        final ServerPairingPayload? payload =
-            ServerPairingPayload.parseQrData(qrData);
+        final ServerPairingPayload? payload = ServerPairingPayload.parseQrData(
+          qrData,
+        );
 
         if (payload != null) {
+          _isNavigating = true;
+          controller.stop();
+
           // Successfully parsed QR code, navigate to pairing confirmation
-          Navigator.of(context).pushReplacementNamed(
-            '/pairing-confirm',
-            arguments: payload,
-          );
+          Navigator.of(
+            context,
+          ).pushReplacementNamed('/pairing-confirm', arguments: payload);
         } else {
           // Show error - invalid QR code format
           _showError('Invalid Bonded QR code. Please try again.');
         }
+
+        break;
       }
     }
   }
 
   void _showError(String message) {
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(message),
-        backgroundColor: Colors.red,
-      ),
+      SnackBar(content: Text(message), backgroundColor: Colors.red),
     );
   }
 
@@ -71,20 +82,14 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
   Widget build(BuildContext context) {
     if (isLoading) {
       return Scaffold(
-        appBar: AppBar(
-          title: const Text('Scan Server QR Code'),
-        ),
-        body: const Center(
-          child: CircularProgressIndicator(),
-        ),
+        appBar: AppBar(title: const Text('Scan Server QR Code')),
+        body: const Center(child: CircularProgressIndicator()),
       );
     }
 
     if (!hasPermission) {
       return Scaffold(
-        appBar: AppBar(
-          title: const Text('Scan Server QR Code'),
-        ),
+        appBar: AppBar(title: const Text('Scan Server QR Code')),
         body: Center(
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
@@ -107,34 +112,24 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
     }
 
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Scan Server QR Code'),
-      ),
+      appBar: AppBar(title: const Text('Scan Server QR Code')),
       body: Stack(
         children: [
-          MobileScanner(
-            controller: controller,
-            onDetect: _onDetect,
-          ),
+          MobileScanner(controller: controller, onDetect: _onDetect),
           // Scanning overlay
           Container(
             color: Colors.black26,
             child: Stack(
               children: [
                 // Dark overlay on sides and top/bottom
-                Container(
-                  color: Colors.black.withAlpha(200),
-                ),
+                Container(color: Colors.black.withAlpha(200)),
                 // Clear rectangle in the center
                 Center(
                   child: Container(
                     width: 280,
                     height: 280,
                     decoration: BoxDecoration(
-                      border: Border.all(
-                        color: Colors.white,
-                        width: 2,
-                      ),
+                      border: Border.all(color: Colors.white, width: 2),
                       borderRadius: BorderRadius.circular(12),
                     ),
                   ),
@@ -155,10 +150,7 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
                   const Text(
                     'Position QR code within the frame',
                     textAlign: TextAlign.center,
-                    style: TextStyle(
-                      color: Colors.white,
-                      fontSize: 16,
-                    ),
+                    style: TextStyle(color: Colors.white, fontSize: 16),
                   ),
                   const SizedBox(height: 16),
                   ElevatedButton.icon(

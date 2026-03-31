@@ -2,19 +2,16 @@ import 'package:flutter/services.dart';
 
 class BackgroundService {
   static const MethodChannel _channel = MethodChannel('bonded/native');
-  static const EventChannel _eventChannel = EventChannel('bonded/background-events');
+  static const EventChannel _eventChannel = EventChannel(
+    'bonded/background-events',
+  );
 
   /// Start VPN service that continues running in background
-  static Future<void> startBackgroundService({
-    required String deviceId,
-  }) async {
+  static Future<void> startBackgroundService({required String deviceId}) async {
     try {
-      await _channel.invokeMethod<void>(
-        'startBackgroundVpn',
-        {
-          'deviceId': deviceId,
-        },
-      );
+      await _channel.invokeMethod<void>('startBackgroundVpn', {
+        'deviceId': deviceId,
+      });
     } on PlatformException catch (e) {
       throw BackgroundServiceException(
         'Failed to start background service: ${e.message}',
@@ -36,9 +33,8 @@ class BackgroundService {
   /// Get current background service status
   static Future<bool> isBackgroundVpnRunning() async {
     try {
-      final bool running = await _channel.invokeMethod<bool>(
-        'isBackgroundVpnRunning',
-      ) ?? false;
+      final bool running =
+          await _channel.invokeMethod<bool>('isBackgroundVpnRunning') ?? false;
       return running;
     } on PlatformException catch (e) {
       throw BackgroundServiceException(
@@ -49,11 +45,11 @@ class BackgroundService {
 
   /// Listen for background service state changes
   static Stream<BackgroundServiceEvent> get backgroundEvents {
-    return _eventChannel
-        .receiveBroadcastStream()
-        .map((dynamic event) => BackgroundServiceEvent.fromMap(
-              Map<String, dynamic>.from(event as Map),
-            ));
+    return _eventChannel.receiveBroadcastStream().map(
+      (dynamic event) => BackgroundServiceEvent.fromMap(
+        Map<String, dynamic>.from(event as Map),
+      ),
+    );
   }
 }
 
@@ -61,10 +57,7 @@ class BackgroundServiceEvent {
   final String type; // 'started', 'stopped', 'error', 'connection_lost'
   final String? message;
 
-  BackgroundServiceEvent({
-    required this.type,
-    this.message,
-  });
+  BackgroundServiceEvent({required this.type, this.message});
 
   factory BackgroundServiceEvent.fromMap(Map<String, dynamic> map) {
     return BackgroundServiceEvent(

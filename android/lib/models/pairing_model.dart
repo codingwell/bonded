@@ -60,6 +60,8 @@ class PairedServer {
     publicAddress: json['publicAddress'] ?? '',
     serverPublicKey: json['serverPublicKey'] ?? '',
     supportedProtocols: List<String>.from(json['supportedProtocols'] ?? []),
-    pairedAt: DateTime.parse(json['pairedAt'] ?? DateTime.now().toIso8601String()),
+    pairedAt: DateTime.parse(
+      json['pairedAt'] ?? DateTime.now().toIso8601String(),
+    ),
   );
 }

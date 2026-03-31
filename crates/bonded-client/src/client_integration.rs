@@ -1,4 +1,7 @@
-use crate::{establish_naive_tcp_session, establish_naive_tcp_sessions, establish_transport_paths};
+use crate::{
+    establish_naive_tcp_session, establish_naive_tcp_session_with_bind,
+    establish_naive_tcp_sessions, establish_transport_paths,
+};
 use bonded_core::auth::{create_auth_challenge, verify_auth_challenge, DeviceKeypair};
 use bonded_core::config::{ClientConfig, ClientSection};
 use bonded_core::session::{SessionFrame, SessionHeader};
@@ -167,6 +170,50 @@ async fn single_path_authenticated_frame_exchange() {
 
     let echoed = transport.recv().await.expect("echo should arrive");
     assert_eq!(&echoed.payload[..], b"hello");
+
+    server_task.await.expect("server task should join");
+
+    let _ = fs::remove_file(&cfg.client.private_key_path);
+    let _ = fs::remove_file(&cfg.client.public_key_path);
+}
+
+#[tokio::test]
+async fn bound_single_path_uses_requested_local_address() {
+    let keypair = DeviceKeypair::generate();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let addr = listener.local_addr().expect("addr should resolve");
+
+    let expected_public_key = keypair.public_key_b64.clone();
+    let server_task = tokio::spawn(async move {
+        let (stream, peer_addr) = listener.accept().await.expect("accept should succeed");
+        assert_eq!(peer_addr.ip().to_string(), "127.0.0.2");
+        let stream = server_handshake(stream, &expected_public_key).await;
+        let mut transport = NaiveTcpTransport::from_stream(stream);
+        let frame = transport.recv().await.expect("frame should arrive");
+        transport.send(frame).await.expect("echo should send");
+    });
+
+    let cfg = test_client_config(addr.to_string(), &keypair);
+    let stream = establish_naive_tcp_session_with_bind(&cfg, "127.0.0.2")
+        .await
+        .expect("session should authenticate with requested bind address");
+    let mut transport = NaiveTcpTransport::from_stream(stream);
+    transport
+        .send(SessionFrame {
+            header: SessionHeader {
+                connection_id: 7,
+                sequence: 1,
+                flags: 0,
+            },
+            payload: Bytes::from_static(b"bound-hello"),
+        })
+        .await
+        .expect("send should succeed");
+
+    let echoed = transport.recv().await.expect("echo should arrive");
+    assert_eq!(&echoed.payload[..], b"bound-hello");
 
     server_task.await.expect("server task should join");
 

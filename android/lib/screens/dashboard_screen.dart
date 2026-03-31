@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../services/background_service.dart';
@@ -6,10 +8,7 @@ import '../utils/background_notification_helper.dart';
 class DashboardScreen extends StatefulWidget {
   final String deviceId;
 
-  const DashboardScreen({
-    super.key,
-    required this.deviceId,
-  });
+  const DashboardScreen({super.key, required this.deviceId});
 
   @override
   State<DashboardScreen> createState() => _DashboardScreenState();
@@ -21,8 +20,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
   String _vpnStatus = 'Unknown';
   String _connectedServer = 'Not connected';
   String _dataTransferred = '0 B';
+  int _activePathCount = 1;
   bool _isConnecting = false;
   bool _isBackgroundRunning = false;
+  StreamSubscription<BackgroundServiceEvent>? _backgroundEventsSubscription;
 
   @override
   void initState() {
@@ -33,22 +34,32 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   void _listenToBackgroundEvents() {
     try {
-      BackgroundService.backgroundEvents.listen(
-        (event) {
-          if (mounted) {
-            setState(() {
-              if (event.type == 'started') {
-                _isBackgroundRunning = true;
-              } else if (event.type == 'stopped' || event.type == 'error') {
-                _isBackgroundRunning = false;
-              }
-            });
+      _backgroundEventsSubscription = BackgroundService.backgroundEvents.listen(
+        (event) async {
+          if (!mounted) {
+            return;
+          }
 
-            if (event.message != null) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(content: Text(event.message!)),
-              );
+          setState(() {
+            if (event.type == 'started') {
+              _isBackgroundRunning = true;
+            } else if (event.type == 'stopped' || event.type == 'error') {
+              _isBackgroundRunning = false;
             }
+          });
+
+          if (event.type == 'session_status' || event.type == 'started') {
+            await _refreshStatus();
+          }
+
+          if (!mounted) {
+            return;
+          }
+
+          if (event.message != null) {
+            ScaffoldMessenger.of(
+              context,
+            ).showSnackBar(SnackBar(content: Text(event.message!)));
           }
         },
         onError: (error) {
@@ -65,12 +76,35 @@ class _DashboardScreenState extends State<DashboardScreen> {
     try {
       final bool vpnRunning =
           await _channel.invokeMethod<bool>('getVpnStatus') ?? false;
+      final bool backgroundRunning =
+          await BackgroundService.isBackgroundVpnRunning();
+      final Map<dynamic, dynamic>? sessionStatus = await _channel
+          .invokeMethod<Map<dynamic, dynamic>>('getVpnSessionStatus');
+      final String sessionState = sessionStatus?['state'] as String? ?? '';
+      final String serverAddress =
+          sessionStatus?['serverAddress'] as String? ?? 'bonded.example.com';
+      final int outboundPackets =
+          (sessionStatus?['outboundPackets'] as num?)?.toInt() ?? 0;
+      final int inboundPackets =
+          (sessionStatus?['inboundPackets'] as num?)?.toInt() ?? 0;
+      final int networkPathCount =
+          (sessionStatus?['networkPathCount'] as num?)?.toInt() ?? 1;
 
       if (mounted) {
         setState(() {
-          _vpnStatus = vpnRunning ? 'Connected' : 'Disconnected';
-          _connectedServer = 'bonded.example.com';
-          _dataTransferred = vpnRunning ? '1.2 MB' : '0 B';
+          _vpnStatus = switch (sessionState) {
+            'connected' => 'Connected',
+            'connecting' => 'Connecting',
+            'error' => 'Error',
+            _ => vpnRunning ? 'Connected' : 'Disconnected',
+          };
+          _connectedServer = serverAddress;
+          _dataTransferred =
+              vpnRunning
+                  ? '${outboundPackets + inboundPackets} packets'
+                  : '0 B';
+          _activePathCount = networkPathCount;
+          _isBackgroundRunning = backgroundRunning;
         });
       }
     } on PlatformException {
@@ -87,13 +121,22 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
     try {
       if (_vpnStatus == 'Connected') {
-        await _channel.invokeMethod('stopVpnService');
+        await BackgroundService.stopBackgroundService();
       } else {
-        await _channel.invokeMethod('startVpnService', {
-          'deviceId': widget.deviceId,
-        });
+        await BackgroundService.startBackgroundService(
+          deviceId: widget.deviceId,
+        );
       }
       await _refreshStatus();
+    } on BackgroundServiceException catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error: ${e.message}'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
     } on PlatformException catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -111,6 +154,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
   }
 
   @override
+  void dispose() {
+    _backgroundEventsSubscription?.cancel();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     final isConnected = _vpnStatus == 'Connected';
     final statusColor = isConnected ? Colors.green : Colors.grey;
@@ -125,8 +174,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
           ),
           IconButton(
             icon: const Icon(Icons.settings),
-            onPressed: () =>
-                Navigator.of(context).pushNamed('/settings'),
+            onPressed: () => Navigator.of(context).pushNamed('/settings'),
           ),
         ],
       ),
@@ -191,7 +239,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
                         children: [
                           _buildDetailItem('Server', _connectedServer),
                           const Divider(),
-                          _buildDetailItem('Data Transferred', _dataTransferred),
+                          _buildDetailItem('Active Paths', '$_activePathCount'),
+                          const Divider(),
+                          _buildDetailItem(
+                            'Data Transferred',
+                            _dataTransferred,
+                          ),
                         ],
                       ),
                     ),
@@ -208,20 +261,22 @@ class _DashboardScreenState extends State<DashboardScreen> {
                             isConnected ? Colors.red : Colors.green,
                         disabledBackgroundColor: Colors.grey,
                       ),
-                      child: _isConnecting
-                          ? const SizedBox(
-                              width: 20,
-                              height: 20,
-                              child: CircularProgressIndicator(
-                                strokeWidth: 2,
-                                valueColor:
-                                    AlwaysStoppedAnimation<Color>(Colors.white),
+                      child:
+                          _isConnecting
+                              ? const SizedBox(
+                                width: 20,
+                                height: 20,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                  valueColor: AlwaysStoppedAnimation<Color>(
+                                    Colors.white,
+                                  ),
+                                ),
+                              )
+                              : Text(
+                                isConnected ? 'Disconnect' : 'Connect',
+                                style: const TextStyle(fontSize: 18),
                               ),
-                            )
-                          : Text(
-                              isConnected ? 'Disconnect' : 'Connect',
-                              style: const TextStyle(fontSize: 18),
-                            ),
                     ),
                     const SizedBox(height: 16),
                     OutlinedButton(
@@ -244,14 +299,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          Text(
-            label,
-            style: const TextStyle(color: Colors.grey),
-          ),
-          Text(
-            value,
-            style: const TextStyle(fontWeight: FontWeight.bold),
-          ),
+          Text(label, style: const TextStyle(color: Colors.grey)),
+          Text(value, style: const TextStyle(fontWeight: FontWeight.bold)),
         ],
       ),
     );

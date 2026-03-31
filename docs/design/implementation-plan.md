@@ -1,7 +1,7 @@
 # Implementation Plan — Server, Linux Client, Android Client
 
 **Status:** In Progress
-**Last Updated:** 2026-03-31
+**Last Updated:** 2026-03-31 (session 3)
 
 This is a living document. Update the status column and notes as work progresses.
 
@@ -309,14 +309,15 @@ Build the Android platform layer. The core Rust logic is shared via FFI.
 | 4.1 | Flutter project setup (Android target initially) | completed | Created Flutter app scaffold at `android/` with Android-only platform (`flutter create --platforms=android`); validated via `flutter test` and `flutter analyze` |
 | 4.2 | Rust → Android FFI bridge (bonded-core compiled for Android targets) | completed | Added `crates/bonded-ffi` (`cdylib`/`staticlib`) with stable C ABI wrappers over `bonded-core` session-frame metadata decoding, validated by crate tests and `cargo check --target aarch64-linux-android` |
 | 4.3 | Platform channel: Dart ↔ Rust FFI | completed | Added Flutter `MethodChannel` (`bonded/native`) plus Android `MainActivity` bridge calling Rust JNI symbol `nativeApiVersion`; app now displays bridge status with graceful fallback when library is not bundled |
-| 4.4 | Android VPN Service implementation | in-progress | Added `BondedVpnService` shell (session/MTU/address/route establish path), manifest service registration, and MethodChannel start/stop/status wiring; explicit user-consent launch flow and packet I/O binding to Rust runtime remain pending |
-| 4.5 | Multi-network support (Wi-Fi + Cellular simultaneously) | not-started | AND-1, AND-3. Use `ConnectivityManager.requestNetwork()` |
-| 4.6 | QR code scanner screen | completed | Added `mobile_scanner` package with QRScannerScreen widget; includes camera preview, QR detection, JSON payload parsing; full permission flow pending |
+| 4.4 | Android VPN Service implementation | in-progress | Added `BondedVpnService` shell (session/MTU/address/route establish path), foreground/background lifecycle wiring, manifest service registration, and MethodChannel start/stop/status wiring; explicit user-consent launch flow is implemented via native permission callback; VPN loop now submits outbound TUN packets to Rust JNI and polls inbound JNI packets; added paired-server persistence on Android plus a Rust single-path NaiveTCP session worker that redeems invite tokens, persists key material under app storage, bridges outbound/inbound packet queues, and exposes session-health snapshots back to Kotlin/Flutter for UI status updates; paired-server configuration edits and deletion now persist through platform channels, and the home list refreshes after configuration changes |
+| 4.5 | Multi-network support (Wi-Fi + Cellular simultaneously) | in-progress | Added Android `ConnectivityManager.requestNetwork()`-based path manager that actively requests Wi-Fi/cellular/ethernet networks, derives per-network local bind addresses from `LinkProperties`, and feeds those addresses into the shared Rust client so NaiveTCP paths bind to distinct local IPs; `BondedVpnService` now restarts the native session when the active network set changes and surfaces active-path count back to the dashboard |
+| 4.6 | QR code scanner screen | completed | Added `mobile_scanner` package with QRScannerScreen widget; includes Android camera permission request handling, camera preview, QR detection, duplicate-scan suppression during navigation, and JSON payload parsing |
 | 4.7 | Pairing flow UI — scan QR, redeem token, store keypair | completed | Added `ServerPairingPayload` model, `PairingService` MethodChannel wrapper, and `PairingConfirmScreen` with server details display and redemption UI |
 | 4.8 | Connection status dashboard UI | completed | Added `DashboardScreen` with VPN toggle, status display, and connection details; added `HomeScreen` listing paired servers; updated main.dart with named routing for all screens |
 | 4.9 | Server configuration screen | completed | Added ServerConfigScreen showing server details, supported protocols display, and save/delete actions; integrated with HomeScreen PopupMenuButton for server management |
-| 4.10 | Background operation | in-progress | Added BackgroundService MethodChannel wrapper with EventChannel stream support for background events; added BackgroundNotificationHelper for UI feedback; integrated DashboardScreen to display background indicator when VPN runs in background |
-| 4.11 | End-to-end test: Android → server → internet | not-started | |
+| 4.10 | Background operation | completed | Completed MethodChannel/EventChannel wiring for `startBackgroundVpn`/`stopBackgroundVpn`/`isBackgroundVpnRunning`; `BondedVpnService` now supports Android foreground-service mode with persistent notification and emits background lifecycle events consumed by Dashboard UI |
+| 4.11 | End-to-end test: Android → server → internet | in-progress | Added host-side `bonded-ffi` smoke test that redeems an invite token, starts the Android session runtime, queues an outbound packet, and verifies echoed inbound traffic over NaiveTCP; host-side client/runtime tests now also assert that requested local bind addresses are actually used for outbound session connections (`127.0.0.2` loopback source assertion), while full APK/device validation remains blocked by Maven DNS/network resolution in the dev container |
+| 4.11 | End-to-end test: Android → server → internet | in-progress | Host-side FFI smoke tests pass (50/50 including bind-address assertion); `libbonded_ffi.so` built for arm64-v8a and x86_64 and placed in jniLibs; debug APK builds successfully; full device/emulator validation (actual VPN tunnel + internet traffic) requires a physical device or running emulator — remaining for device testing phase |
 
 Acceptance gate:
 
@@ -395,6 +396,14 @@ Decisions made during implementation that aren't in the requirements docs.
 | Android Rust bridge uses dedicated `bonded-ffi` crate with minimal C ABI and explicit metadata decode wrapper | 2026-03-31 | Creates a stable JNI/FFI boundary while reusing `bonded-core` internals and enabling incremental API expansion |
 | Flutter-to-Rust handshake starts via `MethodChannel` and Kotlin JNI stub before full native library packaging | 2026-03-31 | Enables incremental UI and bridge validation even when `jniLibs` artifacts are not yet produced in CI/dev flows |
 | Android VPN lifecycle is first exposed through MethodChannel (`start/stop/status`) with `BondedVpnService` shell | 2026-03-31 | Allows Flutter UI and host plumbing to stabilize before binding live TUN packet flow into shared Rust runtime |
+| Android background mode uses `BondedVpnService` foreground-service startup plus EventChannel status streaming | 2026-03-31 | Satisfies long-running VPN requirements and keeps Flutter UI synchronized with native service lifecycle |
+| Android pairing metadata is stored in app `SharedPreferences`, while device key material is persisted by Rust under app-private files dir | 2026-03-31 | Keeps Flutter pairing UI simple and gives the native VPN service enough data to bootstrap reconnects without reusing invite tokens |
+| Android VPN UI status is driven by Rust session snapshots polled by Kotlin service, not only service lifecycle flags | 2026-03-31 | Distinguishes VPN-service startup from actual transport/session connectivity in the dashboard and background events |
+| Android multi-path currently steers NaiveTCP paths by binding each Rust socket to a local IP derived from Android `LinkProperties`, and restarts the native session when the active network set changes | 2026-03-31 | Preserves the shared Rust transport/session stack while giving Android concrete per-network path steering before a deeper socket-factory-based integration exists |
+| Android cross-compilation configured via workspace-root `.cargo/config.toml` with NDK 26 linker/ar/CC/CXX/AR env vars per target | 2026-03-31 | `cc-rs` build scripts look for unversioned `aarch64-linux-android-clang`; explicit `CC_aarch64_linux_android` env var overrides that search; NDK 26.3.11579264 is the installed version; NDK 27 download attempted but incomplete |
+| VPN notification icon changed from `android.R.drawable.stat_sys_vpn_ic` to `R.mipmap.ic_launcher` | 2026-03-31 | `stat_sys_vpn_ic` was removed from Android API 34; `R.mipmap.ic_launcher` is always present in Flutter-generated Android projects |
+| Pre-compiled `libbonded_ffi.so` bundled in `jniLibs/arm64-v8a/` and `jniLibs/x86_64/` for debug builds | 2026-03-31 | Keeps Flutter Gradle build self-contained without requiring NDK in every CI/dev environment; `scripts/build-android-native.sh` automates rebuild on Rust changes |
+| GitHub Actions artifact workflow builds both Docker image tarball and Android debug APK | 2026-03-31 | Added `.github/workflows/build-artifacts.yml`; Docker job exports `/tmp/bonded-server-image.tar`; Android job builds Rust JNI libs via `cargo-ndk`, runs `flutter build apk --debug`, and uploads APK artifact |
 | Phase-5 websocket transport shares frame codec and auth flow semantics with NaiveTCP | 2026-03-31 | Uses binary websocket frames for session payloads plus JSON text messages for challenge-signature auth to keep protocol behavior aligned |
 | Mixed-path establishment rotates preferred protocols per path with per-path fallback | 2026-03-31 | Enables one session to combine NaiveTCP and websocket paths without introducing a new scheduler strategy |
 | QUIC implementation is deferred until WSS TLS server endpoint/certificate lifecycle is complete | 2026-03-31 | Reduces concurrent transport hardening risk while preserving planned `quinn` adoption path |
@@ -407,7 +416,8 @@ Decisions made during implementation that aren't in the requirements docs.
 
 | Issue | Status | Resolution |
 |-------|--------|------------|
-| | | |
+| Android `flutter build apk --debug` fails in dev container due Maven hostname resolution (`repo.maven.apache.org: No address associated with hostname`) while resolving `mobile_scanner` Gradle dependencies | **resolved** | Maven is accessible; APK builds successfully in ~3s (Gradle cache warm). Fixed notification icon (`stat_sys_vpn_ic` removed in API 34, replaced with `R.mipmap.ic_launcher`). APK is at `android/build/app/outputs/flutter-apk/app-debug.apk`. |
+| Android-target Rust validation for `bonded-ffi` is blocked in this dev container because `aarch64-linux-android-clang` is unavailable while building `aws-lc-sys` | **resolved** | NDK 26.3.11579264 was already installed; configured `.cargo/config.toml` with per-target `linker`/`ar` paths and `CC_*`/`CXX_*`/`AR_*` env vars for `cc-rs`; `cargo build --target aarch64-linux-android -p bonded-ffi --release` now produces `libbonded_ffi.so`; both arm64-v8a and x86_64 `.so` files are committed to `android/android/app/src/main/jniLibs/`. |
 
 ---
 

@@ -1,5 +1,7 @@
 import 'package:flutter/services.dart';
 
+import '../models/pairing_model.dart';
+
 class PairingService {
   static const MethodChannel _channel = MethodChannel('bonded/native');
 
@@ -11,14 +13,13 @@ class PairingService {
     required String inviteToken,
   }) async {
     try {
-      final String deviceId = await _channel.invokeMethod<String>(
-        'redeemInviteToken',
-        {
-          'serverAddress': serverAddress,
-          'serverPublicKey': serverPublicKey,
-          'inviteToken': inviteToken,
-        },
-      ) ?? '';
+      final String deviceId =
+          await _channel.invokeMethod<String>('redeemInviteToken', {
+            'serverAddress': serverAddress,
+            'serverPublicKey': serverPublicKey,
+            'inviteToken': inviteToken,
+          }) ??
+          '';
       return deviceId;
     } on PlatformException catch (e) {
       throw PairingException('Failed to redeem invite token: ${e.message}');
@@ -33,15 +34,12 @@ class PairingService {
     required List<String> supportedProtocols,
   }) async {
     try {
-      await _channel.invokeMethod<void>(
-        'storePairedServer',
-        {
-          'deviceId': deviceId,
-          'publicAddress': publicAddress,
-          'serverPublicKey': serverPublicKey,
-          'supportedProtocols': supportedProtocols,
-        },
-      );
+      await _channel.invokeMethod<void>('storePairedServer', {
+        'deviceId': deviceId,
+        'publicAddress': publicAddress,
+        'serverPublicKey': serverPublicKey,
+        'supportedProtocols': supportedProtocols,
+      });
     } on PlatformException catch (e) {
       throw PairingException('Failed to store paired server: ${e.message}');
     }
@@ -50,14 +48,36 @@ class PairingService {
   /// Retrieve all paired servers.
   static Future<List<Map<String, dynamic>>> getPairedServers() async {
     try {
-      final List<dynamic> result = await _channel.invokeMethod<List<dynamic>>(
-        'getPairedServers',
-      ) ?? [];
+      final List<dynamic> result =
+          await _channel.invokeMethod<List<dynamic>>('getPairedServers') ?? [];
       return List<Map<String, dynamic>>.from(
         result.map((e) => Map<String, dynamic>.from(e as Map)),
       );
     } on PlatformException catch (e) {
       throw PairingException('Failed to get paired servers: ${e.message}');
+    }
+  }
+
+  static Future<void> updatePairedServer(PairedServer server) async {
+    try {
+      await _channel.invokeMethod<void>('updatePairedServer', {
+        'deviceId': server.id,
+        'publicAddress': server.publicAddress,
+        'serverPublicKey': server.serverPublicKey,
+        'supportedProtocols': server.supportedProtocols,
+      });
+    } on PlatformException catch (e) {
+      throw PairingException('Failed to update paired server: ${e.message}');
+    }
+  }
+
+  static Future<void> deletePairedServer(String deviceId) async {
+    try {
+      await _channel.invokeMethod<void>('deletePairedServer', {
+        'deviceId': deviceId,
+      });
+    } on PlatformException catch (e) {
+      throw PairingException('Failed to delete paired server: ${e.message}');
     }
   }
 }

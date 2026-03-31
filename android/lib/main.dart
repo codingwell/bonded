@@ -55,9 +55,7 @@ class BondedApp extends StatelessWidget {
         return null;
       },
       onUnknownRoute: (settings) {
-        return MaterialPageRoute(
-          builder: (context) => const HomeScreen(),
-        );
+        return MaterialPageRoute(builder: (context) => const HomeScreen());
       },
     );
   }

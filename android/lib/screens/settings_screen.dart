@@ -6,9 +6,7 @@ class SettingsScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Settings'),
-      ),
+      appBar: AppBar(title: const Text('Settings')),
       body: ListView(
         children: [
           ListTile(
@@ -43,28 +41,29 @@ class SettingsScreen extends StatelessWidget {
   void _showDebugInfo(BuildContext context) {
     showDialog(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Debug Information'),
-        content: const SingleChildScrollView(
-          child: Text(
-            'Bonded VPN Android Client\n'
-            'Version: 1.0.0\n'
-            'Platform: Flutter 3.x\n'
-            'Rust FFI: Enabled\n'
-            '\n'
-            'Features:\n'
-            '- QR code pairing\n'
-            '- Multi-path VPN\n'
-            '- WebSocket + TLS support\n',
+      builder:
+          (context) => AlertDialog(
+            title: const Text('Debug Information'),
+            content: const SingleChildScrollView(
+              child: Text(
+                'Bonded VPN Android Client\n'
+                'Version: 1.0.0\n'
+                'Platform: Flutter 3.x\n'
+                'Rust FFI: Enabled\n'
+                '\n'
+                'Features:\n'
+                '- QR code pairing\n'
+                '- Multi-path VPN\n'
+                '- WebSocket + TLS support\n',
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: Navigator.of(context).pop,
+                child: const Text('Close'),
+              ),
+            ],
           ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: Navigator.of(context).pop,
-            child: const Text('Close'),
-          ),
-        ],
-      ),
     );
   }
 }

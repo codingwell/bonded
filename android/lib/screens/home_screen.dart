@@ -24,6 +24,23 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
+  Future<void> _openQrScanner() async {
+    final result = await Navigator.of(context).pushNamed('/qr-scanner');
+    if (result != null && mounted) {
+      _loadPairedServers();
+    }
+  }
+
+  Future<void> _openServerConfig(Map<String, dynamic> server) async {
+    final pairedServer = PairedServer.fromJson(server);
+    final result = await Navigator.of(
+      context,
+    ).pushNamed('/server-config', arguments: pairedServer);
+    if (result == true && mounted) {
+      _loadPairedServers();
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -45,31 +62,20 @@ class _HomeScreenState extends State<HomeScreen> {
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  const Icon(
-                    Icons.security,
-                    size: 64,
-                    color: Colors.grey,
-                  ),
+                  const Icon(Icons.security, size: 64, color: Colors.grey),
                   const SizedBox(height: 16),
                   const Text(
                     'No paired servers',
-                    style: TextStyle(
-                      fontSize: 18,
-                      fontWeight: FontWeight.w500,
-                    ),
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.w500),
                   ),
                   const SizedBox(height: 8),
                   Text(
                     'Scan a server QR code to get started',
-                    style: TextStyle(
-                      fontSize: 14,
-                      color: Colors.grey[600],
-                    ),
+                    style: TextStyle(fontSize: 14, color: Colors.grey[600]),
                   ),
                   const SizedBox(height: 32),
                   ElevatedButton.icon(
-                    onPressed: () =>
-                        Navigator.of(context).pushNamed('/qr-scanner'),
+                    onPressed: _openQrScanner,
                     icon: const Icon(Icons.qr_code_2),
                     label: const Text('Scan QR Code'),
                     style: ElevatedButton.styleFrom(
@@ -92,8 +98,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 return Padding(
                   padding: const EdgeInsets.symmetric(vertical: 16),
                   child: ElevatedButton.icon(
-                    onPressed: () =>
-                        Navigator.of(context).pushNamed('/qr-scanner'),
+                    onPressed: _openQrScanner,
                     icon: const Icon(Icons.add),
                     label: const Text('Add Server'),
                   ),
@@ -109,10 +114,7 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _buildServerCard(
-    BuildContext context,
-    Map<String, dynamic> server,
-  ) {
+  Widget _buildServerCard(BuildContext context, Map<String, dynamic> server) {
     return Card(
       child: ListTile(
         leading: const Icon(Icons.dns, color: Colors.teal),
@@ -131,27 +133,24 @@ class _HomeScreenState extends State<HomeScreen> {
           ],
         ),
         trailing: PopupMenuButton(
-          itemBuilder: (context) => [
-            PopupMenuItem(
-              onTap: () {
-                Navigator.of(context).pushNamed(
-                  '/dashboard',
-                  arguments: {'deviceId': server['id'] ?? ''},
-                );
-              },
-              child: const Text('Connect'),
-            ),
-            PopupMenuItem(
-              onTap: () {
-                final pairedServer = PairedServer.fromJson(server);
-                Navigator.of(context).pushNamed(
-                  '/server-config',
-                  arguments: pairedServer,
-                );
-              },
-              child: const Text('Configure'),
-            ),
-          ],
+          itemBuilder:
+              (context) => [
+                PopupMenuItem(
+                  onTap: () {
+                    Navigator.of(context).pushNamed(
+                      '/dashboard',
+                      arguments: {'deviceId': server['id'] ?? ''},
+                    );
+                  },
+                  child: const Text('Connect'),
+                ),
+                PopupMenuItem(
+                  onTap: () {
+                    _openServerConfig(server);
+                  },
+                  child: const Text('Configure'),
+                ),
+              ],
         ),
         onTap: () {
           Navigator.of(context).pushNamed(

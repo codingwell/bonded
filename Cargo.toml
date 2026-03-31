@@ -3,7 +3,8 @@ members = [
     "crates/bonded-core",
     "crates/bonded-client",
     "crates/bonded-server",
-    "crates/bonded-cli", "crates/bonded-ffi",
+    "crates/bonded-cli",
+    "crates/bonded-ffi",
 ]
 resolver = "2"
 

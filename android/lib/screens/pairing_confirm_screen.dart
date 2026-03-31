@@ -5,10 +5,7 @@ import '../services/pairing_service.dart';
 class PairingConfirmScreen extends StatefulWidget {
   final ServerPairingPayload payload;
 
-  const PairingConfirmScreen({
-    super.key,
-    required this.payload,
-  });
+  const PairingConfirmScreen({super.key, required this.payload});
 
   @override
   State<PairingConfirmScreen> createState() => _PairingConfirmScreenState();
@@ -64,9 +61,7 @@ class _PairingConfirmScreenState extends State<PairingConfirmScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Confirm Pairing'),
-      ),
+      appBar: AppBar(title: const Text('Confirm Pairing')),
       body: Center(
         child: SingleChildScrollView(
           padding: const EdgeInsets.all(24),
@@ -81,10 +76,7 @@ class _PairingConfirmScreenState extends State<PairingConfirmScreen> {
               const SizedBox(height: 24),
               const Text(
                 'Pair with Server',
-                style: TextStyle(
-                  fontSize: 24,
-                  fontWeight: FontWeight.bold,
-                ),
+                style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
               ),
               const SizedBox(height: 32),
               // Server details
@@ -124,17 +116,19 @@ class _PairingConfirmScreenState extends State<PairingConfirmScreen> {
               // Action buttons
               ElevatedButton.icon(
                 onPressed: _isPairing ? null : _confirmPairing,
-                icon: _isPairing
-                    ? const SizedBox(
-                        width: 20,
-                        height: 20,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 2,
-                          valueColor:
-                              AlwaysStoppedAnimation<Color>(Colors.white),
-                        ),
-                      )
-                    : const Icon(Icons.check),
+                icon:
+                    _isPairing
+                        ? const SizedBox(
+                          width: 20,
+                          height: 20,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            valueColor: AlwaysStoppedAnimation<Color>(
+                              Colors.white,
+                            ),
+                          ),
+                        )
+                        : const Icon(Icons.check),
                 label: Text(_isPairing ? 'Pairing...' : 'Confirm Pairing'),
                 style: ElevatedButton.styleFrom(
                   padding: const EdgeInsets.symmetric(
@@ -147,7 +141,8 @@ class _PairingConfirmScreenState extends State<PairingConfirmScreen> {
               ),
               const SizedBox(height: 16),
               OutlinedButton.icon(
-                onPressed: _isPairing ? null : () => Navigator.of(context).pop(),
+                onPressed:
+                    _isPairing ? null : () => Navigator.of(context).pop(),
                 icon: const Icon(Icons.close),
                 label: const Text('Cancel'),
               ),

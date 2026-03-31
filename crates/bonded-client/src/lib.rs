@@ -1,15 +1,19 @@
 use bonded_core::auth::{sign_auth_challenge, DeviceKeypair};
 use bonded_core::config::ClientConfig;
+#[cfg(target_os = "linux")]
 use bonded_core::session::SessionState;
 use bonded_core::transport::{NaiveTcpTransport, Transport, WebSocketTlsTransport};
+#[cfg(target_os = "linux")]
 use bytes::Bytes;
 use pnet_datalink::NetworkInterface;
 use serde::Deserialize;
 use serde_json::json;
 use std::fs;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
+use tokio::net::{lookup_host, TcpSocket, TcpStream};
+#[cfg(target_os = "linux")]
 use tokio::select;
 use tracing::info;
 #[cfg(target_os = "linux")]
@@ -18,20 +22,20 @@ use tun::Configuration;
 #[cfg(test)]
 mod client_integration;
 
-enum ClientTransport {
+pub enum ClientTransport {
     NaiveTcp(NaiveTcpTransport),
     WebSocket(WebSocketTlsTransport),
 }
 
 impl ClientTransport {
-    async fn send(&mut self, frame: bonded_core::session::SessionFrame) -> anyhow::Result<()> {
+    pub async fn send(&mut self, frame: bonded_core::session::SessionFrame) -> anyhow::Result<()> {
         match self {
             ClientTransport::NaiveTcp(inner) => inner.send(frame).await,
             ClientTransport::WebSocket(inner) => inner.send(frame).await,
         }
     }
 
-    async fn recv(&mut self) -> anyhow::Result<bonded_core::session::SessionFrame> {
+    pub async fn recv(&mut self) -> anyhow::Result<bonded_core::session::SessionFrame> {
         match self {
             ClientTransport::NaiveTcp(inner) => inner.recv().await,
             ClientTransport::WebSocket(inner) => inner.recv().await,
@@ -81,7 +85,7 @@ impl ClientRuntime {
     }
 }
 
-async fn establish_transport_paths(
+pub async fn establish_transport_paths(
     config: &ClientConfig,
     count: usize,
 ) -> anyhow::Result<Vec<ClientTransport>> {
@@ -94,6 +98,15 @@ async fn establish_transport_paths(
     let target = count.max(1);
     let mut paths = Vec::with_capacity(target);
     for path_index in 0..target {
+        if let Some(bind_address) = config.client.path_bind_addresses.get(path_index) {
+            if let Ok(stream) = establish_naive_tcp_session_with_bind(config, bind_address).await {
+                paths.push(ClientTransport::NaiveTcp(NaiveTcpTransport::from_stream(
+                    stream,
+                )));
+                continue;
+            }
+        }
+
         let mut connected: Option<ClientTransport> = None;
         for protocol in rotated_protocols(&protocols, path_index) {
             let attempt = match protocol.as_str() {
@@ -156,12 +169,39 @@ pub async fn establish_naive_tcp_session(config: &ClientConfig) -> anyhow::Resul
         anyhow::bail!("server_public_address is required for NaiveTCP connection");
     }
 
+    let stream = TcpStream::connect(&config.client.server_public_address).await?;
+    authenticate_naive_tcp_stream(config, stream).await
+}
+
+pub async fn establish_naive_tcp_session_with_bind(
+    config: &ClientConfig,
+    bind_address: &str,
+) -> anyhow::Result<TcpStream> {
+    if config.client.server_public_address.trim().is_empty() {
+        anyhow::bail!("server_public_address is required for NaiveTCP connection");
+    }
+
+    let bind_ip = parse_bind_ip(bind_address)?;
+    let server_address =
+        resolve_server_address(&config.client.server_public_address, Some(bind_ip)).await?;
+    let socket = match bind_ip {
+        IpAddr::V4(_) => TcpSocket::new_v4()?,
+        IpAddr::V6(_) => TcpSocket::new_v6()?,
+    };
+    socket.bind(SocketAddr::new(bind_ip, 0))?;
+    let stream = socket.connect(server_address).await?;
+    authenticate_naive_tcp_stream(config, stream).await
+}
+
+pub async fn authenticate_naive_tcp_stream(
+    config: &ClientConfig,
+    stream: TcpStream,
+) -> anyhow::Result<TcpStream> {
     let keypair = load_or_create_device_keypair(
         &expand_home_path(&config.client.private_key_path),
         &expand_home_path(&config.client.public_key_path),
     )?;
 
-    let stream = TcpStream::connect(&config.client.server_public_address).await?;
     perform_auth_handshake(stream, &keypair, &config.client.invite_token).await
 }
 
@@ -205,6 +245,40 @@ async fn establish_websocket_session(
     let mut transport = WebSocketTlsTransport::connect(&websocket_url).await?;
     perform_websocket_auth_handshake(&mut transport, &keypair, &config.client.invite_token).await?;
     Ok(transport)
+}
+
+fn parse_bind_ip(bind_address: &str) -> anyhow::Result<IpAddr> {
+    if let Ok(ip) = bind_address.parse::<IpAddr>() {
+        return Ok(ip);
+    }
+
+    if let Ok(socket_addr) = bind_address.parse::<SocketAddr>() {
+        return Ok(socket_addr.ip());
+    }
+
+    anyhow::bail!("invalid bind address {bind_address}")
+}
+
+async fn resolve_server_address(
+    address: &str,
+    bind_ip: Option<IpAddr>,
+) -> anyhow::Result<SocketAddr> {
+    let addresses: Vec<SocketAddr> = lookup_host(address).await?.collect();
+    if addresses.is_empty() {
+        anyhow::bail!("failed to resolve server address {address}");
+    }
+
+    if let Some(bind_ip) = bind_ip {
+        if let Some(matched) = addresses
+            .iter()
+            .copied()
+            .find(|candidate| candidate.is_ipv4() == bind_ip.is_ipv4())
+        {
+            return Ok(matched);
+        }
+    }
+
+    Ok(addresses[0])
 }
 
 async fn perform_auth_handshake(
