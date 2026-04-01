@@ -169,7 +169,18 @@ pub async fn establish_naive_tcp_session(config: &ClientConfig) -> anyhow::Resul
         anyhow::bail!("server_public_address is required for NaiveTCP connection");
     }
 
-    let stream = TcpStream::connect(&config.client.server_public_address).await?;
+    let server_addr =
+        resolve_server_address(&config.client.server_public_address, None).await?;
+    let socket = match server_addr {
+        SocketAddr::V4(_) => TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => TcpSocket::new_v6()?,
+    };
+    #[cfg(unix)]
+    if let Some(protect) = &config.socket_protect {
+        use std::os::unix::io::AsRawFd;
+        protect.0(socket.as_raw_fd());
+    }
+    let stream = socket.connect(server_addr).await?;
     authenticate_naive_tcp_stream(config, stream).await
 }
 
@@ -189,6 +200,11 @@ pub async fn establish_naive_tcp_session_with_bind(
         IpAddr::V6(_) => TcpSocket::new_v6()?,
     };
     socket.bind(SocketAddr::new(bind_ip, 0))?;
+    #[cfg(unix)]
+    if let Some(protect) = &config.socket_protect {
+        use std::os::unix::io::AsRawFd;
+        protect.0(socket.as_raw_fd());
+    }
     let stream = socket.connect(server_address).await?;
     authenticate_naive_tcp_stream(config, stream).await
 }

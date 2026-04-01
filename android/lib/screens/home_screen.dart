@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import '../services/pairing_service.dart';
 import '../models/pairing_model.dart';
+import '../services/background_service.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -11,17 +13,65 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   Future<List<Map<String, dynamic>>>? _pairedServersFuture;
+  static const _statusChannel = MethodChannel('bonded/native');
+  String? _activeDeviceId;
+  bool _vpnRunning = false;
 
   @override
   void initState() {
     super.initState();
     _loadPairedServers();
+    _refreshVpnStatus();
   }
 
   void _loadPairedServers() {
     setState(() {
       _pairedServersFuture = PairingService.getPairedServers();
     });
+  }
+
+  Future<void> _refreshVpnStatus() async {
+    try {
+      final running =
+          await _statusChannel.invokeMethod<bool>('getVpnStatus') ?? false;
+      final status = await _statusChannel
+          .invokeMethod<Map<dynamic, dynamic>>('getVpnSessionStatus');
+      final serverAddress =
+          status?['serverAddress'] as String? ?? '';
+      if (mounted) {
+        setState(() {
+          _vpnRunning = running;
+          // Try to match running server address to a device ID via the paired
+          // server list – good enough for status display without extra channels.
+          if (!running) {
+            _activeDeviceId = null;
+          } else if (serverAddress.isNotEmpty) {
+            _activeDeviceId = serverAddress;
+          }
+        });
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _disconnectVpn() async {
+    try {
+      await BackgroundService.stopBackgroundService();
+      if (mounted) {
+        setState(() {
+          _vpnRunning = false;
+          _activeDeviceId = null;
+        });
+      }
+    } on BackgroundServiceException catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Disconnect failed: ${e.message}'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
   }
 
   Future<void> _openQrScanner() async {
@@ -47,6 +97,28 @@ class _HomeScreenState extends State<HomeScreen> {
       appBar: AppBar(
         title: const Text('Bonded VPN'),
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+        actions: [
+          if (_vpnRunning)
+            Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: Chip(
+                avatar: const Icon(Icons.vpn_lock,
+                    size: 16, color: Colors.white),
+                label: const Text('Connected',
+                    style: TextStyle(color: Colors.white, fontSize: 12)),
+                backgroundColor: Colors.green,
+                padding: EdgeInsets.zero,
+              ),
+            ),
+          IconButton(
+            icon: const Icon(Icons.refresh),
+            tooltip: 'Refresh',
+            onPressed: () {
+              _loadPairedServers();
+              _refreshVpnStatus();
+            },
+          ),
+        ],
       ),
       body: FutureBuilder<List<Map<String, dynamic>>>(
         future: _pairedServersFuture,
@@ -115,6 +187,12 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildServerCard(BuildContext context, Map<String, dynamic> server) {
+    final serverAddress = server['publicAddress'] as String? ?? '';
+    // Consider this server "active" when VPN is running and the address matches.
+    final isActive = _vpnRunning &&
+        (_activeDeviceId == server['id'] ||
+            _activeDeviceId == serverAddress);
+
     return Card(
       child: ListTile(
         leading: const Icon(Icons.dns, color: Colors.teal),
@@ -130,11 +208,40 @@ class _HomeScreenState extends State<HomeScreen> {
               'Protocols: ${(server['supportedProtocols'] as List?)?.join(', ') ?? 'unknown'}',
               style: const TextStyle(fontSize: 12),
             ),
+            if (isActive)
+              const Text(
+                'Active',
+                style: TextStyle(
+                    fontSize: 12,
+                    color: Colors.green,
+                    fontWeight: FontWeight.w600),
+              ),
           ],
         ),
-        trailing: PopupMenuButton(
-          itemBuilder:
-              (context) => [
+        trailing: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (isActive)
+              IconButton(
+                icon: const Icon(Icons.stop_circle, color: Colors.red),
+                tooltip: 'Disconnect',
+                onPressed: _disconnectVpn,
+              )
+            else
+              IconButton(
+                icon: const Icon(Icons.play_circle, color: Colors.green),
+                tooltip: 'Connect',
+                onPressed: () async {
+                  final deviceId = server['id'] as String? ?? '';
+                  await Navigator.of(context).pushNamed(
+                    '/dashboard',
+                    arguments: {'deviceId': deviceId},
+                  );
+                  if (mounted) _refreshVpnStatus();
+                },
+              ),
+            PopupMenuButton(
+              itemBuilder: (context) => [
                 PopupMenuItem(
                   onTap: () {
                     Navigator.of(context).pushNamed(
@@ -142,15 +249,15 @@ class _HomeScreenState extends State<HomeScreen> {
                       arguments: {'deviceId': server['id'] ?? ''},
                     );
                   },
-                  child: const Text('Connect'),
+                  child: const Text('Open dashboard'),
                 ),
                 PopupMenuItem(
-                  onTap: () {
-                    _openServerConfig(server);
-                  },
+                  onTap: () => _openServerConfig(server),
                   child: const Text('Configure'),
                 ),
               ],
+            ),
+          ],
         ),
         onTap: () {
           Navigator.of(context).pushNamed(

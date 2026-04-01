@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 use thiserror::Error;
+use std::sync::Arc;
 
 pub const DEFAULT_SERVER_CONFIG_PATH: &str = "/etc/bonded/server.toml";
 pub const DEFAULT_AUTHORIZED_KEYS_PATH: &str = "/var/lib/bonded/authorized_keys.toml";
@@ -10,6 +11,19 @@ pub const DEFAULT_INVITE_TOKENS_PATH: &str = "/var/lib/bonded/invite_tokens.toml
 pub const DEFAULT_CLIENT_CONFIG_PATH: &str = "~/.config/bonded/client.toml";
 pub const DEFAULT_CLIENT_PRIVATE_KEY_PATH: &str = "~/.local/share/bonded/device-key.pem";
 pub const DEFAULT_CLIENT_PUBLIC_KEY_PATH: &str = "~/.local/share/bonded/device-key.pub";
+
+/// Callback called with a raw socket file-descriptor just before the socket
+/// connects.  On Android this is used to call `VpnService.protect(fd)` so
+/// that the tunnel session's own TCP connections bypass the VPN routing table
+/// and avoid a routing loop.
+#[derive(Clone)]
+pub struct SocketProtectFn(pub Arc<dyn Fn(i32) -> bool + Send + Sync>);
+
+impl std::fmt::Debug for SocketProtectFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SocketProtectFn(..)")
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -68,12 +82,17 @@ impl Default for ServerSection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
     pub client: ClientSection,
+    /// Not serialised – set at runtime on platforms that require socket
+    /// protection (e.g. Android VPN services).
+    #[serde(skip)]
+    pub socket_protect: Option<SocketProtectFn>,
 }
 
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             client: ClientSection::default(),
+            socket_protect: None,
         }
     }
 }

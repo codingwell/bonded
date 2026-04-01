@@ -38,6 +38,7 @@ fn test_client_config(addr: String, keypair: &DeviceKeypair) -> ClientConfig {
             public_key_path: public_key_path.to_string_lossy().to_string(),
             ..ClientConfig::default().client
         },
+        socket_protect: None,
     }
 }
 

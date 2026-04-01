@@ -2,6 +2,8 @@
 use bonded_client::{establish_naive_tcp_session, establish_transport_paths};
 #[cfg(any(target_os = "android", test))]
 use bonded_core::config::ClientConfig;
+#[cfg(any(target_os = "android", test))]
+use bonded_core::config::SocketProtectFn;
 use bonded_core::session::SessionFrame;
 #[cfg(any(target_os = "android", test))]
 use bonded_core::session::SessionState;
@@ -20,6 +22,55 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 #[cfg(any(target_os = "android", test))]
 use std::time::Duration;
+#[cfg(any(target_os = "android", test))]
+use std::time::{SystemTime, UNIX_EPOCH};
+
+// ── JVM / VPN-service globals (Android only) ────────────────────────────────
+
+/// The JavaVM singleton stored once in JNI_OnLoad so threads can attach later.
+#[cfg(target_os = "android")]
+static ANDROID_JVM: OnceLock<jni::JavaVM> = OnceLock::new();
+
+/// A global reference to the currently active BondedVpnService instance, used
+/// to call `protect(fd)` on session sockets before they connect.
+#[cfg(target_os = "android")]
+static ANDROID_VPN_SERVICE: Mutex<Option<jni::objects::GlobalRef>> = Mutex::new(None);
+
+/// Called by the JVM when the native library is first loaded.  We grab the
+/// JavaVM here so we can attach arbitrary threads later.
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "system" fn JNI_OnLoad(
+    vm: jni::JavaVM,
+    _: *mut std::ffi::c_void,
+) -> jni::sys::jint {
+    let _ = ANDROID_JVM.set(vm);
+    jni::sys::JNI_VERSION_1_6
+}
+
+/// Ask the stored VpnService to protect `fd` so the socket bypasses the VPN.
+#[cfg(target_os = "android")]
+fn protect_fd(fd: i32) -> bool {
+    let Some(jvm) = ANDROID_JVM.get() else {
+        return false;
+    };
+        let mut guard = match jvm.attach_current_thread_as_daemon() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    let service = match ANDROID_VPN_SERVICE.lock() {
+        Ok(lock) => match lock.as_ref() {
+            Some(r) => r.clone(),
+            None => return false,
+        },
+        Err(_) => return false,
+    };
+    guard
+        .call_method(&service, "protect", "(I)Z", &[jni::objects::JValue::Int(fd)])
+        .ok()
+        .and_then(|v| v.z().ok())
+        .unwrap_or(false)
+}
 
 #[cfg(any(target_os = "android", test))]
 struct AndroidSessionHandle {
@@ -37,6 +88,10 @@ struct AndroidSessionSnapshot {
     server_address: String,
     outbound_packets: u64,
     inbound_packets: u64,
+    outbound_bytes: u64,
+    inbound_bytes: u64,
+    /// Unix timestamp in milliseconds when the session reached "connected".
+    connected_at_ms: u64,
     last_error: Option<String>,
 }
 
@@ -125,11 +180,14 @@ fn snapshot_json(snapshot: &AndroidSessionSnapshot) -> String {
         .unwrap_or_else(|| "null".to_owned());
 
     format!(
-        "{{\"state\":\"{}\",\"serverAddress\":\"{}\",\"outboundPackets\":{},\"inboundPackets\":{},\"lastError\":{}}}",
+        "{{\"state\":\"{}\",\"serverAddress\":\"{}\",\"outboundPackets\":{},\"inboundPackets\":{},\"outboundBytes\":{},\"inboundBytes\":{},\"connectedAtMs\":{},\"lastError\":{}}}",
         escape_json(&snapshot.state),
         escape_json(&snapshot.server_address),
         snapshot.outbound_packets,
         snapshot.inbound_packets,
+        snapshot.outbound_bytes,
+        snapshot.inbound_bytes,
+        snapshot.connected_at_ms,
         last_error,
     )
 }
@@ -185,6 +243,9 @@ fn start_android_session(
         server_address: server_address.to_owned(),
         outbound_packets: 0,
         inbound_packets: 0,
+        outbound_bytes: 0,
+        inbound_bytes: 0,
+        connected_at_ms: 0,
         last_error: None,
     }));
     let worker_snapshot = Arc::clone(&snapshot);
@@ -199,6 +260,11 @@ fn start_android_session(
     if !bind_addresses.is_empty() {
         config.client.path_bind_addresses = bind_addresses;
     }
+    // Wire in the socket protect callback so session sockets bypass the VPN.
+    #[cfg(target_os = "android")]
+    {
+        config.socket_protect = Some(SocketProtectFn(Arc::new(|fd| protect_fd(fd))));
+    }
 
     let worker = thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -212,8 +278,13 @@ fn start_android_session(
         runtime.block_on(async move {
             let mut transports = match establish_transport_paths(&config, path_count.max(1)).await {
                 Ok(transports) => {
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
                     update_snapshot(&worker_snapshot, |session_snapshot| {
                         session_snapshot.state = "connected".to_owned();
+                        session_snapshot.connected_at_ms = now_ms;
                         session_snapshot.last_error = None;
                     });
                     transports
@@ -238,6 +309,7 @@ fn start_android_session(
                                     break;
                                 }
 
+                                let packet_len = packet.len() as u64;
                                 let frame = session.create_outbound_frame(Bytes::from(packet), 0);
                                 if let Err(err) = transports[active_index].send(frame).await {
                                     if transports.len() == 1 {
@@ -256,6 +328,7 @@ fn start_android_session(
                                 }
                                 update_snapshot(&worker_snapshot, |session_snapshot| {
                                     session_snapshot.outbound_packets = session_snapshot.outbound_packets.saturating_add(1);
+                                    session_snapshot.outbound_bytes = session_snapshot.outbound_bytes.saturating_add(packet_len);
                                 });
                             }
                             None => break,
@@ -277,6 +350,7 @@ fn start_android_session(
 
                                 if !ready.is_empty() {
                                     let ready_len = ready.len() as u64;
+                                    let total_bytes = ready.iter().map(|f| f.payload.len() as u64).sum::<u64>();
                                     let mut queue = worker_inbound_queue
                                         .lock()
                                         .expect("android inbound queue lock poisoned");
@@ -285,6 +359,7 @@ fn start_android_session(
                                     }
                                     update_snapshot(&worker_snapshot, |session_snapshot| {
                                         session_snapshot.inbound_packets = session_snapshot.inbound_packets.saturating_add(ready_len);
+                                        session_snapshot.inbound_bytes = session_snapshot.inbound_bytes.saturating_add(total_bytes);
                                     });
                                 }
                             }
@@ -447,13 +522,20 @@ pub extern "system" fn Java_com_bonded_bonded_1app_MainActivity_nativeRedeemInvi
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeStartSession(
     mut env: jni::JNIEnv,
-    _obj: jni::objects::JObject,
+    obj: jni::objects::JObject,
     server_address: jni::objects::JString,
     protocol_csv: jni::objects::JString,
     path_count: jni::sys::jint,
     bind_addresses_json: jni::objects::JString,
     storage_dir: jni::objects::JString,
 ) -> jni::sys::jboolean {
+    // Store global ref to the service so protect_fd can call back into Java.
+    if let Ok(global_ref) = env.new_global_ref(&obj) {
+        if let Ok(mut guard) = ANDROID_VPN_SERVICE.lock() {
+            *guard = Some(global_ref);
+        }
+    }
+
     let server_address: String = match env.get_string(&server_address) {
         Ok(value) => value.into(),
         Err(_) => return 0,
@@ -493,6 +575,10 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeStopSe
     _obj: jni::objects::JObject,
 ) {
     stop_android_session();
+    // Release the VPN service global ref now that the session is stopped.
+    if let Ok(mut guard) = ANDROID_VPN_SERVICE.lock() {
+        *guard = None;
+    }
 }
 
 #[cfg(target_os = "android")]

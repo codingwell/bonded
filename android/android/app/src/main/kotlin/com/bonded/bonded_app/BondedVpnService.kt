@@ -23,6 +23,9 @@ data class SessionSnapshot(
     val serverAddress: String,
     val outboundPackets: Long,
     val inboundPackets: Long,
+    val outboundBytes: Long,
+    val inboundBytes: Long,
+    val connectedAtMs: Long,
     val lastError: String?,
 )
 
@@ -87,6 +90,8 @@ class BondedVpnService : VpnService() {
                     .setMtu(1500)
                     .addAddress("10.8.0.2", 32)
                     .addRoute("0.0.0.0", 0)
+                    .addDnsServer("8.8.8.8")
+                    .addDnsServer("1.1.1.1")
                     .establish()
             } catch (e: Exception) {
                 emitEvent("error", "Failed to establish VPN: ${e.message}")
@@ -286,6 +291,9 @@ class BondedVpnService : VpnService() {
                 serverAddress = json.optString("serverAddress", ""),
                 outboundPackets = json.optLong("outboundPackets", 0),
                 inboundPackets = json.optLong("inboundPackets", 0),
+                outboundBytes = json.optLong("outboundBytes", 0),
+                inboundBytes = json.optLong("inboundBytes", 0),
+                connectedAtMs = json.optLong("connectedAtMs", 0),
                 lastError = json.optString("lastError").takeIf { it.isNotBlank() && it != "null" },
             )
         } catch (_: Exception) {
@@ -496,6 +504,9 @@ class BondedVpnService : VpnService() {
                 "serverAddress" to snapshot.serverAddress,
                 "outboundPackets" to snapshot.outboundPackets,
                 "inboundPackets" to snapshot.inboundPackets,
+                "outboundBytes" to snapshot.outboundBytes,
+                "inboundBytes" to snapshot.inboundBytes,
+                "connectedAtMs" to snapshot.connectedAtMs,
                 "lastError" to snapshot.lastError,
                 "networkPathCount" to activeNetworkPathCount,
             )

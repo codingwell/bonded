@@ -19,11 +19,16 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   String _vpnStatus = 'Unknown';
   String _connectedServer = 'Not connected';
-  String _dataTransferred = '0 B';
   int _activePathCount = 1;
   bool _isConnecting = false;
   bool _isBackgroundRunning = false;
   StreamSubscription<BackgroundServiceEvent>? _backgroundEventsSubscription;
+
+  // Bytes / uptime
+  int _outboundBytes = 0;
+  int _inboundBytes = 0;
+  int _connectedAtMs = 0;
+  String? _lastError;
 
   @override
   void initState() {
@@ -83,12 +88,16 @@ class _DashboardScreenState extends State<DashboardScreen> {
       final String sessionState = sessionStatus?['state'] as String? ?? '';
       final String serverAddress =
           sessionStatus?['serverAddress'] as String? ?? 'bonded.example.com';
-      final int outboundPackets =
-          (sessionStatus?['outboundPackets'] as num?)?.toInt() ?? 0;
-      final int inboundPackets =
-          (sessionStatus?['inboundPackets'] as num?)?.toInt() ?? 0;
-      final int networkPathCount =
+        final int networkPathCount =
           (sessionStatus?['networkPathCount'] as num?)?.toInt() ?? 1;
+
+      final int outboundBytes =
+          (sessionStatus?['outboundBytes'] as num?)?.toInt() ?? 0;
+      final int inboundBytes =
+          (sessionStatus?['inboundBytes'] as num?)?.toInt() ?? 0;
+      final int connectedAtMs =
+          (sessionStatus?['connectedAtMs'] as num?)?.toInt() ?? 0;
+      final String? lastError = sessionStatus?['lastError'] as String?;
 
       if (mounted) {
         setState(() {
@@ -99,10 +108,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
             _ => vpnRunning ? 'Connected' : 'Disconnected',
           };
           _connectedServer = serverAddress;
-          _dataTransferred =
-              vpnRunning
-                  ? '${outboundPackets + inboundPackets} packets'
-                  : '0 B';
+          _outboundBytes = outboundBytes;
+          _inboundBytes = inboundBytes;
+          _connectedAtMs = connectedAtMs;
+          _lastError = lastError?.isNotEmpty == true ? lastError : null;
           _activePathCount = networkPathCount;
           _isBackgroundRunning = backgroundRunning;
         });
@@ -162,7 +171,15 @@ class _DashboardScreenState extends State<DashboardScreen> {
   @override
   Widget build(BuildContext context) {
     final isConnected = _vpnStatus == 'Connected';
-    final statusColor = isConnected ? Colors.green : Colors.grey;
+    final isConnecting = _vpnStatus == 'Connecting';
+    final isError = _vpnStatus == 'Error';
+    final statusColor = isConnected
+        ? Colors.green
+        : isConnecting
+            ? Colors.orange
+            : isError
+                ? Colors.red
+                : Colors.grey;
 
     return Scaffold(
       appBar: AppBar(
@@ -193,90 +210,28 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
                     // Large VPN status indicator
-                    Container(
-                      width: 120,
-                      height: 120,
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        color: statusColor.withAlpha(50),
-                        border: Border.all(color: statusColor, width: 3),
-                      ),
-                      child: Center(
-                        child: Icon(
-                          isConnected ? Icons.vpn_lock : Icons.lock_open,
-                          size: 60,
-                          color: statusColor,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(height: 24),
-                    // Status text
-                    Text(
-                      _vpnStatus,
-                      style: TextStyle(
-                        fontSize: 28,
-                        fontWeight: FontWeight.bold,
-                        color: statusColor,
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    Text(
-                      'Device ID: ${widget.deviceId}',
-                      style: TextStyle(fontSize: 12, color: Colors.grey[600]),
-                    ),
+                    _StatusIndicator(
+                        status: _vpnStatus, color: statusColor),
                     const SizedBox(height: 32),
-                    // Connection details
-                    Container(
-                      width: double.infinity,
-                      padding: const EdgeInsets.all(16),
-                      decoration: BoxDecoration(
-                        color: Colors.grey[100],
-                        borderRadius: BorderRadius.circular(8),
-                        border: Border.all(color: Colors.grey[300]!),
-                      ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          _buildDetailItem('Server', _connectedServer),
-                          const Divider(),
-                          _buildDetailItem('Active Paths', '$_activePathCount'),
-                          const Divider(),
-                          _buildDetailItem(
-                            'Data Transferred',
-                            _dataTransferred,
-                          ),
-                        ],
-                      ),
+                    // Connection stats card
+                    _ConnectionStatsCard(
+                      server: _connectedServer,
+                      activePaths: _activePathCount,
+                      outboundBytes: _outboundBytes,
+                      inboundBytes: _inboundBytes,
+                      connectedAtMs: _connectedAtMs,
+                      isConnected: isConnected,
                     ),
+                    if (_lastError != null) ...[
+                      const SizedBox(height: 12),
+                      _ErrorBanner(message: _lastError!),
+                    ],
                     const SizedBox(height: 32),
-                    // Main action button
-                    ElevatedButton(
-                      onPressed: _isConnecting ? null : _toggleVpn,
-                      style: ElevatedButton.styleFrom(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 48,
-                          vertical: 16,
-                        ),
-                        backgroundColor:
-                            isConnected ? Colors.red : Colors.green,
-                        disabledBackgroundColor: Colors.grey,
-                      ),
-                      child:
-                          _isConnecting
-                              ? const SizedBox(
-                                width: 20,
-                                height: 20,
-                                child: CircularProgressIndicator(
-                                  strokeWidth: 2,
-                                  valueColor: AlwaysStoppedAnimation<Color>(
-                                    Colors.white,
-                                  ),
-                                ),
-                              )
-                              : Text(
-                                isConnected ? 'Disconnect' : 'Connect',
-                                style: const TextStyle(fontSize: 18),
-                              ),
+                    // Connect / Disconnect
+                    _ConnectButton(
+                      isConnected: isConnected,
+                      isConnecting: _isConnecting,
+                      onTap: _toggleVpn,
                     ),
                     const SizedBox(height: 16),
                     OutlinedButton(
@@ -292,16 +247,206 @@ class _DashboardScreenState extends State<DashboardScreen> {
       ),
     );
   }
+}
 
-  Widget _buildDetailItem(String label, String value) {
+// ── Reusable sub-widgets ──────────────────────────────────────────────────────
+
+class _StatusIndicator extends StatelessWidget {
+  final String status;
+  final Color color;
+  const _StatusIndicator({required this.status, required this.color});
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        Container(
+          width: 120,
+          height: 120,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: color.withAlpha(40),
+            border: Border.all(color: color, width: 3),
+          ),
+          child: Center(
+            child: Icon(
+              status == 'Connected' ? Icons.vpn_lock : Icons.lock_open,
+              size: 60,
+              color: color,
+            ),
+          ),
+        ),
+        const SizedBox(height: 16),
+        Text(
+          status,
+          style: TextStyle(
+            fontSize: 28,
+            fontWeight: FontWeight.bold,
+            color: color,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _ConnectionStatsCard extends StatelessWidget {
+  final String server;
+  final int activePaths;
+  final int outboundBytes;
+  final int inboundBytes;
+  final int connectedAtMs;
+  final bool isConnected;
+
+  const _ConnectionStatsCard({
+    required this.server,
+    required this.activePaths,
+    required this.outboundBytes,
+    required this.inboundBytes,
+    required this.connectedAtMs,
+    required this.isConnected,
+  });
+
+  String _fmtBytes(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) {
+      return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    }
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(2)} MB';
+  }
+
+  String _uptime() {
+    if (!isConnected || connectedAtMs == 0) return '—';
+    final elapsed =
+        DateTime.now().millisecondsSinceEpoch - connectedAtMs;
+    if (elapsed <= 0) return '—';
+    final d = Duration(milliseconds: elapsed);
+    final h = d.inHours;
+    final m = d.inMinutes.remainder(60);
+    final s = d.inSeconds.remainder(60);
+    if (h > 0) return '${h}h ${m}m ${s}s';
+    if (m > 0) return '${m}m ${s}s';
+    return '${s}s';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.grey[100],
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.grey[300]!),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _Row('Server', server),
+          const Divider(height: 16),
+          _Row('Active paths', '$activePaths'),
+          const Divider(height: 16),
+          _Row('Uptime', _uptime()),
+          const Divider(height: 16),
+          _Row('Sent', _fmtBytes(outboundBytes)),
+          const Divider(height: 16),
+          _Row('Received', _fmtBytes(inboundBytes)),
+        ],
+      ),
+    );
+  }
+}
+
+class _Row extends StatelessWidget {
+  final String label;
+  final String value;
+  const _Row(this.label, this.value);
+
+  @override
+  Widget build(BuildContext context) {
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8),
+      padding: const EdgeInsets.symmetric(vertical: 4),
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          Text(label, style: const TextStyle(color: Colors.grey)),
-          Text(value, style: const TextStyle(fontWeight: FontWeight.bold)),
+          Text(label,
+              style: TextStyle(color: Colors.grey[600], fontSize: 14)),
+          Text(value,
+              style: const TextStyle(
+                  fontWeight: FontWeight.bold, fontSize: 14)),
         ],
+      ),
+    );
+  }
+}
+
+class _ErrorBanner extends StatelessWidget {
+  final String message;
+  const _ErrorBanner({required this.message});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.red[50],
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.red[200]!),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.error_outline, color: Colors.red, size: 18),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              message,
+              style:
+                  const TextStyle(color: Colors.red, fontSize: 13),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ConnectButton extends StatelessWidget {
+  final bool isConnected;
+  final bool isConnecting;
+  final VoidCallback onTap;
+  const _ConnectButton(
+      {required this.isConnected,
+      required this.isConnecting,
+      required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return FilledButton.icon(
+      onPressed: isConnecting ? null : onTap,
+      style: FilledButton.styleFrom(
+        backgroundColor: isConnected ? Colors.red : Colors.green,
+        padding:
+            const EdgeInsets.symmetric(horizontal: 48, vertical: 18),
+        shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(32)),
+      ),
+      icon: isConnecting
+          ? const SizedBox(
+              width: 18,
+              height: 18,
+              child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                  color: Colors.white),
+            )
+          : Icon(
+              isConnected ? Icons.stop_circle : Icons.play_circle,
+              size: 22,
+            ),
+      label: Text(
+        isConnected ? 'Disconnect' : 'Connect',
+        style:
+            const TextStyle(fontSize: 17, fontWeight: FontWeight.w600),
       ),
     );
   }
