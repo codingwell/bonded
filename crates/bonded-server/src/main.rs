@@ -23,7 +23,6 @@ use invite_tokens::ensure_startup_invite;
 use pairing_qr::emit_pairing_qr;
 use session_registry::SessionRegistry;
 use std::io::BufReader;
-use std::path::Path;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -53,7 +52,6 @@ async fn main() -> anyhow::Result<()> {
 
     apply_env_overrides(&mut cfg, |key| std::env::var(key).ok());
     init_tracing_from_level(&cfg.server.log_level);
-    ensure_server_state_files(&cfg)?;
 
     let authorized_keys = AuthorizedKeysStore::load(&cfg.server.authorized_keys_file)?;
     info!(
@@ -116,40 +114,6 @@ async fn main() -> anyhow::Result<()> {
         SessionRegistry::default(),
     )
     .await
-}
-
-fn ensure_server_state_files(cfg: &ServerConfig) -> anyhow::Result<()> {
-    ensure_state_file(
-        &cfg.server.authorized_keys_file,
-        "devices = []\n",
-        "authorized keys",
-    )?;
-    ensure_state_file(
-        &cfg.server.invite_tokens_file,
-        "tokens = []\n",
-        "invite tokens",
-    )?;
-
-    Ok(())
-}
-
-fn ensure_state_file(path: &str, default_contents: &str, description: &str) -> anyhow::Result<()> {
-    let path = Path::new(path);
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    if !path.exists() {
-        std::fs::write(path, default_contents)?;
-        info!(
-            path = %path.display(),
-            file = %description,
-            "created missing server state file"
-        );
-    }
-
-    Ok(())
 }
 
 async fn run_websocket_server(
@@ -488,18 +452,8 @@ fn init_tracing_from_level(level: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_env_overrides, ensure_server_state_files};
+    use super::apply_env_overrides;
     use bonded_core::config::ServerConfig;
-    use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_state_path(name: &str) -> std::path::PathBuf {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be valid")
-            .as_nanos();
-        std::env::temp_dir().join(format!("bonded-{name}-{stamp}"))
-    }
 
     #[test]
     fn env_overrides_replace_server_fields() {
@@ -551,33 +505,5 @@ mod tests {
         });
 
         assert_eq!(cfg.server.public_address, "legacy.example.com:8080");
-    }
-
-    #[test]
-    fn startup_creates_missing_server_state_files() {
-        let root = temp_state_path("state-files");
-        let authorized = root.join("authorized_keys.toml");
-        let invites = root.join("invite_tokens.toml");
-
-        let mut cfg = ServerConfig::default();
-        cfg.server.authorized_keys_file = authorized.display().to_string();
-        cfg.server.invite_tokens_file = invites.display().to_string();
-
-        ensure_server_state_files(&cfg).expect("state files should be created");
-
-        assert!(authorized.exists());
-        assert!(invites.exists());
-        assert_eq!(
-            fs::read_to_string(&authorized).expect("authorized keys should be readable"),
-            "devices = []\n"
-        );
-        assert_eq!(
-            fs::read_to_string(&invites).expect("invite tokens should be readable"),
-            "tokens = []\n"
-        );
-
-        let _ = fs::remove_file(authorized);
-        let _ = fs::remove_file(invites);
-        let _ = fs::remove_dir(root);
     }
 }
