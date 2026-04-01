@@ -19,7 +19,8 @@
                 "tamasfe.even-better-toml",
                 "serayuzgur.crates",
                 "ms-azuretools.vscode-docker",
-                "GitHub.copilot"
+                "GitHub.copilot",
+                "github.vscode-github-actions"
             ],
             "settings": {
                 "rust-analyzer.cargo.features": "all",
