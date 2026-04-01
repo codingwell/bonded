@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
-use thiserror::Error;
 use std::sync::Arc;
+use thiserror::Error;
 
 pub const DEFAULT_SERVER_CONFIG_PATH: &str = "/etc/bonded/server.toml";
 pub const DEFAULT_AUTHORIZED_KEYS_PATH: &str = "/var/lib/bonded/authorized_keys.toml";

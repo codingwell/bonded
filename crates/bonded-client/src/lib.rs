@@ -169,8 +169,7 @@ pub async fn establish_naive_tcp_session(config: &ClientConfig) -> anyhow::Resul
         anyhow::bail!("server_public_address is required for NaiveTCP connection");
     }
 
-    let server_addr =
-        resolve_server_address(&config.client.server_public_address, None).await?;
+    let server_addr = resolve_server_address(&config.client.server_public_address, None).await?;
     let socket = match server_addr {
         SocketAddr::V4(_) => TcpSocket::new_v4()?,
         SocketAddr::V6(_) => TcpSocket::new_v6()?,

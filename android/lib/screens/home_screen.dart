@@ -34,10 +34,10 @@ class _HomeScreenState extends State<HomeScreen> {
     try {
       final running =
           await _statusChannel.invokeMethod<bool>('getVpnStatus') ?? false;
-      final status = await _statusChannel
-          .invokeMethod<Map<dynamic, dynamic>>('getVpnSessionStatus');
-      final serverAddress =
-          status?['serverAddress'] as String? ?? '';
+      final status = await _statusChannel.invokeMethod<Map<dynamic, dynamic>>(
+        'getVpnSessionStatus',
+      );
+      final serverAddress = status?['serverAddress'] as String? ?? '';
       if (mounted) {
         setState(() {
           _vpnRunning = running;
@@ -102,10 +102,15 @@ class _HomeScreenState extends State<HomeScreen> {
             Padding(
               padding: const EdgeInsets.only(right: 8),
               child: Chip(
-                avatar: const Icon(Icons.vpn_lock,
-                    size: 16, color: Colors.white),
-                label: const Text('Connected',
-                    style: TextStyle(color: Colors.white, fontSize: 12)),
+                avatar: const Icon(
+                  Icons.vpn_lock,
+                  size: 16,
+                  color: Colors.white,
+                ),
+                label: const Text(
+                  'Connected',
+                  style: TextStyle(color: Colors.white, fontSize: 12),
+                ),
                 backgroundColor: Colors.green,
                 padding: EdgeInsets.zero,
               ),
@@ -189,9 +194,9 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget _buildServerCard(BuildContext context, Map<String, dynamic> server) {
     final serverAddress = server['publicAddress'] as String? ?? '';
     // Consider this server "active" when VPN is running and the address matches.
-    final isActive = _vpnRunning &&
-        (_activeDeviceId == server['id'] ||
-            _activeDeviceId == serverAddress);
+    final isActive =
+        _vpnRunning &&
+        (_activeDeviceId == server['id'] || _activeDeviceId == serverAddress);
 
     return Card(
       child: ListTile(
@@ -212,9 +217,10 @@ class _HomeScreenState extends State<HomeScreen> {
               const Text(
                 'Active',
                 style: TextStyle(
-                    fontSize: 12,
-                    color: Colors.green,
-                    fontWeight: FontWeight.w600),
+                  fontSize: 12,
+                  color: Colors.green,
+                  fontWeight: FontWeight.w600,
+                ),
               ),
           ],
         ),
@@ -233,29 +239,29 @@ class _HomeScreenState extends State<HomeScreen> {
                 tooltip: 'Connect',
                 onPressed: () async {
                   final deviceId = server['id'] as String? ?? '';
-                  await Navigator.of(context).pushNamed(
-                    '/dashboard',
-                    arguments: {'deviceId': deviceId},
-                  );
+                  await Navigator.of(
+                    context,
+                  ).pushNamed('/dashboard', arguments: {'deviceId': deviceId});
                   if (mounted) _refreshVpnStatus();
                 },
               ),
             PopupMenuButton(
-              itemBuilder: (context) => [
-                PopupMenuItem(
-                  onTap: () {
-                    Navigator.of(context).pushNamed(
-                      '/dashboard',
-                      arguments: {'deviceId': server['id'] ?? ''},
-                    );
-                  },
-                  child: const Text('Open dashboard'),
-                ),
-                PopupMenuItem(
-                  onTap: () => _openServerConfig(server),
-                  child: const Text('Configure'),
-                ),
-              ],
+              itemBuilder:
+                  (context) => [
+                    PopupMenuItem(
+                      onTap: () {
+                        Navigator.of(context).pushNamed(
+                          '/dashboard',
+                          arguments: {'deviceId': server['id'] ?? ''},
+                        );
+                      },
+                      child: const Text('Open dashboard'),
+                    ),
+                    PopupMenuItem(
+                      onTap: () => _openServerConfig(server),
+                      child: const Text('Configure'),
+                    ),
+                  ],
             ),
           ],
         ),

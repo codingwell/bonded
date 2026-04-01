@@ -88,7 +88,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       final String sessionState = sessionStatus?['state'] as String? ?? '';
       final String serverAddress =
           sessionStatus?['serverAddress'] as String? ?? 'bonded.example.com';
-        final int networkPathCount =
+      final int networkPathCount =
           (sessionStatus?['networkPathCount'] as num?)?.toInt() ?? 1;
 
       final int outboundBytes =
@@ -173,13 +173,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
     final isConnected = _vpnStatus == 'Connected';
     final isConnecting = _vpnStatus == 'Connecting';
     final isError = _vpnStatus == 'Error';
-    final statusColor = isConnected
-        ? Colors.green
-        : isConnecting
+    final statusColor =
+        isConnected
+            ? Colors.green
+            : isConnecting
             ? Colors.orange
             : isError
-                ? Colors.red
-                : Colors.grey;
+            ? Colors.red
+            : Colors.grey;
 
     return Scaffold(
       appBar: AppBar(
@@ -210,8 +211,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
                     // Large VPN status indicator
-                    _StatusIndicator(
-                        status: _vpnStatus, color: statusColor),
+                    _StatusIndicator(status: _vpnStatus, color: statusColor),
                     const SizedBox(height: 32),
                     // Connection stats card
                     _ConnectionStatsCard(
@@ -317,8 +317,7 @@ class _ConnectionStatsCard extends StatelessWidget {
 
   String _uptime() {
     if (!isConnected || connectedAtMs == 0) return '—';
-    final elapsed =
-        DateTime.now().millisecondsSinceEpoch - connectedAtMs;
+    final elapsed = DateTime.now().millisecondsSinceEpoch - connectedAtMs;
     if (elapsed <= 0) return '—';
     final d = Duration(milliseconds: elapsed);
     final h = d.inHours;
@@ -369,11 +368,11 @@ class _Row extends StatelessWidget {
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          Text(label,
-              style: TextStyle(color: Colors.grey[600], fontSize: 14)),
-          Text(value,
-              style: const TextStyle(
-                  fontWeight: FontWeight.bold, fontSize: 14)),
+          Text(label, style: TextStyle(color: Colors.grey[600], fontSize: 14)),
+          Text(
+            value,
+            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+          ),
         ],
       ),
     );
@@ -401,8 +400,7 @@ class _ErrorBanner extends StatelessWidget {
           Expanded(
             child: Text(
               message,
-              style:
-                  const TextStyle(color: Colors.red, fontSize: 13),
+              style: const TextStyle(color: Colors.red, fontSize: 13),
             ),
           ),
         ],
@@ -415,10 +413,11 @@ class _ConnectButton extends StatelessWidget {
   final bool isConnected;
   final bool isConnecting;
   final VoidCallback onTap;
-  const _ConnectButton(
-      {required this.isConnected,
-      required this.isConnecting,
-      required this.onTap});
+  const _ConnectButton({
+    required this.isConnected,
+    required this.isConnecting,
+    required this.onTap,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -426,27 +425,26 @@ class _ConnectButton extends StatelessWidget {
       onPressed: isConnecting ? null : onTap,
       style: FilledButton.styleFrom(
         backgroundColor: isConnected ? Colors.red : Colors.green,
-        padding:
-            const EdgeInsets.symmetric(horizontal: 48, vertical: 18),
-        shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(32)),
+        padding: const EdgeInsets.symmetric(horizontal: 48, vertical: 18),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(32)),
       ),
-      icon: isConnecting
-          ? const SizedBox(
-              width: 18,
-              height: 18,
-              child: CircularProgressIndicator(
+      icon:
+          isConnecting
+              ? const SizedBox(
+                width: 18,
+                height: 18,
+                child: CircularProgressIndicator(
                   strokeWidth: 2,
-                  color: Colors.white),
-            )
-          : Icon(
-              isConnected ? Icons.stop_circle : Icons.play_circle,
-              size: 22,
-            ),
+                  color: Colors.white,
+                ),
+              )
+              : Icon(
+                isConnected ? Icons.stop_circle : Icons.play_circle,
+                size: 22,
+              ),
       label: Text(
         isConnected ? 'Disconnect' : 'Connect',
-        style:
-            const TextStyle(fontSize: 17, fontWeight: FontWeight.w600),
+        style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w600),
       ),
     );
   }

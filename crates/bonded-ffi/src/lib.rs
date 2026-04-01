@@ -40,10 +40,7 @@ static ANDROID_VPN_SERVICE: Mutex<Option<jni::objects::GlobalRef>> = Mutex::new(
 /// JavaVM here so we can attach arbitrary threads later.
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
-pub extern "system" fn JNI_OnLoad(
-    vm: jni::JavaVM,
-    _: *mut std::ffi::c_void,
-) -> jni::sys::jint {
+pub extern "system" fn JNI_OnLoad(vm: jni::JavaVM, _: *mut std::ffi::c_void) -> jni::sys::jint {
     let _ = ANDROID_JVM.set(vm);
     jni::sys::JNI_VERSION_1_6
 }
@@ -54,7 +51,7 @@ fn protect_fd(fd: i32) -> bool {
     let Some(jvm) = ANDROID_JVM.get() else {
         return false;
     };
-        let mut guard = match jvm.attach_current_thread_as_daemon() {
+    let mut guard = match jvm.attach_current_thread_as_daemon() {
         Ok(g) => g,
         Err(_) => return false,
     };
@@ -66,7 +63,12 @@ fn protect_fd(fd: i32) -> bool {
         Err(_) => return false,
     };
     guard
-        .call_method(&service, "protect", "(I)Z", &[jni::objects::JValue::Int(fd)])
+        .call_method(
+            &service,
+            "protect",
+            "(I)Z",
+            &[jni::objects::JValue::Int(fd)],
+        )
         .ok()
         .and_then(|v| v.z().ok())
         .unwrap_or(false)
