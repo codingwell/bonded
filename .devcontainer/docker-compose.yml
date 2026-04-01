@@ -6,8 +6,12 @@ services:
     volumes:
       - ..:/workspace:cached
       - ./.history:/commandhistory
+      - gradle-cache:/home/vscode/.gradle
     command: sleep infinity
     cap_add:
       - SYS_PTRACE
     security_opt:
       - seccomp:unconfined
+
+volumes:
+  gradle-cache:
