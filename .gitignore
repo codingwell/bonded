@@ -44,7 +44,6 @@ Thumbs.db
 
 # ----- Docker -----
 docker-compose.override.yml
-.devcontainer/.history/
 
 # ----- OS -----
 *.log
