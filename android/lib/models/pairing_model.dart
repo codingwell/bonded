@@ -14,10 +14,15 @@ class ServerPairingPayload {
   });
 
   factory ServerPairingPayload.fromJson(Map<String, dynamic> json) {
+    final publicAddress =
+        (json['server_public_address'] ?? json['public_address'] ?? '')
+            .toString()
+            .trim();
+
     return ServerPairingPayload(
-      publicAddress: json['public_address'] ?? '',
-      inviteToken: json['invite_token'] ?? '',
-      serverPublicKey: json['server_public_key'] ?? '',
+      publicAddress: publicAddress,
+      inviteToken: (json['invite_token'] ?? '').toString().trim(),
+      serverPublicKey: (json['server_public_key'] ?? '').toString().trim(),
       supportedProtocols: List<String>.from(json['supported_protocols'] ?? []),
     );
   }
@@ -25,7 +30,15 @@ class ServerPairingPayload {
   static ServerPairingPayload? parseQrData(String data) {
     try {
       final json = jsonDecode(data) as Map<String, dynamic>;
-      return ServerPairingPayload.fromJson(json);
+      final payload = ServerPairingPayload.fromJson(json);
+
+      if (payload.publicAddress.isEmpty ||
+          payload.inviteToken.isEmpty ||
+          payload.serverPublicKey.isEmpty) {
+        return null;
+      }
+
+      return payload;
     } catch (e) {
       return null;
     }
