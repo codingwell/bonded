@@ -89,9 +89,9 @@ jobs:
           yes | sdkmanager --licenses
           sdkmanager \
             "platform-tools" \
-            "platforms;android-34" \
-            "build-tools;34.0.0" \
-            "ndk;26.3.11579264"
+            "platforms;android-36" \
+            "build-tools;35.0.0" \
+            "ndk;28.2.13676358"
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
