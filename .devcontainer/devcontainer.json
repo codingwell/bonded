@@ -24,6 +24,7 @@
             "settings": {
                 "rust-analyzer.cargo.features": "all",
                 "editor.formatOnSave": true,
+                "terminal.integrated.defaultProfile.linux": "bash",
                 "[rust]": {
                     "editor.defaultFormatter": "rust-lang.rust-analyzer"
                 },
