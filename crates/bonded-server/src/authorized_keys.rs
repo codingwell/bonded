@@ -129,59 +129,59 @@ impl AuthorizedKeysWatcher {
         let last_reload_for_callback = last_reload_at.clone();
         let mut watcher = notify::recommended_watcher(
             move |event_result: notify::Result<notify::Event>| match event_result {
-            Ok(event) => {
-                if !should_reload_for_event_kind(&event.kind) {
-                    debug!(
-                        path = %path_for_callback.display(),
-                        event_kind = ?event.kind,
-                        "ignoring non-mutating authorized keys watcher event"
-                    );
-                    return;
-                }
+                Ok(event) => {
+                    if !should_reload_for_event_kind(&event.kind) {
+                        debug!(
+                            path = %path_for_callback.display(),
+                            event_kind = ?event.kind,
+                            "ignoring non-mutating authorized keys watcher event"
+                        );
+                        return;
+                    }
 
-                let now = Instant::now();
-                let should_skip = match last_reload_for_callback.lock() {
-                    Ok(mut guard) => {
-                        if let Some(last) = *guard {
-                            if now.duration_since(last) < Duration::from_millis(200) {
-                                true
+                    let now = Instant::now();
+                    let should_skip = match last_reload_for_callback.lock() {
+                        Ok(mut guard) => {
+                            if let Some(last) = *guard {
+                                if now.duration_since(last) < Duration::from_millis(200) {
+                                    true
+                                } else {
+                                    *guard = Some(now);
+                                    false
+                                }
                             } else {
                                 *guard = Some(now);
                                 false
                             }
-                        } else {
-                            *guard = Some(now);
+                        }
+                        Err(_) => {
+                            warn!(
+                                path = %path_for_callback.display(),
+                                "authorized keys watcher debounce lock poisoned; proceeding without debounce"
+                            );
                             false
                         }
-                    }
-                    Err(_) => {
-                        warn!(
+                    };
+
+                    if should_skip {
+                        debug!(
                             path = %path_for_callback.display(),
-                            "authorized keys watcher debounce lock poisoned; proceeding without debounce"
+                            event_kind = ?event.kind,
+                            "debounced authorized keys watcher event"
                         );
-                        false
+                        return;
                     }
-                };
 
-                if should_skip {
-                    debug!(
-                        path = %path_for_callback.display(),
-                        event_kind = ?event.kind,
-                        "debounced authorized keys watcher event"
-                    );
-                    return;
+                    if let Err(err) = store.reload() {
+                        error!(path = %path_for_callback.display(), error = %err, "authorized keys reload failed");
+                    } else {
+                        info!(path = %path_for_callback.display(), devices = store.device_count(), "authorized keys reloaded");
+                    }
                 }
-
-                if let Err(err) = store.reload() {
-                    error!(path = %path_for_callback.display(), error = %err, "authorized keys reload failed");
-                } else {
-                    info!(path = %path_for_callback.display(), devices = store.device_count(), "authorized keys reloaded");
+                Err(err) => {
+                    warn!(path = %path_for_callback.display(), error = %err, "authorized keys watcher event error");
                 }
-            }
-            Err(err) => {
-                warn!(path = %path_for_callback.display(), error = %err, "authorized keys watcher event error");
-            }
-        },
+            },
         )?;
 
         watcher.watch(&path, RecursiveMode::NonRecursive)?;
