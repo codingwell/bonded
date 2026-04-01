@@ -6,6 +6,9 @@ members = [
     "crates/bonded-cli",
     "crates/bonded-ffi",
 ]
+exclude = [
+    "server",
+]
 resolver = "2"
 
 [workspace.package]
