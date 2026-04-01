@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
+use notify::event::{AccessKind, AccessMode, EventKind, ModifyKind};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AuthorizedDevice {
@@ -123,8 +125,53 @@ impl AuthorizedKeysWatcher {
     pub fn spawn(store: AuthorizedKeysStore) -> notify::Result<Self> {
         let path = store.path().to_path_buf();
         let path_for_callback = path.clone();
-        let mut watcher = notify::recommended_watcher(move |event_result| match event_result {
-            Ok(_event) => {
+        let last_reload_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+        let last_reload_for_callback = last_reload_at.clone();
+        let mut watcher = notify::recommended_watcher(
+            move |event_result: notify::Result<notify::Event>| match event_result {
+            Ok(event) => {
+                if !should_reload_for_event_kind(&event.kind) {
+                    debug!(
+                        path = %path_for_callback.display(),
+                        event_kind = ?event.kind,
+                        "ignoring non-mutating authorized keys watcher event"
+                    );
+                    return;
+                }
+
+                let now = Instant::now();
+                let should_skip = match last_reload_for_callback.lock() {
+                    Ok(mut guard) => {
+                        if let Some(last) = *guard {
+                            if now.duration_since(last) < Duration::from_millis(200) {
+                                true
+                            } else {
+                                *guard = Some(now);
+                                false
+                            }
+                        } else {
+                            *guard = Some(now);
+                            false
+                        }
+                    }
+                    Err(_) => {
+                        warn!(
+                            path = %path_for_callback.display(),
+                            "authorized keys watcher debounce lock poisoned; proceeding without debounce"
+                        );
+                        false
+                    }
+                };
+
+                if should_skip {
+                    debug!(
+                        path = %path_for_callback.display(),
+                        event_kind = ?event.kind,
+                        "debounced authorized keys watcher event"
+                    );
+                    return;
+                }
+
                 if let Err(err) = store.reload() {
                     error!(path = %path_for_callback.display(), error = %err, "authorized keys reload failed");
                 } else {
@@ -134,16 +181,29 @@ impl AuthorizedKeysWatcher {
             Err(err) => {
                 warn!(path = %path_for_callback.display(), error = %err, "authorized keys watcher event error");
             }
-        })?;
+        },
+        )?;
 
         watcher.watch(&path, RecursiveMode::NonRecursive)?;
         Ok(Self { _watcher: watcher })
     }
 }
 
+fn should_reload_for_event_kind(kind: &EventKind) -> bool {
+    match kind {
+        EventKind::Create(_) | EventKind::Remove(_) => true,
+        EventKind::Modify(ModifyKind::Any)
+        | EventKind::Modify(ModifyKind::Data(_))
+        | EventKind::Modify(ModifyKind::Name(_)) => true,
+        EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{authorize_device_key, AuthorizedKeysStore};
+    use notify::event::{AccessKind, AccessMode, EventKind, ModifyKind};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -229,5 +289,29 @@ public_key = "pub-b"
         assert!(!added_again);
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn watcher_filters_non_mutating_access_events() {
+        assert!(super::should_reload_for_event_kind(&EventKind::Modify(
+            ModifyKind::Data(notify::event::DataChange::Any),
+        )));
+        assert!(super::should_reload_for_event_kind(&EventKind::Create(
+            notify::event::CreateKind::Any,
+        )));
+        assert!(super::should_reload_for_event_kind(&EventKind::Remove(
+            notify::event::RemoveKind::Any,
+        )));
+        assert!(super::should_reload_for_event_kind(&EventKind::Access(
+            AccessKind::Close(AccessMode::Write),
+        )));
+
+        assert!(!super::should_reload_for_event_kind(&EventKind::Access(
+            AccessKind::Close(AccessMode::Read),
+        )));
+        assert!(!super::should_reload_for_event_kind(&EventKind::Access(
+            AccessKind::Open(AccessMode::Read),
+        )));
+        assert!(!super::should_reload_for_event_kind(&EventKind::Any));
     }
 }

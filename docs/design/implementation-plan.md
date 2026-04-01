@@ -252,7 +252,7 @@ Build the server binary on top of `bonded-core`.
 | # | Task | Status | Notes |
 |---|------|--------|-------|
 | 2.1 | Server config loading (env vars + config file) | completed | Server loads TOML via `BONDED_CONFIG`/`--config`, falls back to defaults on read failure, and applies env overrides for bind/public/health/log/protocol/key paths |
-| 2.2 | Authorized keys file — load, watch for changes, reload | completed | Added server authorized key store loading from TOML plus `notify` file watcher that reloads key state on file changes; server startup pre-creates missing state files/directories so operators only need to provide `server.toml` |
+| 2.2 | Authorized keys file — load, watch for changes, reload | completed | Added server authorized key store loading from TOML plus `notify` watcher callbacks; hardened watcher to ignore non-mutating access events and debounce rapid bursts to avoid self-triggered tight reload loops; server startup pre-creates missing state files/directories so operators only need to provide `server.toml` |
 | 2.3 | Accept NaiveTCP connections, perform auth handshake | completed | Added NaiveTCP listener accept loop and line-delimited JSON challenge-signature handshake with authorized-key enforcement |
 | 2.4 | Server-side session management (multiple concurrent clients) | completed | Added concurrent session registry keyed by authenticated client key with unique server session IDs and per-connection frame receive loop lifecycle |
 | 2.5 | IP packet forwarding — read from session, write to internet (TUN or raw socket) | completed | Added initial frame-forwarding path that relays payload bytes to optional upstream TCP target (`BONDED_UPSTREAM_TCP_TARGET`) |
@@ -410,6 +410,7 @@ Decisions made during implementation that aren't in the requirements docs.
 | Server WSS termination uses rustls with PEM certificate/key configuration and optional enablement | 2026-03-31 | Websocket listener remains `ws://` when TLS files are unset and upgrades to `wss://` when both files are provided |
 | WSS integration tests use generated self-signed certificates with explicit client trust roots | 2026-03-31 | Validates authenticated frame exchange over true TLS websocket without relying on external PKI in CI |
 | Server startup pre-creates missing state files (`authorized_keys.toml`, `invite_tokens.toml`) and parent directories | 2026-04-01 | Ensures first boot succeeds with only `/etc/bonded/server.toml` present; keeps state-file defaults under configured paths (including `/var/lib/bonded`) |
+| Authorized-keys watcher reloads only on mutating events and applies short debounce | 2026-04-01 | Prevents notify access/read event feedback loops and duplicate reload bursts when authorized-keys file is rewritten during pairing/auth flows |
 
 ---
 
