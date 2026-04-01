@@ -39,5 +39,8 @@
         8080
     ],
     "postCreateCommand": ".devcontainer/post-create.sh",
+    "remoteEnv": {
+        "HISTFILE": "/commandhistory/.bash_history"
+    },
     "remoteUser": "vscode"
 }

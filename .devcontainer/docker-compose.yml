@@ -5,6 +5,7 @@ services:
       dockerfile: Dockerfile
     volumes:
       - ..:/workspace:cached
+      - ./.history:/commandhistory
     command: sleep infinity
     cap_add:
       - SYS_PTRACE

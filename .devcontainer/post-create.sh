@@ -3,6 +3,19 @@ set -e
 
 echo "=== Bonded devcontainer post-create setup ==="
 
+# Persist shell history into the bind-mounted workspace directory.
+mkdir -p /commandhistory
+touch /commandhistory/.bash_history
+
+if ! grep -q "# Bonded persistent bash history" "$HOME/.bashrc"; then
+    cat <<'EOF' >> "$HOME/.bashrc"
+
+# Bonded persistent bash history
+export HISTFILE=/commandhistory/.bash_history
+export PROMPT_COMMAND="history -a${PROMPT_COMMAND:+;${PROMPT_COMMAND}}"
+EOF
+fi
+
 # Verify Rust
 if command -v rustc &> /dev/null; then
     echo "Rust: $(rustc --version)"
