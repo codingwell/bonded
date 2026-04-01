@@ -7,6 +7,12 @@ echo "=== Bonded devcontainer post-create setup ==="
 mkdir -p /commandhistory
 touch /commandhistory/.bash_history
 
+mkdir -p /home/vscode/.gradle/
+sudo chown -R $(whoami): /home/vscode/.gradle/
+
+mkdir -p /home/vscode/.android/
+sudo chown -R $(whoami): /home/vscode/.android/
+
 if ! grep -q "# Bonded persistent bash history" "$HOME/.bashrc"; then
     cat <<'EOF' >> "$HOME/.bashrc"
 

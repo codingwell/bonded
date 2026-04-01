@@ -6,7 +6,8 @@ services:
     volumes:
       - ..:/workspace:cached
       - ./.history:/commandhistory
-      - gradle-cache:/home/vscode/.gradle
+      - bonded-gradle-cache:/home/vscode/.gradle
+      - bonded-android-cache:/home/vscode/.android
     command: sleep infinity
     cap_add:
       - SYS_PTRACE
@@ -14,4 +15,5 @@ services:
       - seccomp:unconfined
 
 volumes:
-  gradle-cache:
+  bonded-gradle-cache:
+  bonded-android-cache:
