@@ -54,6 +54,8 @@ volumes:
 
 The server is configured via a TOML file (default: `/etc/bonded/server.toml`). The path can be overridden with the `--config` flag or the `BONDED_CONFIG` environment variable. All fields can also be overridden with environment variables.
 
+On startup, the server auto-creates missing state files and parent directories for `authorized_keys_file` and `invite_tokens_file`.
+
 ### Sample `server.toml`
 
 ```toml
