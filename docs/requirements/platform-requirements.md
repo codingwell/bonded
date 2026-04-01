@@ -1,7 +1,7 @@
 # Platform-Specific Requirements — Bonded
 
 **Status:** Draft
-**Last Updated:** 2026-03-30
+**Last Updated:** 2026-04-01
 
 ## Server (Rust + Docker)
 
@@ -22,6 +22,7 @@
 | SRV-13 | Pluggable transport protocol support                  | Must     |
 | SRV-14 | Pluggable path scheduler                              | Must     |
 | SRV-15 | Require configured public address for QR code generation | Must     |
+| SRV-16 | Auto-create missing server state files and parent directories for configured paths (for example `/var/lib/bonded/authorized_keys.toml` and `/var/lib/bonded/invite_tokens.toml`) | Must     |
 
 ## Android Client
 

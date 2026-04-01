@@ -1,7 +1,7 @@
 # Product Requirements — Bonded
 
 **Status:** Draft
-**Last Updated:** 2026-03-30
+**Last Updated:** 2026-04-01
 
 ## Vision
 
@@ -43,6 +43,8 @@ All traffic between client and server MUST be encrypted.
 ### CR-6: Minimal Configuration
 
 The client SHOULD require minimal setup — ideally a single QR code scan or a server address and pairing token.
+
+For server operators, the default first-boot flow SHOULD only require creating `server.toml`; missing state files for authorized keys and invite tokens should be initialized automatically at startup.
 
 ### CR-6a: QR Code Pairing
 
