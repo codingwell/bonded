@@ -28,14 +28,17 @@ RUN mkdir -p ${ANDROID_SDK_ROOT}/cmdline-tools \
     && rm commandlinetools.zip
 
 # Accept Android SDK licenses and install necessary components
-RUN yes | ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager --licenses && \
-    ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager "build-tools;34.0.0" \
-    "cmake;3.22.1" "ndk;26.3.11579264" "platform-tools" "platforms;android-35"
+RUN yes | ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager --licenses
+
+RUN ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager "build-tools;35.0.0"
+RUN ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager "cmake;4.1.1"
+RUN ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager "ndk;28.2.13676358"
+RUN ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager "platform-tools" "platforms;android-36"
 
 # Download and install Flutter
 RUN mkdir -p ${FLUTTER_SDK_ROOT} \
     && wget -O flutter.tar.xz \
-    "https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_3.29.2-stable.tar.xz" \
+    "https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_3.41.6-stable.tar.xz" \
     && tar xf flutter.tar.xz -C ${FLUTTER_SDK_ROOT} --strip-components=1 \
     && rm flutter.tar.xz
 
