@@ -235,6 +235,15 @@ fn start_android_session(
     bind_addresses_json: &str,
     storage_dir: &str,
 ) -> anyhow::Result<()> {
+    eprintln!(
+        "[bonded-ffi] Starting Android session to {}",
+        server_address
+    );
+    eprintln!(
+        "[bonded-ffi] Protocols: {}, Paths: {}, Bind addresses: {}",
+        protocol_csv, path_count, bind_addresses_json
+    );
+
     stop_android_session();
 
     let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
@@ -274,12 +283,17 @@ fn start_android_session(
             .build()
         {
             Ok(runtime) => runtime,
-            Err(_) => return,
+            Err(_) => {
+                eprintln!("[bonded-ffi] Failed to create tokio runtime");
+                return;
+            }
         };
 
         runtime.block_on(async move {
+            eprintln!("[bonded-ffi] Worker thread: establishing transport paths");
             let mut transports = match establish_transport_paths(&config, path_count.max(1)).await {
                 Ok(transports) => {
+                    eprintln!("[bonded-ffi] Transport paths established, count: {}", transports.len());
                     let now_ms = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
@@ -292,6 +306,7 @@ fn start_android_session(
                     transports
                 }
                 Err(err) => {
+                    eprintln!("[bonded-ffi] Failed to establish transport paths: {}", err);
                     update_snapshot(&worker_snapshot, |session_snapshot| {
                         session_snapshot.state = "error".to_owned();
                         session_snapshot.last_error = Some(err.to_string());
@@ -301,6 +316,7 @@ fn start_android_session(
             };
             let mut active_index = 0_usize;
             let mut session = SessionState::new(1);
+            let mut select_cycle = 0u64;
 
             while !worker_stop_flag.load(Ordering::SeqCst) {
                 tokio::select! {
@@ -308,12 +324,15 @@ fn start_android_session(
                         match maybe_packet {
                             Some(packet) => {
                                 if packet.is_empty() && worker_stop_flag.load(Ordering::SeqCst) {
+                                    eprintln!("[bonded-ffi] Stop signal received");
                                     break;
                                 }
 
                                 let packet_len = packet.len() as u64;
+                                eprintln!("[bonded-ffi] Worker: sending {} byte outbound packet via transport index {}", packet_len, active_index);
                                 let frame = session.create_outbound_frame(Bytes::from(packet), 0);
                                 if let Err(err) = transports[active_index].send(frame).await {
+                                    eprintln!("[bonded-ffi] Worker: send on transport {} failed: {}", active_index, err);
                                     if transports.len() == 1 {
                                         update_snapshot(&worker_snapshot, |session_snapshot| {
                                             session_snapshot.state = "error".to_owned();
@@ -326,6 +345,7 @@ fn start_android_session(
                                     if active_index >= transports.len() {
                                         active_index = 0;
                                     }
+                                    eprintln!("[bonded-ffi] Worker: failover to transport index {}", active_index);
                                     continue;
                                 }
                                 update_snapshot(&worker_snapshot, |session_snapshot| {
@@ -333,15 +353,20 @@ fn start_android_session(
                                     session_snapshot.outbound_bytes = session_snapshot.outbound_bytes.saturating_add(packet_len);
                                 });
                             }
-                            None => break,
+                            None => {
+                                eprintln!("[bonded-ffi] Outbound channel closed");
+                                break;
+                            }
                         }
                     }
                     frame_result = transports[active_index].recv() => {
                         match frame_result {
                             Ok(frame) => {
+                                eprintln!("[bonded-ffi] Worker: received frame from transport {}", active_index);
                                 let ready = match session.ingest_inbound(frame) {
                                     Ok(ready) => ready,
                                     Err(err) => {
+                                        eprintln!("[bonded-ffi] Worker: failed to ingest inbound frame: {}", err);
                                         update_snapshot(&worker_snapshot, |session_snapshot| {
                                             session_snapshot.state = "error".to_owned();
                                             session_snapshot.last_error = Some(err.to_string());
@@ -353,6 +378,7 @@ fn start_android_session(
                                 if !ready.is_empty() {
                                     let ready_len = ready.len() as u64;
                                     let total_bytes = ready.iter().map(|f| f.payload.len() as u64).sum::<u64>();
+                                    eprintln!("[bonded-ffi] Worker: ingested {} packets, {} bytes total", ready_len, total_bytes);
                                     let mut queue = worker_inbound_queue
                                         .lock()
                                         .expect("android inbound queue lock poisoned");
@@ -366,6 +392,7 @@ fn start_android_session(
                                 }
                             }
                             Err(err) => {
+                                eprintln!("[bonded-ffi] Worker: recv on transport {} failed: {}", active_index, err);
                                 if transports.len() == 1 {
                                     update_snapshot(&worker_snapshot, |session_snapshot| {
                                         session_snapshot.state = "error".to_owned();
@@ -378,12 +405,19 @@ fn start_android_session(
                                 if active_index >= transports.len() {
                                     active_index = 0;
                                 }
+                                eprintln!("[bonded-ffi] Worker: failover to transport index {}", active_index);
                             }
                         }
                     }
-                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                        select_cycle += 1;
+                        if select_cycle % 200 == 0 {  // Every ~10 seconds
+                            eprintln!("[bonded-ffi] Worker: heartbeat - {} select cycles", select_cycle);
+                        }
+                    }
                 }
             }
+            eprintln!("[bonded-ffi] Worker thread: exiting main loop");
         });
     });
 
@@ -399,6 +433,7 @@ fn start_android_session(
         .lock()
         .expect("android session slot lock poisoned");
     *slot = Some(handle);
+    eprintln!("[bonded-ffi] Android session started successfully");
     Ok(())
 }
 
@@ -425,13 +460,19 @@ fn queue_outbound_packet(packet: Vec<u8>) {
         .expect("android session slot lock poisoned")
         .as_ref()
     {
-        let _ = handle.outbound_tx.send(packet);
+        eprintln!("[bonded-ffi] Queuing {} byte outbound packet", packet.len());
+        let result = handle.outbound_tx.send(packet);
+        if let Err(_) = result {
+            eprintln!("[bonded-ffi] Failed to queue outbound packet: channel closed");
+        }
+    } else {
+        eprintln!("[bonded-ffi] Cannot queue outbound packet: no active session");
     }
 }
 
 #[cfg(any(target_os = "android", test))]
 fn poll_inbound_packet() -> Option<Vec<u8>> {
-    android_session_slot()
+    let result = android_session_slot()
         .lock()
         .expect("android session slot lock poisoned")
         .as_ref()
@@ -441,7 +482,12 @@ fn poll_inbound_packet() -> Option<Vec<u8>> {
                 .lock()
                 .expect("android inbound queue lock poisoned")
                 .pop_front()
-        })
+        });
+
+    if let Some(ref packet) = result {
+        eprintln!("[bonded-ffi] Polled {} byte inbound packet", packet.len());
+    }
+    result
 }
 
 #[cfg(any(target_os = "android", test))]

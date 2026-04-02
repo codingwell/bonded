@@ -85,6 +85,7 @@ class BondedVpnService : VpnService() {
 
         if (vpnInterface == null) {
             try {
+                android.util.Log.d("BondedVPN", "Establishing VPN interface: address=10.8.0.2/32, mtu=1500, route=0.0.0.0/0")
                 vpnInterface = Builder()
                     .setSession("Bonded")
                     .setMtu(1500)
@@ -93,7 +94,9 @@ class BondedVpnService : VpnService() {
                     .addDnsServer("8.8.8.8")
                     .addDnsServer("1.1.1.1")
                     .establish()
+                android.util.Log.d("BondedVPN", "VPN interface established successfully")
             } catch (e: Exception) {
+                android.util.Log.e("BondedVPN", "Failed to establish VPN: ${e.message}", e)
                 emitEvent("error", "Failed to establish VPN: ${e.message}")
                 stopSelf()
                 return START_NOT_STICKY
@@ -195,7 +198,12 @@ class BondedVpnService : VpnService() {
             val output = FileOutputStream(pfd.fileDescriptor)
             val buffer = ByteArray(32767)
             var packetCounter = 0L
+            var outboundCount = 0L
+            var inboundCount = 0L
+            var totalOutboundBytes = 0L
+            var totalInboundBytes = 0L
 
+            android.util.Log.d("BondedVPN", "Packet I/O loop started")
             try {
                 while (packetIoRunning) {
                     val readBytes = input.read(buffer)
@@ -203,27 +211,38 @@ class BondedVpnService : VpnService() {
                         continue
                     }
 
+                    android.util.Log.d("BondedVPN", "Read $readBytes bytes from TUN device")
+                    totalOutboundBytes += readBytes
                     processOutboundPacket(buffer, readBytes)
+                    outboundCount++
+
                     repeat(MAX_POLLED_INBOUND_PER_CYCLE) {
                         val inbound = pollInboundPacket()
                         if (inbound == null || inbound.isEmpty()) {
                             return@repeat
                         }
 
+                        android.util.Log.d("BondedVPN", "Writing ${inbound.size} inbound bytes to TUN device")
+                        totalInboundBytes += inbound.size
                         output.write(inbound)
                         output.flush()
+                        inboundCount++
                     }
 
                     packetCounter += 1
                     if (packetCounter % PACKET_IO_EVENT_EVERY == 0L) {
-                        emitEvent("packet_io", "Processed $packetCounter packets")
+                        val msg = "I/O loop: $outboundCount outbound (${totalOutboundBytes}B), $inboundCount inbound (${totalInboundBytes}B)"
+                        android.util.Log.i("BondedVPN", msg)
+                        emitEvent("packet_io", msg)
                     }
                 }
             } catch (e: Exception) {
+                android.util.Log.e("BondedVPN", "VPN packet loop exception: ${e.message}", e)
                 if (packetIoRunning) {
                     emitEvent("error", "VPN packet loop stopped: ${e.message}")
                 }
             } finally {
+                android.util.Log.d("BondedVPN", "Packet I/O loop stopped. Final: $outboundCount outbound, $inboundCount inbound")
                 try {
                     input.close()
                 } catch (_: Exception) {
@@ -330,11 +349,14 @@ class BondedVpnService : VpnService() {
         }
 
         try {
+            android.util.Log.d("BondedVPN", "Sending $length bytes to native layer (packet type: ${describePacket(packet)})")
             nativeHandleTunOutbound(packet)
         } catch (_: UnsatisfiedLinkError) {
             nativeProcessingAvailable = false
+            android.util.Log.e("BondedVPN", "Native packet symbols unavailable; packets are dropped")
             emitEvent("packet_io", "Native packet symbols unavailable; packets are dropped")
         } catch (e: Exception) {
+            android.util.Log.e("BondedVPN", "Native packet processing failed: ${e.message}", e)
             emitEvent("error", "Native packet processing failed: ${e.message}")
         }
     }
@@ -345,15 +367,38 @@ class BondedVpnService : VpnService() {
         }
 
         return try {
-            nativePollTunInbound()
+            val packet = nativePollTunInbound()
+            if (packet != null && packet.isNotEmpty()) {
+                android.util.Log.d("BondedVPN", "Received ${packet.size} bytes from native layer (packet type: ${describePacket(packet)})")
+            }
+            packet
         } catch (_: UnsatisfiedLinkError) {
             nativeProcessingAvailable = false
+            android.util.Log.e("BondedVPN", "Native inbound polling unavailable")
             emitEvent("packet_io", "Native inbound polling unavailable")
             null
         } catch (e: Exception) {
+            android.util.Log.e("BondedVPN", "Native inbound polling failed: ${e.message}", e)
             emitEvent("error", "Native inbound polling failed: ${e.message}")
             null
         }
+    }
+
+    private fun describePacket(packet: ByteArray): String {
+        if (packet.isEmpty()) return "empty"
+        if (packet.size < 1) return "too-short"
+
+        val version = (packet[0].toInt() shr 4) and 0x0F
+        if (version == 4 && packet.size >= 20) {
+            val protocol = packet[9].toInt() and 0xFF
+            val src = "${packet[12].toInt() and 0xFF}.${packet[13].toInt() and 0xFF}.${packet[14].toInt() and 0xFF}.${packet[15].toInt() and 0xFF}"
+            val dst = "${packet[16].toInt() and 0xFF}.${packet[17].toInt() and 0xFF}.${packet[18].toInt() and 0xFF}.${packet[19].toInt() and 0xFF}"
+            return "IPv4(proto=$protocol,$src->$dst)"
+        } else if (version == 6) {
+            return "IPv6"
+        }
+
+        return "unknown(v=$version)"
     }
 
     private external fun nativeHandleTunOutbound(packet: ByteArray)
