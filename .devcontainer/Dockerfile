@@ -42,14 +42,6 @@ RUN mkdir -p ${FLUTTER_SDK_ROOT} \
     && tar xf flutter.tar.xz -C ${FLUTTER_SDK_ROOT} --strip-components=1 \
     && rm flutter.tar.xz
 
-# TODO: Combine with above when have better internet
-RUN apt-get update \
-    && apt-get -y install --no-install-recommends \
-    ripgrep \
-    && apt-get autoremove -y \
-    && apt-get clean -y \
-    && rm -rf /var/lib/apt/lists/*
-
 # --- Final Stage ---
 FROM --platform=linux/amd64 debian:bookworm-slim AS final
 
@@ -75,6 +67,7 @@ RUN dpkg --add-architecture amd64 \
     openjdk-17-jdk \
     libglu1-mesa \
     libc6:amd64 \
+    ripgrep \
     sudo \
     && apt-get autoremove -y \
     && apt-get clean -y \
