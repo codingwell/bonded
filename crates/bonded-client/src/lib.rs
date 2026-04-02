@@ -13,9 +13,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{lookup_host, TcpSocket, TcpStream};
-use tokio::time::{timeout, Duration};
 #[cfg(target_os = "linux")]
 use tokio::select;
+use tokio::time::{timeout, Duration};
 use tracing::{info, warn};
 #[cfg(target_os = "linux")]
 use tun::Configuration;
@@ -122,14 +122,13 @@ pub async fn establish_transport_paths(
                     .and_then(|result| result)
                     .map(NaiveTcpTransport::from_stream)
                     .map(ClientTransport::NaiveTcp),
-                "wss" | "websocket_tls" => timeout(
-                    PATH_ESTABLISH_TIMEOUT,
-                    establish_websocket_session(config),
-                )
-                .await
-                .map_err(anyhow::Error::from)
-                .and_then(|result| result)
-                .map(ClientTransport::WebSocket),
+                "wss" | "websocket_tls" => {
+                    timeout(PATH_ESTABLISH_TIMEOUT, establish_websocket_session(config))
+                        .await
+                        .map_err(anyhow::Error::from)
+                        .and_then(|result| result)
+                        .map(ClientTransport::WebSocket)
+                }
                 _ => continue,
             };
 

@@ -25,6 +25,9 @@ use std::time::Duration;
 #[cfg(any(target_os = "android", test))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(any(target_os = "android", test))]
+const ANDROID_PATH_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(12);
+
 // ── JVM / VPN-service globals (Android only) ────────────────────────────────
 
 /// The JavaVM singleton stored once in JNI_OnLoad so threads can attach later.
@@ -283,17 +286,31 @@ fn start_android_session(
             .build()
         {
             Ok(runtime) => runtime,
-            Err(_) => {
-                eprintln!("[bonded-ffi] Failed to create tokio runtime");
+            Err(err) => {
+                eprintln!("[bonded-ffi] Failed to create tokio runtime: {}", err);
+                update_snapshot(&worker_snapshot, |session_snapshot| {
+                    session_snapshot.state = "error".to_owned();
+                    session_snapshot.last_error = Some(format!(
+                        "failed to create tokio runtime: {err}"
+                    ));
+                });
                 return;
             }
         };
 
         runtime.block_on(async move {
             eprintln!("[bonded-ffi] Worker thread: establishing transport paths");
-            let mut transports = match establish_transport_paths(&config, path_count.max(1)).await {
-                Ok(transports) => {
-                    eprintln!("[bonded-ffi] Transport paths established, count: {}", transports.len());
+            let mut transports = match tokio::time::timeout(
+                ANDROID_PATH_ESTABLISH_TIMEOUT,
+                establish_transport_paths(&config, path_count.max(1)),
+            )
+            .await
+            {
+                Ok(Ok(transports)) => {
+                    eprintln!(
+                        "[bonded-ffi] Transport paths established, count: {}",
+                        transports.len()
+                    );
                     let now_ms = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
@@ -305,11 +322,23 @@ fn start_android_session(
                     });
                     transports
                 }
-                Err(err) => {
+                Ok(Err(err)) => {
                     eprintln!("[bonded-ffi] Failed to establish transport paths: {}", err);
                     update_snapshot(&worker_snapshot, |session_snapshot| {
                         session_snapshot.state = "error".to_owned();
                         session_snapshot.last_error = Some(err.to_string());
+                    });
+                    return;
+                }
+                Err(_) => {
+                    let message = format!(
+                        "timed out after {}s while establishing transport paths",
+                        ANDROID_PATH_ESTABLISH_TIMEOUT.as_secs()
+                    );
+                    eprintln!("[bonded-ffi] {}", message);
+                    update_snapshot(&worker_snapshot, |session_snapshot| {
+                        session_snapshot.state = "error".to_owned();
+                        session_snapshot.last_error = Some(message.clone());
                     });
                     return;
                 }

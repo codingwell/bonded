@@ -63,8 +63,13 @@ class BondedVpnService : VpnService() {
     private var lastEmittedSessionState: String? = null
     private var lastNetworkBindingSignature: String = ""
 
+    @Volatile
+    private var shutdownInProgress = false
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
+            android.util.Log.i("BondedVPN", "Received ACTION_STOP; shutting down VPN now")
+            shutdownVpnNow()
             stopSelf()
             return START_NOT_STICKY
         }
@@ -148,6 +153,16 @@ class BondedVpnService : VpnService() {
     }
 
     override fun onDestroy() {
+        shutdownVpnNow()
+        super.onDestroy()
+    }
+
+    private fun shutdownVpnNow() {
+        if (shutdownInProgress) {
+            return
+        }
+        shutdownInProgress = true
+
         stopPacketIoLoop()
         stopSessionMonitor()
         networkPathManager?.stop()
@@ -158,7 +173,10 @@ class BondedVpnService : VpnService() {
         sessionRecoveryInProgress = false
         lastRecoveryAttemptMs = 0L
         stopNativeSession()
-        vpnInterface?.close()
+        try {
+            vpnInterface?.close()
+        } catch (_: Exception) {
+        }
         vpnInterface = null
         activeDeviceId = null
         if (backgroundRunning) {
@@ -167,7 +185,8 @@ class BondedVpnService : VpnService() {
         running = false
         backgroundRunning = false
         emitEvent("stopped", "VPN stopped")
-        super.onDestroy()
+
+        shutdownInProgress = false
     }
 
     private fun ensureNotificationChannel() {
@@ -601,7 +620,14 @@ class BondedVpnService : VpnService() {
 
         fun stop(context: Context) {
             val intent = Intent(context, BondedVpnService::class.java).setAction(ACTION_STOP)
-            context.startService(intent)
+            try {
+                context.startService(intent)
+            } catch (_: Exception) {
+            }
+            try {
+                context.stopService(Intent(context, BondedVpnService::class.java))
+            } catch (_: Exception) {
+            }
         }
 
         fun isRunning(): Boolean = running
