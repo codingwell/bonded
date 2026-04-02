@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- Allow cleartext traffic to codingwell.net for testing purposes -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">codingwell.net</domain>
+    </domain-config>
+    <!-- All other domains require HTTPS -->
+    <domain-config cleartextTrafficPermitted="false">
+        <domain includeSubdomains="true">.</domain>
+    </domain-config>
+</network-security-config>

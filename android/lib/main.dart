@@ -5,6 +5,7 @@ import 'screens/pairing_confirm_screen.dart';
 import 'screens/dashboard_screen.dart';
 import 'screens/server_config_screen.dart';
 import 'screens/settings_screen.dart';
+import 'screens/network_tests_screen.dart';
 import 'models/pairing_model.dart';
 
 void main() {
@@ -27,6 +28,7 @@ class BondedApp extends StatelessWidget {
         '/home': (context) => const HomeScreen(),
         '/qr-scanner': (context) => const QRScannerScreen(),
         '/settings': (context) => const SettingsScreen(),
+        '/network-tests': (context) => const NetworkTestsScreen(),
       },
       onGenerateRoute: (settings) {
         if (settings.name == '/pairing-confirm') {

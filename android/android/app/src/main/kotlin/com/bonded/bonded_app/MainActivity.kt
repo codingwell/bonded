@@ -93,6 +93,35 @@ class MainActivity : FlutterActivity() {
 		MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
 			.setMethodCallHandler { call, result ->
 				when (call.method) {
+					"getNetworkTestLogs" -> {
+						result.success(NetworkTestReceiver.getBufferedLogs())
+					}
+
+					"clearNetworkTestLogs" -> {
+						NetworkTestReceiver.clearBufferedLogs()
+						result.success(null)
+					}
+
+					"runNetworkTest" -> {
+						val args = call.arguments as? Map<*, *>
+						val action = args?.get("action") as? String
+						if (action.isNullOrBlank()) {
+							result.error("invalid_args", "action is required", null)
+						} else {
+							try {
+								val intent = Intent(action).setClass(this, NetworkTestReceiver::class.java)
+								(args["host"] as? String)?.let { intent.putExtra("host", it) }
+								(args["expected_ip"] as? String)?.let { intent.putExtra("expected_ip", it) }
+								(args["url"] as? String)?.let { intent.putExtra("url", it) }
+								(args["port"] as? Int)?.let { intent.putExtra("port", it) }
+								sendBroadcast(intent)
+								result.success("sent")
+							} catch (e: Exception) {
+								result.error("broadcast_failed", e.message, null)
+							}
+						}
+					}
+
 					"getNativeApiVersion" -> {
 						if (!nativeLoaded) {
 							result.success(-1)

@@ -9,6 +9,7 @@ import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.VpnService
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import androidx.core.app.NotificationCompat
@@ -99,6 +100,26 @@ class BondedVpnService : VpnService() {
             return START_NOT_STICKY
         }
 
+        backgroundRunning = runInBackground
+        if (backgroundRunning) {
+            ensureNotificationChannel()
+            val notification = buildForegroundNotification()
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    startForeground(
+                        NOTIFICATION_ID,
+                        notification,
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+                    )
+                } else {
+                    startForeground(NOTIFICATION_ID, notification)
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("BondedVPN", "startForeground failed: ${e.message}", e)
+                emitEvent("error", "Foreground startup warning: ${e.message}")
+            }
+        }
+
         // Pre-resolve the server hostname to an IP address while DNS is still unaffected
         // by the VPN. Once VPN is active, all DNS queries route through the TUN interface
         // which creates a bootstrapping deadlock (VPN not connected → can't forward DNS →
@@ -113,15 +134,34 @@ class BondedVpnService : VpnService() {
         if (vpnInterface == null) {
             try {
                 android.util.Log.d("BondedVPN", "Establishing VPN interface: address=10.8.0.2/32, mtu=1500, route=0.0.0.0/0")
-                vpnInterface = Builder()
+                val builder = Builder()
                     .setSession("Bonded")
                     .setMtu(1500)
                     .addAddress("10.8.0.2", 32)
                     .addRoute("0.0.0.0", 0)
                     .addDnsServer("8.8.8.8")
                     .addDnsServer("1.1.1.1")
-                    .establish()
+
+                // Keep the app process itself outside the VPN so control-plane sockets
+                // (session establishment, pairing, health probes) are never captured.
+                // This makes startup resilient even when per-socket protect(fd) fails.
+                try {
+                    builder.addDisallowedApplication(packageName)
+                    android.util.Log.i("BondedVPN", "Added disallowed application for VPN bypass: $packageName")
+                } catch (e: PackageManager.NameNotFoundException) {
+                    android.util.Log.w("BondedVPN", "Failed to add disallowed application $packageName: ${e.message}")
+                }
+
+                vpnInterface = builder.establish()
+                if (vpnInterface == null) {
+                    throw IllegalStateException(
+                        "VpnService.Builder.establish() returned null (VPN permission missing or revoked)",
+                    )
+                }
                 android.util.Log.d("BondedVPN", "VPN interface established successfully")
+                // Mark service running as soon as TUN exists so status checks reflect
+                // VPN establishment even if later session/foreground steps degrade.
+                running = vpnInterface != null
             } catch (e: Exception) {
                 android.util.Log.e("BondedVPN", "Failed to establish VPN: ${e.message}", e)
                 emitEvent("error", "Failed to establish VPN: ${e.message}")
@@ -138,23 +178,7 @@ class BondedVpnService : VpnService() {
         }
         sessionStartupInProgress = false
 
-        backgroundRunning = runInBackground
-
-        if (backgroundRunning) {
-            ensureNotificationChannel()
-            val notification = buildForegroundNotification()
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                startForeground(
-                    NOTIFICATION_ID,
-                    notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
-                )
-            } else {
-                startForeground(NOTIFICATION_ID, notification)
-            }
-        }
-
-        running = vpnInterface != null
+        running = running || (vpnInterface != null)
         startPacketIoLoopIfNeeded()
         startSessionMonitorIfNeeded()
         emitEvent(

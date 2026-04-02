@@ -116,6 +116,13 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             ),
           IconButton(
+            icon: const Icon(Icons.science),
+            tooltip: 'Network Tests',
+            onPressed: () {
+              Navigator.of(context).pushNamed('/network-tests');
+            },
+          ),
+          IconButton(
             icon: const Icon(Icons.refresh),
             tooltip: 'Refresh',
             onPressed: () {
@@ -246,22 +253,21 @@ class _HomeScreenState extends State<HomeScreen> {
                 },
               ),
             PopupMenuButton(
-              itemBuilder:
-                  (context) => [
-                    PopupMenuItem(
-                      onTap: () {
-                        Navigator.of(context).pushNamed(
-                          '/dashboard',
-                          arguments: {'deviceId': server['id'] ?? ''},
-                        );
-                      },
-                      child: const Text('Open dashboard'),
-                    ),
-                    PopupMenuItem(
-                      onTap: () => _openServerConfig(server),
-                      child: const Text('Configure'),
-                    ),
-                  ],
+              itemBuilder: (context) => [
+                PopupMenuItem(
+                  onTap: () {
+                    Navigator.of(context).pushNamed(
+                      '/dashboard',
+                      arguments: {'deviceId': server['id'] ?? ''},
+                    );
+                  },
+                  child: const Text('Open dashboard'),
+                ),
+                PopupMenuItem(
+                  onTap: () => _openServerConfig(server),
+                  child: const Text('Configure'),
+                ),
+              ],
             ),
           ],
         ),
