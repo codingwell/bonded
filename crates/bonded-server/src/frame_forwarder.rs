@@ -199,7 +199,11 @@ fn udp_checksum_ipv4(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, udp_segment: &[u8]) -> 
     }
 
     let checksum = checksum_ones_complement(&pseudo);
-    if checksum == 0 { 0xffff } else { checksum }
+    if checksum == 0 {
+        0xffff
+    } else {
+        checksum
+    }
 }
 
 #[cfg(test)]
