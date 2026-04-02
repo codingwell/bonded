@@ -1,7 +1,7 @@
 # Implementation Plan — Server, Linux Client, Android Client
 
 **Status:** In Progress
-**Last Updated:** 2026-04-02 (session 6)
+**Last Updated:** 2026-04-02 (session 8)
 
 This is a living document. Update the status column and notes as work progresses.
 
@@ -419,6 +419,8 @@ Decisions made during implementation that aren't in the requirements docs.
 | Authorized-keys watcher reloads only on mutating events and applies short debounce | 2026-04-01 | Prevents notify access/read event feedback loops and duplicate reload bursts when authorized-keys file is rewritten during pairing/auth flows |
 | Server frame forwarder now performs user-space IPv4+UDP relay and response packet synthesis before fallback behavior | 2026-04-02 | Enables DNS/UDP tunnel round-trip without kernel NAT as first incremental gateway slice; TCP user-space flow tracking remains future work |
 | Client multipath establishment now requires path 0 success but treats later-path failures as degradable warnings | 2026-04-02 | Prevents Android VPN session startup from collapsing when Wi-Fi+cellular dual-path setup partially fails; preserves failover architecture while prioritizing a working single-path tunnel |
+| Android session startup diagnostics now preserve first transport-establish error and avoid clobbering it with downstream queue-closed noise | 2026-04-02 | `establish_transport_paths` now reports underlying timeout/connect/protect failures, Android socket protect failures are fatal, and FFI queue-closed updates keep prior `lastError` when already set |
+| NaiveTCP client path establishment now always binds the socket to an ephemeral local wildcard address before VPN protect/connect | 2026-04-02 | Makes both explicit-bind and default paths follow bind -> protect -> connect ordering, aligning Android VPN socket-handling expectations and simplifying behavior across paths |
 
 ---
 
@@ -432,6 +434,7 @@ Decisions made during implementation that aren't in the requirements docs.
 | VPN-connected-but-no-traffic: two root causes — (A) no DNS in VPN builder, (B) routing-loop deadlock when Rust session TCP sockets were captured by the VPN TUN before transport paths could be established | **resolved** | (A) fixed by adding `addDnsServer()` calls; (B) fixed by calling `VpnService.protect(fd)` from Rust via stored JVM/GlobalRef before each `socket.connect()`. |
 | Server internet egress was previously payload-echo/TCP-relay oriented and could not return real DNS/UDP tunnel traffic | **resolved** | Implemented user-space IPv4+UDP relay in `frame_forwarder` with checksum-correct packet synthesis for return traffic; validated with new unit test `forwarder_relays_ipv4_udp_payload_and_builds_response_packet` and full `bonded-server` test suite. |
 | Flutter update remains blocked in this dev container due outbound network restrictions (`storage.googleapis.com` and `pub.dev`/`pub.flutter-io.cn` are not reachable) | **open** | `flutter upgrade --force` fails downloading Dart SDK; manual SDK restore attempt hit flutter-tool dependency refresh limits because hosted pub packages for newer toolchain metadata cannot be fetched from this environment. |
+| Android VPN runtime still intermittently loops in `connecting` with zero session counters on device despite active TUN reads | **open** | Latest fixes preserve root-cause errors (`establish_transport_paths` detail + socket-protect failure surfacing + queue failure propagation). Next validation run should capture actionable `lastError` instead of generic channel-closed noise. |
 
 ---
 

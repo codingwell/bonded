@@ -9,7 +9,7 @@ use pnet_datalink::NetworkInterface;
 use serde::Deserialize;
 use serde_json::json;
 use std::fs;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{lookup_host, TcpSocket, TcpStream};
@@ -99,17 +99,30 @@ pub async fn establish_transport_paths(
     let target = count.max(1);
     let mut paths = Vec::with_capacity(target);
     for path_index in 0..target {
+        let mut last_err: Option<anyhow::Error> = None;
+
         if let Some(bind_address) = config.client.path_bind_addresses.get(path_index) {
-            if let Ok(Ok(stream)) = timeout(
+            match timeout(
                 PATH_ESTABLISH_TIMEOUT,
                 establish_naive_tcp_session_with_bind(config, bind_address),
             )
             .await
             {
-                paths.push(ClientTransport::NaiveTcp(NaiveTcpTransport::from_stream(
-                    stream,
-                )));
-                continue;
+                Ok(Ok(stream)) => {
+                    paths.push(ClientTransport::NaiveTcp(NaiveTcpTransport::from_stream(
+                        stream,
+                    )));
+                    continue;
+                }
+                Ok(Err(err)) => {
+                    last_err = Some(err);
+                }
+                Err(_) => {
+                    last_err = Some(anyhow::anyhow!(
+                        "timed out after {}s while establishing bind-aware NaiveTCP session",
+                        PATH_ESTABLISH_TIMEOUT.as_secs()
+                    ));
+                }
             }
         }
 
@@ -132,21 +145,32 @@ pub async fn establish_transport_paths(
                 _ => continue,
             };
 
-            if let Ok(path) = attempt {
-                connected = Some(path);
-                break;
+            match attempt {
+                Ok(path) => {
+                    connected = Some(path);
+                    break;
+                }
+                Err(err) => {
+                    last_err = Some(err);
+                }
             }
         }
 
         let Some(path) = connected else {
+            let reason = last_err
+                .map(|err| err.to_string())
+                .unwrap_or_else(|| "no matching protocols configured".to_owned());
             if path_index == 0 {
-                anyhow::bail!("failed to establish path {path_index} with configured protocols");
+                anyhow::bail!(
+                    "failed to establish path {path_index} with configured protocols: {reason}"
+                );
             }
 
             warn!(
                 path_index,
                 requested_paths = target,
                 established_paths = paths.len(),
+                reason = %reason,
                 "failed to establish additional path; continuing with available paths"
             );
             break;
@@ -198,10 +222,13 @@ pub async fn establish_naive_tcp_session(config: &ClientConfig) -> anyhow::Resul
         SocketAddr::V4(_) => TcpSocket::new_v4()?,
         SocketAddr::V6(_) => TcpSocket::new_v6()?,
     };
+    socket.bind(local_wildcard_bind_addr_for(server_addr))?;
     #[cfg(unix)]
     if let Some(protect) = &config.socket_protect {
         use std::os::unix::io::AsRawFd;
-        protect.0(socket.as_raw_fd());
+        if !protect.0(socket.as_raw_fd()) {
+            anyhow::bail!("failed to protect NaiveTCP socket from VPN capture");
+        }
     }
     let stream = socket.connect(server_addr).await?;
     authenticate_naive_tcp_stream(config, stream).await
@@ -226,7 +253,9 @@ pub async fn establish_naive_tcp_session_with_bind(
     #[cfg(unix)]
     if let Some(protect) = &config.socket_protect {
         use std::os::unix::io::AsRawFd;
-        protect.0(socket.as_raw_fd());
+        if !protect.0(socket.as_raw_fd()) {
+            anyhow::bail!("failed to protect bind-aware NaiveTCP socket from VPN capture");
+        }
     }
     let stream = socket.connect(server_address).await?;
     authenticate_naive_tcp_stream(config, stream).await
@@ -296,6 +325,13 @@ fn parse_bind_ip(bind_address: &str) -> anyhow::Result<IpAddr> {
     }
 
     anyhow::bail!("invalid bind address {bind_address}")
+}
+
+fn local_wildcard_bind_addr_for(remote: SocketAddr) -> SocketAddr {
+    match remote {
+        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+    }
 }
 
 async fn resolve_server_address(

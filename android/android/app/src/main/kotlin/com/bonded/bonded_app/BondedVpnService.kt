@@ -429,7 +429,12 @@ class BondedVpnService : VpnService() {
 
         try {
             android.util.Log.d("BondedVPN", "Sending $length bytes to native layer (packet type: ${describePacket(packet)})")
-            nativeHandleTunOutbound(packet)
+            val queued = nativeHandleTunOutbound(packet)
+            if (!queued) {
+                val message = "Native packet queue rejected outbound packet"
+                android.util.Log.w("BondedVPN", "$message (packet type: ${describePacket(packet)})")
+                emitEvent("error", message)
+            }
         } catch (_: UnsatisfiedLinkError) {
             nativeProcessingAvailable = false
             android.util.Log.e("BondedVPN", "Native packet symbols unavailable; packets are dropped")
@@ -480,7 +485,7 @@ class BondedVpnService : VpnService() {
         return "unknown(v=$version)"
     }
 
-    private external fun nativeHandleTunOutbound(packet: ByteArray)
+    private external fun nativeHandleTunOutbound(packet: ByteArray): Boolean
 
     private external fun nativePollTunInbound(): ByteArray?
 

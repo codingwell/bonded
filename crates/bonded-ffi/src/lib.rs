@@ -2,7 +2,7 @@
 use bonded_client::{establish_naive_tcp_session, establish_transport_paths};
 #[cfg(any(target_os = "android", test))]
 use bonded_core::config::ClientConfig;
-#[cfg(any(target_os = "android", test))]
+#[cfg(target_os = "android")]
 use bonded_core::config::SocketProtectFn;
 use bonded_core::session::SessionFrame;
 #[cfg(any(target_os = "android", test))]
@@ -290,9 +290,8 @@ fn start_android_session(
                 eprintln!("[bonded-ffi] Failed to create tokio runtime: {}", err);
                 update_snapshot(&worker_snapshot, |session_snapshot| {
                     session_snapshot.state = "error".to_owned();
-                    session_snapshot.last_error = Some(format!(
-                        "failed to create tokio runtime: {err}"
-                    ));
+                    session_snapshot.last_error =
+                        Some(format!("failed to create tokio runtime: {err}"));
                 });
                 return;
             }
@@ -483,7 +482,7 @@ fn get_session_snapshot_json() -> Option<String> {
 }
 
 #[cfg(any(target_os = "android", test))]
-fn queue_outbound_packet(packet: Vec<u8>) {
+fn queue_outbound_packet(packet: Vec<u8>) -> bool {
     if let Some(handle) = android_session_slot()
         .lock()
         .expect("android session slot lock poisoned")
@@ -497,12 +496,18 @@ fn queue_outbound_packet(packet: Vec<u8>) {
             eprintln!("[bonded-ffi] {}", message);
             update_snapshot(&handle.snapshot, |session_snapshot| {
                 session_snapshot.state = "error".to_owned();
-                session_snapshot.last_error = Some(message.to_owned());
+                if session_snapshot.last_error.is_none() {
+                    session_snapshot.last_error = Some(message.to_owned());
+                }
             });
+            return false;
         }
-    } else {
-        eprintln!("[bonded-ffi] Cannot queue outbound packet: no active session");
+
+        return true;
     }
+
+    eprintln!("[bonded-ffi] Cannot queue outbound packet: no active session");
+    false
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -670,10 +675,12 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeHandle
     env: jni::JNIEnv,
     _obj: jni::objects::JObject,
     packet: jni::objects::JByteArray,
-) {
+) -> jni::sys::jboolean {
     if let Ok(packet) = env.convert_byte_array(&packet) {
-        queue_outbound_packet(packet);
+        return if queue_outbound_packet(packet) { 1 } else { 0 };
     }
+
+    0
 }
 
 #[cfg(target_os = "android")]
