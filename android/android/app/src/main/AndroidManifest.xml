@@ -60,6 +60,18 @@
                 <action android:name="com.bonded.bonded_app.VPN_STOP"/>
             </intent-filter>
         </receiver>
+
+        <receiver
+            android:name=".NetworkTestReceiver"
+            android:exported="true"
+            android:enabled="true">
+            <intent-filter>
+                <action android:name="com.bonded.bonded_app.TEST_DNS"/>
+                <action android:name="com.bonded.bonded_app.TEST_TCP"/>
+                <action android:name="com.bonded.bonded_app.TEST_HTTP"/>
+                <action android:name="com.bonded.bonded_app.TEST_ALL"/>
+            </intent-filter>
+        </receiver>
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and
