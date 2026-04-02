@@ -15,7 +15,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{lookup_host, TcpSocket, TcpStream};
 #[cfg(target_os = "linux")]
 use tokio::select;
-use tracing::info;
+use tracing::{info, warn};
 #[cfg(target_os = "linux")]
 use tun::Configuration;
 
@@ -127,7 +127,17 @@ pub async fn establish_transport_paths(
         }
 
         let Some(path) = connected else {
-            anyhow::bail!("failed to establish path {path_index} with configured protocols");
+            if path_index == 0 {
+                anyhow::bail!("failed to establish path {path_index} with configured protocols");
+            }
+
+            warn!(
+                path_index,
+                requested_paths = target,
+                established_paths = paths.len(),
+                "failed to establish additional path; continuing with available paths"
+            );
+            break;
         };
         paths.push(path);
     }
