@@ -14,6 +14,8 @@ import android.os.ParcelFileDescriptor
 import androidx.core.app.NotificationCompat
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.net.Inet4Address
+import java.net.InetAddress
 import java.util.ArrayDeque
 import org.json.JSONArray
 import org.json.JSONObject
@@ -66,6 +68,9 @@ class BondedVpnService : VpnService() {
 
     private var lastEmittedSessionState: String? = null
     private var lastNetworkBindingSignature: String = ""
+    // Server address with hostname pre-resolved to IP before VPN captures DNS traffic.
+    // Cached across recovery attempts so native code never needs in-tunnel DNS resolution.
+    private var cachedServerAddress: String? = null
 
     @Volatile
     private var shutdownInProgress = false
@@ -93,6 +98,13 @@ class BondedVpnService : VpnService() {
             stopSelf()
             return START_NOT_STICKY
         }
+
+        // Pre-resolve the server hostname to an IP address while DNS is still unaffected
+        // by the VPN. Once VPN is active, all DNS queries route through the TUN interface
+        // which creates a bootstrapping deadlock (VPN not connected → can't forward DNS →
+        // can't connect to VPN server). Caching the resolved IP here breaks that cycle.
+        cachedServerAddress = resolveServerAddressEarly(pairedServer.publicAddress)
+        android.util.Log.i("BondedVPN", "Cached server address: $cachedServerAddress")
 
         sessionStartupInProgress = true
         val pathManager = ensureNetworkPathManager()
@@ -179,6 +191,7 @@ class BondedVpnService : VpnService() {
         synchronized(pendingOutboundLock) {
             pendingOutboundPackets.clear()
         }
+        cachedServerAddress = null
         stopNativeSession()
         try {
             vpnInterface?.close()
@@ -366,22 +379,25 @@ class BondedVpnService : VpnService() {
         setSessionSnapshot(snapshot)
         val state = snapshot?.state ?: return
 
-        if (state == lastEmittedSessionState) {
-            return
+        // Emit state-change events only on transitions to avoid spam.
+        if (state != lastEmittedSessionState) {
+            lastEmittedSessionState = state
+            when (state) {
+                "connected" -> {
+                    sessionRecoveryInProgress = false
+                    emitEvent("session_status", "Session connected")
+                }
+                "connecting" -> emitEvent("session_status", "Connecting to server")
+                "error" -> emitEvent("error", snapshot.lastError ?: "Native session error")
+                "stopped" -> emitEvent("session_status", "Session stopped")
+            }
         }
 
-        lastEmittedSessionState = state
-        when (state) {
-            "connected" -> {
-                sessionRecoveryInProgress = false
-                emitEvent("session_status", "Session connected")
-            }
-            "connecting" -> emitEvent("session_status", "Connecting to server")
-            "error" -> {
-                emitEvent("error", snapshot.lastError ?: "Native session error")
-                attemptSessionRecovery(snapshot.lastError)
-            }
-            "stopped" -> emitEvent("session_status", "Session stopped")
+        // Attempt recovery every poll cycle while in error, not just on first transition.
+        // Without this, a fast-failing recovery (state stays at "error") silently stops
+        // retrying because the subsequent identical state is ignored by the transition check.
+        if (state == "error") {
+            attemptSessionRecovery(snapshot.lastError)
         }
     }
 
@@ -511,20 +527,47 @@ class BondedVpnService : VpnService() {
 
     private external fun nativeStopSession()
 
+    // Resolve a "host:port" address to "ip:port" using system DNS, before the VPN is
+    // active. Returns the original string unchanged on any error or if already an IP.
+    private fun resolveServerAddressEarly(rawAddress: String): String {
+        val lastColon = rawAddress.lastIndexOf(':')
+        if (lastColon < 0) return rawAddress
+        val host = rawAddress.substring(0, lastColon)
+        val port = rawAddress.substring(lastColon + 1)
+        // Already an IPv4 literal — no resolution needed.
+        if (host.matches(Regex("^\\d{1,3}(\\.\\d{1,3}){3}$"))) return rawAddress
+        // IPv6 literal in brackets (e.g. "[::1]") — no resolution needed.
+        if (host.startsWith('[')) return rawAddress
+        return try {
+            val addresses = InetAddress.getAllByName(host)
+            val resolved = addresses.filterIsInstance<Inet4Address>().firstOrNull()
+                ?: addresses.firstOrNull()
+            resolved?.hostAddress?.let { ip -> "$ip:$port" }?.also { resolved ->
+                android.util.Log.i("BondedVPN", "Pre-resolved $host -> $resolved (port $port)")
+            } ?: rawAddress
+        } catch (e: Exception) {
+            android.util.Log.w("BondedVPN", "Pre-resolution failed for $host: ${e.message}")
+            rawAddress
+        }
+    }
+
     private fun startNativeSession(
         server: PairedServerRecord,
         pathCount: Int,
         bindAddresses: List<String>,
     ): Boolean {
         return try {
+            // Use the pre-resolved IP address if available so native code never needs to
+            // perform DNS resolution inside an active VPN (which would route through TUN).
+            val serverAddr = cachedServerAddress ?: server.publicAddress
             val protocolCsv = server.supportedProtocols.joinToString(",")
             val bindAddressesJson = JSONArray(bindAddresses).toString()
             android.util.Log.i(
                 "BondedVPN",
-                "Starting native session: server=${server.publicAddress}, protocols=$protocolCsv, pathCount=$pathCount, bindAddresses=$bindAddressesJson",
+                "Starting native session: server=$serverAddr (original: ${server.publicAddress}), protocols=$protocolCsv, pathCount=$pathCount, bindAddresses=$bindAddressesJson",
             )
             val started = nativeStartSession(
-                server.publicAddress,
+                serverAddr,
                 protocolCsv,
                 pathCount,
                 bindAddressesJson,

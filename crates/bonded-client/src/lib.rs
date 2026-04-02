@@ -365,9 +365,7 @@ async fn perform_auth_handshake(
         "public_key_b64": keypair.public_key_b64,
         "invite_token": invite_token,
     });
-    stream
-        .write_all(format!("{}\n", hello).as_bytes())
-        .await?;
+    stream.write_all(format!("{}\n", hello).as_bytes()).await?;
 
     let challenge_line = read_line_from_stream(&mut stream).await?;
 
@@ -377,9 +375,7 @@ async fn perform_auth_handshake(
     let proof = json!({
         "signature_b64": signature_b64,
     });
-    stream
-        .write_all(format!("{}\n", proof).as_bytes())
-        .await?;
+    stream.write_all(format!("{}\n", proof).as_bytes()).await?;
 
     let result_line = read_line_from_stream(&mut stream).await?;
 
