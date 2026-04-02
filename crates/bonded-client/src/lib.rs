@@ -11,7 +11,7 @@ use serde_json::json;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{lookup_host, TcpSocket, TcpStream};
 #[cfg(target_os = "linux")]
 use tokio::select;
@@ -357,26 +357,19 @@ async fn resolve_server_address(
 }
 
 async fn perform_auth_handshake(
-    stream: TcpStream,
+    mut stream: TcpStream,
     keypair: &DeviceKeypair,
     invite_token: &str,
 ) -> anyhow::Result<TcpStream> {
-    let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
-
     let hello = json!({
         "public_key_b64": keypair.public_key_b64,
         "invite_token": invite_token,
     });
-    write_half
+    stream
         .write_all(format!("{}\n", hello).as_bytes())
         .await?;
 
-    let mut challenge_line = String::new();
-    let read = reader.read_line(&mut challenge_line).await?;
-    if read == 0 {
-        anyhow::bail!("server closed connection before sending challenge");
-    }
+    let challenge_line = read_line_from_stream(&mut stream).await?;
 
     let challenge: ServerChallenge = serde_json::from_str(challenge_line.trim_end())?;
     let signature_b64 = sign_auth_challenge(keypair, &challenge.challenge_b64)?;
@@ -384,15 +377,11 @@ async fn perform_auth_handshake(
     let proof = json!({
         "signature_b64": signature_b64,
     });
-    write_half
+    stream
         .write_all(format!("{}\n", proof).as_bytes())
         .await?;
 
-    let mut result_line = String::new();
-    let read = reader.read_line(&mut result_line).await?;
-    if read == 0 {
-        anyhow::bail!("server closed connection before auth result");
-    }
+    let result_line = read_line_from_stream(&mut stream).await?;
 
     let result: ServerAuthResult = serde_json::from_str(result_line.trim_end())?;
     if result.status != "ok" {
@@ -402,11 +391,28 @@ async fn perform_auth_handshake(
         );
     }
 
-    let read_half = reader.into_inner();
-    let stream = read_half
-        .reunite(write_half)
-        .map_err(|_| anyhow::anyhow!("failed to reunite client stream after handshake"))?;
     Ok(stream)
+}
+
+async fn read_line_from_stream(stream: &mut TcpStream) -> anyhow::Result<String> {
+    const MAX_AUTH_LINE_BYTES: usize = 16 * 1024;
+    let mut buf = Vec::with_capacity(256);
+    loop {
+        let byte = match stream.read_u8().await {
+            Ok(value) => value,
+            Err(err) if buf.is_empty() && err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                anyhow::bail!("server closed connection during auth handshake")
+            }
+            Err(err) => return Err(err.into()),
+        };
+        buf.push(byte);
+        if byte == b'\n' {
+            return Ok(String::from_utf8(buf)?);
+        }
+        if buf.len() >= MAX_AUTH_LINE_BYTES {
+            anyhow::bail!("auth handshake line exceeded {MAX_AUTH_LINE_BYTES} bytes");
+        }
+    }
 }
 
 async fn perform_websocket_auth_handshake(

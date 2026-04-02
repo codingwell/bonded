@@ -11,6 +11,8 @@ use tokio_tungstenite::{
 
 use crate::session::SessionFrame;
 
+const MIN_SESSION_FRAME_LEN: usize = 16;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportKind {
     NaiveTcp,
@@ -135,6 +137,12 @@ impl Transport for NaiveTcpTransport {
         let mut len_buf = [0_u8; 4];
         self.stream.read_exact(&mut len_buf).await?;
         let len = u32::from_be_bytes(len_buf) as usize;
+
+        if len < MIN_SESSION_FRAME_LEN {
+            anyhow::bail!(
+                "invalid session frame length prefix: {len} bytes (minimum {MIN_SESSION_FRAME_LEN})"
+            );
+        }
 
         let mut payload = vec![0_u8; len];
         self.stream.read_exact(&mut payload).await?;

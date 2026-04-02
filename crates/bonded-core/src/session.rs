@@ -19,8 +19,8 @@ pub struct SessionFrame {
 
 #[derive(Debug, Error)]
 pub enum FrameError {
-    #[error("buffer too small for frame header")]
-    BufferTooSmall,
+    #[error("buffer too small for frame header: got {found} bytes, need at least {minimum}")]
+    BufferTooSmall { found: usize, minimum: usize },
 }
 
 #[derive(Debug, Error)]
@@ -118,7 +118,10 @@ impl SessionFrame {
 
     pub fn decode(raw: &[u8]) -> Result<Self, FrameError> {
         if raw.len() < HEADER_LEN {
-            return Err(FrameError::BufferTooSmall);
+            return Err(FrameError::BufferTooSmall {
+                found: raw.len(),
+                minimum: HEADER_LEN,
+            });
         }
         let mut raw = raw;
         let connection_id = raw.get_u32();

@@ -70,16 +70,21 @@ fn protect_fd(fd: i32) -> bool {
         },
         Err(_) => return false,
     };
-    guard
-        .call_method(
-            &service,
-            "protect",
-            "(I)Z",
-            &[jni::objects::JValue::Int(fd)],
-        )
+    let call_args = [jni::objects::JValue::Int(fd)];
+    let result = guard
+        .call_method(&service, "protectSocketForNative", "(I)Z", &call_args)
         .ok()
         .and_then(|v| v.z().ok())
-        .unwrap_or(false)
+        .or_else(|| {
+            // Fallback for older app binaries that don't expose the wrapper method yet.
+            guard
+                .call_method(&service, "protect", "(I)Z", &call_args)
+                .ok()
+                .and_then(|v| v.z().ok())
+        })
+        .unwrap_or(false);
+    eprintln!("[bonded-ffi] protect_fd(fd={fd}) -> {result}");
+    result
 }
 
 #[cfg(any(target_os = "android", test))]

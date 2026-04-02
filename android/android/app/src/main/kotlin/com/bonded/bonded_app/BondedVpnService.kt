@@ -14,6 +14,7 @@ import android.os.ParcelFileDescriptor
 import androidx.core.app.NotificationCompat
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.util.ArrayDeque
 import org.json.JSONArray
 import org.json.JSONObject
 import kotlin.concurrent.thread
@@ -59,6 +60,9 @@ class BondedVpnService : VpnService() {
 
     @Volatile
     private var lastRecoveryAttemptMs = 0L
+
+    private val pendingOutboundLock = Any()
+    private val pendingOutboundPackets = ArrayDeque<ByteArray>()
 
     private var lastEmittedSessionState: String? = null
     private var lastNetworkBindingSignature: String = ""
@@ -172,6 +176,9 @@ class BondedVpnService : VpnService() {
         networkRebindInProgress = false
         sessionRecoveryInProgress = false
         lastRecoveryAttemptMs = 0L
+        synchronized(pendingOutboundLock) {
+            pendingOutboundPackets.clear()
+        }
         stopNativeSession()
         try {
             vpnInterface?.close()
@@ -428,12 +435,15 @@ class BondedVpnService : VpnService() {
         }
 
         try {
+            flushPendingOutboundPackets(MAX_PENDING_FLUSH_PER_CYCLE)
             android.util.Log.d("BondedVPN", "Sending $length bytes to native layer (packet type: ${describePacket(packet)})")
-            val queued = nativeHandleTunOutbound(packet)
+            val queued = tryQueueOutboundPacket(packet)
             if (!queued) {
-                val message = "Native packet queue rejected outbound packet"
-                android.util.Log.w("BondedVPN", "$message (packet type: ${describePacket(packet)})")
-                emitEvent("error", message)
+                enqueuePendingOutboundPacket(packet)
+                android.util.Log.w(
+                    "BondedVPN",
+                    "Native queue unavailable; buffered outbound packet (packet type: ${describePacket(packet)}, pending=${pendingOutboundSize()})",
+                )
             }
         } catch (_: UnsatisfiedLinkError) {
             nativeProcessingAvailable = false
@@ -523,10 +533,52 @@ class BondedVpnService : VpnService() {
             android.util.Log.i("BondedVPN", "nativeStartSession returned: $started")
             if (started) {
                 lastNetworkBindingSignature = bindAddressesJson
+                flushPendingOutboundPackets(MAX_PENDING_FLUSH_ON_SESSION_START)
             }
             started
         } catch (_: UnsatisfiedLinkError) {
             false
+        }
+    }
+
+    private fun tryQueueOutboundPacket(packet: ByteArray): Boolean {
+        return nativeHandleTunOutbound(packet)
+    }
+
+    private fun enqueuePendingOutboundPacket(packet: ByteArray) {
+        synchronized(pendingOutboundLock) {
+            if (pendingOutboundPackets.size >= MAX_PENDING_OUTBOUND_PACKETS) {
+                pendingOutboundPackets.removeFirst()
+            }
+            pendingOutboundPackets.addLast(packet)
+        }
+    }
+
+    private fun pendingOutboundSize(): Int {
+        synchronized(pendingOutboundLock) {
+            return pendingOutboundPackets.size
+        }
+    }
+
+    private fun flushPendingOutboundPackets(maxPackets: Int) {
+        var flushed = 0
+        while (flushed < maxPackets) {
+            val next = synchronized(pendingOutboundLock) {
+                if (pendingOutboundPackets.isEmpty()) {
+                    null
+                } else {
+                    pendingOutboundPackets.removeFirst()
+                }
+            } ?: return
+
+            if (!tryQueueOutboundPacket(next)) {
+                synchronized(pendingOutboundLock) {
+                    pendingOutboundPackets.addFirst(next)
+                }
+                return
+            }
+
+            flushed++
         }
     }
 
@@ -573,6 +625,18 @@ class BondedVpnService : VpnService() {
         }
     }
 
+    // Called from Rust/JNI to protect socket FDs from VPN capture.
+    fun protectSocketForNative(fd: Int): Boolean {
+        return try {
+            val protected = protect(fd)
+            android.util.Log.i("BondedVPN", "protect(fd=$fd) returned $protected")
+            protected
+        } catch (e: Exception) {
+            android.util.Log.e("BondedVPN", "protect(fd=$fd) threw ${e.message}", e)
+            false
+        }
+    }
+
     companion object {
         private const val ACTION_START = "com.bonded.bonded_app.vpn.START"
         private const val ACTION_STOP = "com.bonded.bonded_app.vpn.STOP"
@@ -582,6 +646,9 @@ class BondedVpnService : VpnService() {
         private const val NOTIFICATION_ID = 1001
         private const val PACKET_IO_EVENT_EVERY = 200L
         private const val MAX_POLLED_INBOUND_PER_CYCLE = 32
+        private const val MAX_PENDING_OUTBOUND_PACKETS = 256
+        private const val MAX_PENDING_FLUSH_PER_CYCLE = 16
+        private const val MAX_PENDING_FLUSH_ON_SESSION_START = 128
         private const val RECOVERY_COOLDOWN_MS = 5000L
 
         private var nativeLoaded = false
