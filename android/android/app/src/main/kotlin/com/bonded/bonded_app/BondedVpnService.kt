@@ -530,23 +530,70 @@ class BondedVpnService : VpnService() {
     // Resolve a "host:port" address to "ip:port" using system DNS, before the VPN is
     // active. Returns the original string unchanged on any error or if already an IP.
     private fun resolveServerAddressEarly(rawAddress: String): String {
+        android.util.Log.i("BondedVPN", "resolveServerAddressEarly() called with: $rawAddress")
         val lastColon = rawAddress.lastIndexOf(':')
-        if (lastColon < 0) return rawAddress
+        if (lastColon < 0) {
+            android.util.Log.w("BondedVPN", "No colon found in address, returning as-is")
+            return rawAddress
+        }
         val host = rawAddress.substring(0, lastColon)
         val port = rawAddress.substring(lastColon + 1)
+        android.util.Log.d("BondedVPN", "Extracted host=$host, port=$port")
         // Already an IPv4 literal — no resolution needed.
-        if (host.matches(Regex("^\\d{1,3}(\\.\\d{1,3}){3}$"))) return rawAddress
+        if (host.matches(Regex("^\\d{1,3}(\\.\\d{1,3}){3}$"))) {
+            android.util.Log.d("BondedVPN", "Host is already IPv4 literal, no resolution needed")
+            return rawAddress
+        }
         // IPv6 literal in brackets (e.g. "[::1]") — no resolution needed.
-        if (host.startsWith('[')) return rawAddress
+        if (host.startsWith('[')) {
+            android.util.Log.d("BondedVPN", "Host is IPv6 literal, no resolution needed")
+            return rawAddress
+        }
         return try {
-            val addresses = InetAddress.getAllByName(host)
-            val resolved = addresses.filterIsInstance<Inet4Address>().firstOrNull()
-                ?: addresses.firstOrNull()
-            resolved?.hostAddress?.let { ip -> "$ip:$port" }?.also { resolved ->
-                android.util.Log.i("BondedVPN", "Pre-resolved $host -> $resolved (port $port)")
-            } ?: rawAddress
+            android.util.Log.d("BondedVPN", "Attempting DNS resolution for host: $host (this may take a moment)")
+            // Run DNS lookup on a background thread to avoid ANR and ensure it completes
+            // even if the main thread has other work. Use a timeout to fail gracefully.
+            var result = rawAddress
+            val resolved = try {
+                // Try to resolve with a short timeout
+                val futureHost = java.util.concurrent.FutureTask {
+                    try {
+                        android.util.Log.d("BondedVPN", "FutureTask: calling InetAddress.getAllByName($host)")
+                        InetAddress.getAllByName(host)
+                    } catch (e: Exception) {
+                        android.util.Log.w("BondedVPN", "FutureTask: InetAddress.getAllByName failed: ${e.message}")
+                        throw e
+                    }
+                }
+                val thread = Thread(futureHost, "bonded-dns-resolve")
+                thread.start()
+                try {
+                    // Wait up to 5 seconds for DNS resolution
+                    val addresses = futureHost.get(5, java.util.concurrent.TimeUnit.SECONDS)
+                    android.util.Log.d("BondedVPN", "Resolved to ${addresses.size} address(es)")
+                    addresses.forEach { addr ->
+                        android.util.Log.d("BondedVPN", "  - ${addr.javaClass.simpleName}: ${addr.hostAddress}")
+                    }
+                    addresses.filterIsInstance<Inet4Address>().firstOrNull()
+                        ?: addresses.firstOrNull()
+                } catch (e: java.util.concurrent.TimeoutException) {
+                    android.util.Log.w("BondedVPN", "DNS resolution timed out after 5 seconds for $host")
+                    null
+                }
+            } catch (e: Exception) {
+                android.util.Log.w("BondedVPN", "Failed to resolve $host: ${e.message}", e)
+                null
+            }
+
+            if (resolved != null && resolved.hostAddress != null) {
+                result = "${resolved.hostAddress}:$port"
+                android.util.Log.i("BondedVPN", "Pre-resolved $host -> $result")
+            } else {
+                android.util.Log.w("BondedVPN", "Could not resolve $host, using original: $rawAddress")
+            }
+            result
         } catch (e: Exception) {
-            android.util.Log.w("BondedVPN", "Pre-resolution failed for $host: ${e.message}")
+            android.util.Log.e("BondedVPN", "Unexpected error in resolveServerAddressEarly: ${e.message}", e)
             rawAddress
         }
     }
