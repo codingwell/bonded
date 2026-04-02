@@ -244,6 +244,10 @@ async fn run_websocket_server(
                                     }
                                 };
 
+                                let Some(response) = response else {
+                                    continue;
+                                };
+
                                 if let Err(err) = transport.send(response).await {
                                     warn!(
                                         peer = %peer,
@@ -388,6 +392,10 @@ async fn run_server(
                                         );
                                         continue;
                                     }
+                                };
+
+                                let Some(response) = response else {
+                                    continue;
                                 };
 
                                 if let Err(err) = transport.send(response).await {

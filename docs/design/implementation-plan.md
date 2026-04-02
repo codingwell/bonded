@@ -1,7 +1,7 @@
 # Implementation Plan — Server, Linux Client, Android Client
 
 **Status:** In Progress
-**Last Updated:** 2026-04-01 (session 4)
+**Last Updated:** 2026-04-02 (session 5)
 
 This is a living document. Update the status column and notes as work progresses.
 
@@ -255,8 +255,8 @@ Build the server binary on top of `bonded-core`.
 | 2.2 | Authorized keys file — load, watch for changes, reload | completed | Added server authorized key store loading from TOML plus `notify` watcher callbacks; hardened watcher to ignore non-mutating access events and debounce rapid bursts to avoid self-triggered tight reload loops; server startup pre-creates missing state files/directories so operators only need to provide `server.toml` |
 | 2.3 | Accept NaiveTCP connections, perform auth handshake | completed | Added NaiveTCP listener accept loop and line-delimited JSON challenge-signature handshake with authorized-key enforcement |
 | 2.4 | Server-side session management (multiple concurrent clients) | completed | Added concurrent session registry keyed by authenticated client key with unique server session IDs and per-connection frame receive loop lifecycle |
-| 2.5 | IP packet forwarding — read from session, write to internet (TUN or raw socket) | completed | Added initial frame-forwarding path that relays payload bytes to optional upstream TCP target (`BONDED_UPSTREAM_TCP_TARGET`) |
-| 2.6 | Return traffic — read from internet, write back to correct client session | completed | Forwarder now emits response frames back over the authenticated session transport, falling back to payload echo when no upstream is set |
+| 2.5 | IP packet forwarding — read from session, write to internet (TUN or raw socket) | completed | Added first user-space internet egress path for IPv4+UDP frames: parse IP/UDP from session payload, send UDP payload to destination via server-side `UdpSocket`, and retain optional upstream TCP relay path for non-UDP payloads |
+| 2.6 | Return traffic — read from internet, write back to correct client session | completed | Added user-space IPv4+UDP return-packet builder (IP+UDP headers/checksums) and wired `forward_frame` to optionally return no frame on timeout/no-response, preventing invalid echoing for tunneled UDP traffic |
 | 2.7 | Invite token creation (on admin request / startup) | completed | Added startup invite-token bootstrap that reuses existing usable token or creates/persists a new single-use token |
 | 2.8 | QR code generation and emission to logs | completed | Added startup pairing payload JSON + terminal QR emission; logs warning and skips QR when `public_address` is not configured |
 | 2.9 | Health check endpoint (HTTP) | completed | Added lightweight HTTP 200 `OK` endpoint on configured `health_bind`, started alongside NaiveTCP listener |
@@ -417,6 +417,7 @@ Decisions made during implementation that aren't in the requirements docs.
 | WSS integration tests use generated self-signed certificates with explicit client trust roots | 2026-03-31 | Validates authenticated frame exchange over true TLS websocket without relying on external PKI in CI |
 | Server startup pre-creates missing state files (`authorized_keys.toml`, `invite_tokens.toml`) and parent directories | 2026-04-01 | Ensures first boot succeeds with only `/etc/bonded/server.toml` present; keeps state-file defaults under configured paths (including `/var/lib/bonded`) |
 | Authorized-keys watcher reloads only on mutating events and applies short debounce | 2026-04-01 | Prevents notify access/read event feedback loops and duplicate reload bursts when authorized-keys file is rewritten during pairing/auth flows |
+| Server frame forwarder now performs user-space IPv4+UDP relay and response packet synthesis before fallback behavior | 2026-04-02 | Enables DNS/UDP tunnel round-trip without kernel NAT as first incremental gateway slice; TCP user-space flow tracking remains future work |
 
 ---
 
@@ -428,6 +429,7 @@ Decisions made during implementation that aren't in the requirements docs.
 | Android-target Rust validation for `bonded-ffi` is blocked in this dev container because `aarch64-linux-android-clang` is unavailable while building `aws-lc-sys` | **resolved** | NDK 26.3.11579264 was already installed; configured `.cargo/config.toml` with per-target `linker`/`ar` paths and `CC_*`/`CXX_*`/`AR_*` env vars for `cc-rs`; `cargo build --target aarch64-linux-android -p bonded-ffi --release` now produces `libbonded_ffi.so`; both arm64-v8a and x86_64 `.so` files are committed to `android/android/app/src/main/jniLibs/`. |
 | Android VPN connect crashed on API 35 with `MissingForegroundServiceTypeException` | **resolved** | Declared `android:foregroundServiceType="specialUse"`, added `FOREGROUND_SERVICE_SPECIAL_USE` permission and special-use subtype property, and updated `BondedVpnService` to call `startForeground(..., ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)`. |
 | VPN-connected-but-no-traffic: two root causes — (A) no DNS in VPN builder, (B) routing-loop deadlock when Rust session TCP sockets were captured by the VPN TUN before transport paths could be established | **resolved** | (A) fixed by adding `addDnsServer()` calls; (B) fixed by calling `VpnService.protect(fd)` from Rust via stored JVM/GlobalRef before each `socket.connect()`. |
+| Server internet egress was previously payload-echo/TCP-relay oriented and could not return real DNS/UDP tunnel traffic | **resolved** | Implemented user-space IPv4+UDP relay in `frame_forwarder` with checksum-correct packet synthesis for return traffic; validated with new unit test `forwarder_relays_ipv4_udp_payload_and_builds_response_packet` and full `bonded-server` test suite. |
 | Flutter update remains blocked in this dev container due outbound network restrictions (`storage.googleapis.com` and `pub.dev`/`pub.flutter-io.cn` are not reachable) | **open** | `flutter upgrade --force` fails downloading Dart SDK; manual SDK restore attempt hit flutter-tool dependency refresh limits because hosted pub packages for newer toolchain metadata cannot be fetched from this environment. |
 
 ---
