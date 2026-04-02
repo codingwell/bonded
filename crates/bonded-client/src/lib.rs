@@ -13,6 +13,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{lookup_host, TcpSocket, TcpStream};
+use tokio::time::{timeout, Duration};
 #[cfg(target_os = "linux")]
 use tokio::select;
 use tracing::{info, warn};
@@ -99,7 +100,12 @@ pub async fn establish_transport_paths(
     let mut paths = Vec::with_capacity(target);
     for path_index in 0..target {
         if let Some(bind_address) = config.client.path_bind_addresses.get(path_index) {
-            if let Ok(stream) = establish_naive_tcp_session_with_bind(config, bind_address).await {
+            if let Ok(Ok(stream)) = timeout(
+                PATH_ESTABLISH_TIMEOUT,
+                establish_naive_tcp_session_with_bind(config, bind_address),
+            )
+            .await
+            {
                 paths.push(ClientTransport::NaiveTcp(NaiveTcpTransport::from_stream(
                     stream,
                 )));
@@ -110,13 +116,20 @@ pub async fn establish_transport_paths(
         let mut connected: Option<ClientTransport> = None;
         for protocol in rotated_protocols(&protocols, path_index) {
             let attempt = match protocol.as_str() {
-                "naive_tcp" => establish_naive_tcp_session(config)
+                "naive_tcp" => timeout(PATH_ESTABLISH_TIMEOUT, establish_naive_tcp_session(config))
                     .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|result| result)
                     .map(NaiveTcpTransport::from_stream)
                     .map(ClientTransport::NaiveTcp),
-                "wss" | "websocket_tls" => establish_websocket_session(config)
-                    .await
-                    .map(ClientTransport::WebSocket),
+                "wss" | "websocket_tls" => timeout(
+                    PATH_ESTABLISH_TIMEOUT,
+                    establish_websocket_session(config),
+                )
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result)
+                .map(ClientTransport::WebSocket),
                 _ => continue,
             };
 
@@ -144,6 +157,8 @@ pub async fn establish_transport_paths(
 
     Ok(paths)
 }
+
+const PATH_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(8);
 
 fn rotated_protocols(protocols: &[String], start: usize) -> Vec<String> {
     if protocols.is_empty() {

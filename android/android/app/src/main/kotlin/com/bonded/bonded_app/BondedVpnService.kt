@@ -54,6 +54,12 @@ class BondedVpnService : VpnService() {
     @Volatile
     private var networkRebindInProgress = false
 
+    @Volatile
+    private var sessionRecoveryInProgress = false
+
+    @Volatile
+    private var lastRecoveryAttemptMs = 0L
+
     private var lastEmittedSessionState: String? = null
     private var lastNetworkBindingSignature: String = ""
 
@@ -149,6 +155,8 @@ class BondedVpnService : VpnService() {
         lastNetworkBindingSignature = ""
         sessionStartupInProgress = false
         networkRebindInProgress = false
+        sessionRecoveryInProgress = false
+        lastRecoveryAttemptMs = 0L
         stopNativeSession()
         vpnInterface?.close()
         vpnInterface = null
@@ -338,10 +346,54 @@ class BondedVpnService : VpnService() {
 
         lastEmittedSessionState = state
         when (state) {
-            "connected" -> emitEvent("session_status", "Session connected")
+            "connected" -> {
+                sessionRecoveryInProgress = false
+                emitEvent("session_status", "Session connected")
+            }
             "connecting" -> emitEvent("session_status", "Connecting to server")
-            "error" -> emitEvent("error", snapshot.lastError ?: "Native session error")
+            "error" -> {
+                emitEvent("error", snapshot.lastError ?: "Native session error")
+                attemptSessionRecovery(snapshot.lastError)
+            }
             "stopped" -> emitEvent("session_status", "Session stopped")
+        }
+    }
+
+    private fun attemptSessionRecovery(lastError: String?) {
+        if (sessionStartupInProgress || networkRebindInProgress || sessionRecoveryInProgress) {
+            return
+        }
+
+        val nowMs = System.currentTimeMillis()
+        if ((nowMs - lastRecoveryAttemptMs) < RECOVERY_COOLDOWN_MS) {
+            return
+        }
+
+        val deviceId = activeDeviceId ?: return
+        val server = PairedServerStore.findById(this, deviceId) ?: return
+        val manager = networkPathManager ?: return
+        val pathCount = manager.activePathCount()
+        val bindAddresses = manager.activeBindAddresses()
+
+        sessionRecoveryInProgress = true
+        lastRecoveryAttemptMs = nowMs
+        thread(name = "bonded-session-recovery", start = true) {
+            android.util.Log.w(
+                "BondedVPN",
+                "Attempting native session recovery after error: ${lastError ?: "unknown"}",
+            )
+
+            stopNativeSession()
+            val restarted = startNativeSession(server, pathCount, bindAddresses)
+            if (restarted) {
+                emitEvent("session_status", "Native session recovered")
+                android.util.Log.i("BondedVPN", "Native session recovery succeeded")
+            } else {
+                emitEvent("error", "Native session recovery failed")
+                android.util.Log.e("BondedVPN", "Native session recovery failed")
+            }
+
+            sessionRecoveryInProgress = false
         }
     }
 
@@ -506,6 +558,7 @@ class BondedVpnService : VpnService() {
         private const val NOTIFICATION_ID = 1001
         private const val PACKET_IO_EVENT_EVERY = 200L
         private const val MAX_POLLED_INBOUND_PER_CYCLE = 32
+        private const val RECOVERY_COOLDOWN_MS = 5000L
 
         private var nativeLoaded = false
 
