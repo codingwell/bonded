@@ -34,6 +34,8 @@ RUN ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager "build-tools;35.0.0"
 RUN ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager "cmake;4.1.1"
 RUN ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager "ndk;28.2.13676358"
 RUN ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager "platform-tools" "platforms;android-36"
+RUN ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager "cmake;3.22.1"
+RUN ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager "platform-tools" "platforms;android-35"
 
 # Download and install Flutter
 RUN mkdir -p ${FLUTTER_SDK_ROOT} \
