@@ -25,8 +25,13 @@ use std::time::Duration;
 #[cfg(any(target_os = "android", test))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// Per-path connect attempts inside establish_transport_paths each carry an 8s
+// timeout.  With two paths and a bind-aware attempt first, path 0 can take close
+// to 16s before the inner layer reports a failure.  Give the outer wrapper 30s so
+// it never races with the inner per-attempt timeouts and we always surface the
+// real error message rather than a generic outer-timeout.
 #[cfg(any(target_os = "android", test))]
-const ANDROID_PATH_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(12);
+const ANDROID_PATH_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ── JVM / VPN-service globals (Android only) ────────────────────────────────
 
