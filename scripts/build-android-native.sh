@@ -8,6 +8,9 @@ WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 JNILIBS_DIR="$WORKSPACE_ROOT/android/android/app/src/main/jniLibs"
 
+echo "Ensuring Android Rust targets are installed..."
+rustup target add aarch64-linux-android x86_64-linux-android
+
 echo "Building bonded-ffi for aarch64-linux-android (arm64 physical devices)..."
 cargo build --target aarch64-linux-android -p bonded-ffi --release
 
