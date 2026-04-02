@@ -268,10 +268,18 @@ class BondedVpnService : VpnService() {
 
         sessionMonitorRunning = true
         sessionMonitorThread = thread(name = "bonded-session-monitor", start = true) {
+            var monitorTick = 0L
             while (sessionMonitorRunning) {
                 val snapshot = getNativeSessionSnapshot()
                 if (snapshot != null) {
                     updateSessionSnapshot(snapshot)
+                    monitorTick += 1
+                    if (monitorTick % 5L == 0L) {
+                        android.util.Log.i(
+                            "BondedVPN",
+                            "Native snapshot: state=${snapshot.state}, outbound=${snapshot.outboundPackets}/${snapshot.outboundBytes}B, inbound=${snapshot.inboundPackets}/${snapshot.inboundBytes}B, lastError=${snapshot.lastError}",
+                        )
+                    }
                 }
 
                 try {
@@ -425,6 +433,10 @@ class BondedVpnService : VpnService() {
         return try {
             val protocolCsv = server.supportedProtocols.joinToString(",")
             val bindAddressesJson = JSONArray(bindAddresses).toString()
+            android.util.Log.i(
+                "BondedVPN",
+                "Starting native session: server=${server.publicAddress}, protocols=$protocolCsv, pathCount=$pathCount, bindAddresses=$bindAddressesJson",
+            )
             val started = nativeStartSession(
                 server.publicAddress,
                 protocolCsv,
@@ -432,6 +444,7 @@ class BondedVpnService : VpnService() {
                 bindAddressesJson,
                 filesDir.absolutePath,
             )
+            android.util.Log.i("BondedVPN", "nativeStartSession returned: $started")
             if (started) {
                 lastNetworkBindingSignature = bindAddressesJson
             }

@@ -460,10 +460,16 @@ fn queue_outbound_packet(packet: Vec<u8>) {
         .expect("android session slot lock poisoned")
         .as_ref()
     {
-        eprintln!("[bonded-ffi] Queuing {} byte outbound packet", packet.len());
+        let packet_len = packet.len();
+        eprintln!("[bonded-ffi] Queuing {} byte outbound packet", packet_len);
         let result = handle.outbound_tx.send(packet);
         if let Err(_) = result {
-            eprintln!("[bonded-ffi] Failed to queue outbound packet: channel closed");
+            let message = "Failed to queue outbound packet: channel closed";
+            eprintln!("[bonded-ffi] {}", message);
+            update_snapshot(&handle.snapshot, |session_snapshot| {
+                session_snapshot.state = "error".to_owned();
+                session_snapshot.last_error = Some(message.to_owned());
+            });
         }
     } else {
         eprintln!("[bonded-ffi] Cannot queue outbound packet: no active session");
