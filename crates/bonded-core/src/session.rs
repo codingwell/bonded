@@ -4,6 +4,11 @@ use thiserror::Error;
 
 const HEADER_LEN: usize = 16;
 
+/// Frame flag: sent by client to probe connection liveness.
+pub const FLAG_PING: u32 = 0x0001;
+/// Frame flag: sent by server in reply to a ping.
+pub const FLAG_PONG: u32 = 0x0002;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionHeader {
     pub connection_id: u32,

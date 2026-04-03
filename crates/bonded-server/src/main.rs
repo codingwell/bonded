@@ -15,6 +15,7 @@ use auth_handshake::{perform_auth_handshake, perform_websocket_auth_handshake};
 use authorized_keys::{AuthorizedKeysStore, AuthorizedKeysWatcher};
 use bonded_core::auth::DeviceKeypair;
 use bonded_core::config::{load_server_config, ServerConfig, DEFAULT_SERVER_CONFIG_PATH};
+use bonded_core::session::{SessionFrame, SessionHeader, FLAG_PING, FLAG_PONG};
 use bonded_core::transport::{NaiveTcpTransport, Transport};
 use clap::Parser;
 use frame_forwarder::forward_frame;
@@ -238,8 +239,37 @@ async fn run_websocket_server(
                                     connection_id = frame.header.connection_id,
                                     frame_size = frame.payload.len(),
                                     sequence = frame.header.sequence,
+                                    flags = frame.header.flags,
                                     "websocket frame received from client"
                                 );
+
+                                // Respond to heartbeat pings without forwarding them.
+                                if frame.header.flags & FLAG_PING != 0 {
+                                    info!(
+                                        peer = %peer,
+                                        session_id = handle.session_id,
+                                        sequence = frame.header.sequence,
+                                        "websocket heartbeat ping received, sending pong"
+                                    );
+                                    let pong = SessionFrame {
+                                        header: SessionHeader {
+                                            connection_id: frame.header.connection_id,
+                                            sequence: frame.header.sequence,
+                                            flags: FLAG_PONG,
+                                        },
+                                        payload: frame.payload,
+                                    };
+                                    if let Err(err) = transport.send(pong).await {
+                                        warn!(
+                                            peer = %peer,
+                                            session_id = handle.session_id,
+                                            error = %err,
+                                            "failed to send websocket heartbeat pong"
+                                        );
+                                        break;
+                                    }
+                                    continue;
+                                }
 
                                 let response = match forward_frame(
                                     frame,
@@ -420,8 +450,37 @@ async fn run_server(
                                     connection_id = frame.header.connection_id,
                                     frame_size = frame.payload.len(),
                                     sequence = frame.header.sequence,
+                                    flags = frame.header.flags,
                                     "frame received from client"
                                 );
+
+                                // Respond to heartbeat pings without forwarding them.
+                                if frame.header.flags & FLAG_PING != 0 {
+                                    info!(
+                                        peer = %peer,
+                                        session_id = handle.session_id,
+                                        sequence = frame.header.sequence,
+                                        "heartbeat ping received, sending pong"
+                                    );
+                                    let pong = SessionFrame {
+                                        header: SessionHeader {
+                                            connection_id: frame.header.connection_id,
+                                            sequence: frame.header.sequence,
+                                            flags: FLAG_PONG,
+                                        },
+                                        payload: frame.payload,
+                                    };
+                                    if let Err(err) = transport.send(pong).await {
+                                        warn!(
+                                            peer = %peer,
+                                            session_id = handle.session_id,
+                                            error = %err,
+                                            "failed to send heartbeat pong"
+                                        );
+                                        break;
+                                    }
+                                    continue;
+                                }
 
                                 let response = match forward_frame(
                                     frame,

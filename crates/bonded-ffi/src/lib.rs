@@ -6,7 +6,7 @@ use bonded_core::config::ClientConfig;
 use bonded_core::config::SocketProtectFn;
 use bonded_core::session::SessionFrame;
 #[cfg(any(target_os = "android", test))]
-use bonded_core::session::SessionState;
+use bonded_core::session::{SessionState, FLAG_PING, FLAG_PONG};
 #[cfg(any(target_os = "android", test))]
 use bytes::Bytes;
 #[cfg(any(target_os = "android", test))]
@@ -355,6 +355,9 @@ fn start_android_session(
             let mut active_index = 0_usize;
             let mut session = SessionState::new(1);
             let mut select_cycle = 0u64;
+            let mut ping_sequence = 0u64;
+            let mut last_ping_sent_ms: Option<u64> = None;
+            const HEARTBEAT_INTERVAL_CYCLES: u64 = 200; // 200 * 50ms = 10s
 
             while !worker_stop_flag.load(Ordering::SeqCst) {
                 tokio::select! {
@@ -400,6 +403,28 @@ fn start_android_session(
                     frame_result = transports[active_index].recv() => {
                         match frame_result {
                             Ok(frame) => {
+                                // Handle heartbeat pong — don't feed it to the session reorder buffer.
+                                if frame.header.flags & FLAG_PONG != 0 {
+                                    let now_ms = SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .map(|d| d.as_millis() as u64)
+                                        .unwrap_or(0);
+                                    let rtt_ms = last_ping_sent_ms
+                                        .map(|sent| now_ms.saturating_sub(sent));
+                                    if let Some(rtt) = rtt_ms {
+                                        eprintln!(
+                                            "[bonded-ffi] Heartbeat pong received: seq={} rtt={}ms",
+                                            frame.header.sequence, rtt
+                                        );
+                                    } else {
+                                        eprintln!(
+                                            "[bonded-ffi] Heartbeat pong received: seq={}",
+                                            frame.header.sequence
+                                        );
+                                    }
+                                    continue;
+                                }
+
                                 eprintln!("[bonded-ffi] Worker: received frame from transport {}", active_index);
                                 let ready = match session.ingest_inbound(frame) {
                                     Ok(ready) => ready,
@@ -449,8 +474,29 @@ fn start_android_session(
                     }
                     _ = tokio::time::sleep(Duration::from_millis(50)) => {
                         select_cycle += 1;
-                        if select_cycle % 200 == 0 {  // Every ~10 seconds
-                            eprintln!("[bonded-ffi] Worker: heartbeat - {} select cycles", select_cycle);
+                        if select_cycle % HEARTBEAT_INTERVAL_CYCLES == 0 {
+                            let now_ms = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0);
+                            let ping = SessionFrame {
+                                header: bonded_core::session::SessionHeader {
+                                    connection_id: 0,
+                                    sequence: ping_sequence,
+                                    flags: FLAG_PING,
+                                },
+                                payload: Bytes::new(),
+                            };
+                            eprintln!(
+                                "[bonded-ffi] Sending heartbeat ping seq={} cycle={}",
+                                ping_sequence, select_cycle
+                            );
+                            if let Err(err) = transports[active_index].send(ping).await {
+                                eprintln!("[bonded-ffi] Heartbeat ping send failed: {}", err);
+                            } else {
+                                last_ping_sent_ms = Some(now_ms);
+                                ping_sequence = ping_sequence.wrapping_add(1);
+                            }
                         }
                     }
                 }
