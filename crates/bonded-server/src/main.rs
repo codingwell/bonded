@@ -218,7 +218,18 @@ async fn run_websocket_server(
                         "websocket client authenticated"
                     );
 
+                    info!(
+                        peer = %peer,
+                        session_id = handle.session_id,
+                        "starting websocket frame receive loop"
+                    );
+
                     loop {
+                        debug!(
+                            peer = %peer,
+                            session_id = handle.session_id,
+                            "waiting for websocket frame from client"
+                        );
                         match transport.recv().await {
                             Ok(frame) => {
                                 debug!(
@@ -286,8 +297,8 @@ async fn run_websocket_server(
                                     peer = %peer,
                                     public_key = %public_key,
                                     session_id = handle.session_id,
-                                    error = %err,
-                                    "websocket client session ended"
+                                    error = ?err,
+                                    "websocket client session ended - recv error"
                                 );
                                 break;
                             }
@@ -390,7 +401,17 @@ async fn run_server(
                     );
 
                     let mut transport = NaiveTcpTransport::from_stream(stream);
+                    info!(
+                        peer = %peer,
+                        session_id = handle.session_id,
+                        "starting frame receive loop"
+                    );
                     loop {
+                        debug!(
+                            peer = %peer,
+                            session_id = handle.session_id,
+                            "waiting for frame from client"
+                        );
                         match transport.recv().await {
                             Ok(frame) => {
                                 debug!(
@@ -458,8 +479,8 @@ async fn run_server(
                                     peer = %peer,
                                     public_key = %public_key,
                                     session_id = handle.session_id,
-                                    error = %err,
-                                    "client session ended"
+                                    error = ?err,
+                                    "client session ended - recv error"
                                 );
                                 break;
                             }
