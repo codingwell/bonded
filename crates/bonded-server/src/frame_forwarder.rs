@@ -1,4 +1,5 @@
 use bonded_core::session::SessionFrame;
+use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -13,6 +14,16 @@ struct Ipv4UdpPacket {
     dst_port: u16,
     payload: Vec<u8>,
     identification: u16,
+}
+
+#[derive(Debug, Clone)]
+struct Ipv4IcmpEchoPacket {
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    identification: u16,
+    echo_identifier: u16,
+    echo_sequence: u16,
+    icmp_segment: Vec<u8>,
 }
 
 pub async fn forward_frame(
@@ -97,6 +108,55 @@ pub async fn forward_frame(
         }));
     }
 
+    if let Some(icmp_packet) = parse_ipv4_icmp_echo_packet(&frame.payload) {
+        debug!(
+            src_ip = %icmp_packet.src_ip,
+            dst_ip = %icmp_packet.dst_ip,
+            echo_identifier = icmp_packet.echo_identifier,
+            echo_sequence = icmp_packet.echo_sequence,
+            payload_size = icmp_packet.icmp_segment.len().saturating_sub(8),
+            "ICMP echo packet forwarding outbound"
+        );
+
+        let reply = send_icmp_echo_and_wait_reply(
+            icmp_packet.dst_ip,
+            icmp_packet.echo_identifier,
+            icmp_packet.echo_sequence,
+            icmp_packet.icmp_segment.clone(),
+        )
+        .await?;
+
+        let Some(reply_icmp_segment) = reply else {
+            debug!(
+                src_ip = %icmp_packet.src_ip,
+                dst_ip = %icmp_packet.dst_ip,
+                echo_identifier = icmp_packet.echo_identifier,
+                echo_sequence = icmp_packet.echo_sequence,
+                "ICMP echo response timeout (1200ms) - no response received"
+            );
+            return Ok(None);
+        };
+
+        let response_packet = build_ipv4_icmp_packet(
+            icmp_packet.dst_ip,
+            icmp_packet.src_ip,
+            icmp_packet.identification,
+            &reply_icmp_segment,
+        )?;
+        debug!(
+            src_ip = %icmp_packet.dst_ip,
+            dst_ip = %icmp_packet.src_ip,
+            echo_identifier = icmp_packet.echo_identifier,
+            echo_sequence = icmp_packet.echo_sequence,
+            response_packet_size = response_packet.len(),
+            "ICMP echo response packet built for client"
+        );
+        return Ok(Some(SessionFrame {
+            header: frame.header,
+            payload: response_packet.into(),
+        }));
+    }
+
     if let Some(target) = upstream_tcp_target.filter(|value| !value.trim().is_empty()) {
         debug!(
             target = %target,
@@ -136,6 +196,62 @@ pub async fn forward_frame(
     }
 
     Ok(Some(frame))
+}
+
+async fn send_icmp_echo_and_wait_reply(
+    dst_ip: Ipv4Addr,
+    echo_identifier: u16,
+    echo_sequence: u16,
+    request_icmp_segment: Vec<u8>,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    tokio::task::spawn_blocking(move || {
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4))?;
+        let timeout = std::time::Duration::from_millis(1200);
+        socket.set_read_timeout(Some(timeout))?;
+        socket.set_write_timeout(Some(timeout))?;
+
+        let target = SocketAddrV4::new(dst_ip, 0);
+        socket.connect(&target.into())?;
+        socket.send(&request_icmp_segment)?;
+
+        loop {
+            let mut raw_response = [std::mem::MaybeUninit::<u8>::uninit(); 4096];
+            let read_size = match socket.recv(&mut raw_response) {
+                Ok(size) => size,
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::TimedOut
+                        || err.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    return Ok(None);
+                }
+                Err(err) => return Err(err.into()),
+            };
+
+            if read_size < 8 {
+                continue;
+            }
+
+            let response: Vec<u8> = raw_response[..read_size]
+                .iter()
+                .map(|byte| {
+                    // Bytes reported by recv() are fully initialized by the OS.
+                    unsafe { byte.assume_init() }
+                })
+                .collect();
+            let reply_type = response[0];
+            let reply_code = response[1];
+            let reply_identifier = u16::from_be_bytes([response[4], response[5]]);
+            let reply_sequence = u16::from_be_bytes([response[6], response[7]]);
+            if reply_type == 0
+                && reply_code == 0
+                && reply_identifier == echo_identifier
+                && reply_sequence == echo_sequence
+            {
+                return Ok(Some(response));
+            }
+        }
+    })
+    .await?
 }
 
 fn parse_ipv4_udp_packet(packet: &[u8]) -> Option<Ipv4UdpPacket> {
@@ -193,6 +309,60 @@ fn parse_ipv4_udp_packet(packet: &[u8]) -> Option<Ipv4UdpPacket> {
     })
 }
 
+fn parse_ipv4_icmp_echo_packet(packet: &[u8]) -> Option<Ipv4IcmpEchoPacket> {
+    if packet.len() < 28 {
+        return None;
+    }
+
+    let version = packet[0] >> 4;
+    let ihl = (packet[0] & 0x0f) as usize;
+    if version != 4 || ihl < 5 {
+        return None;
+    }
+
+    let header_len = ihl * 4;
+    if packet.len() < header_len + 8 {
+        return None;
+    }
+
+    let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+    if total_len < header_len + 8 || total_len > packet.len() {
+        return None;
+    }
+
+    let fragment_field = u16::from_be_bytes([packet[6], packet[7]]);
+    let is_fragmented = (fragment_field & 0x1fff) != 0 || (fragment_field & 0x2000) != 0;
+    if is_fragmented {
+        return None;
+    }
+
+    if packet[9] != 1 {
+        return None;
+    }
+
+    let icmp_start = header_len;
+    let icmp_type = packet[icmp_start];
+    let icmp_code = packet[icmp_start + 1];
+    if icmp_type != 8 || icmp_code != 0 {
+        return None;
+    }
+
+    let src_ip = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+    let dst_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+    let identification = u16::from_be_bytes([packet[4], packet[5]]);
+    let echo_identifier = u16::from_be_bytes([packet[icmp_start + 4], packet[icmp_start + 5]]);
+    let echo_sequence = u16::from_be_bytes([packet[icmp_start + 6], packet[icmp_start + 7]]);
+
+    Some(Ipv4IcmpEchoPacket {
+        src_ip,
+        dst_ip,
+        identification,
+        echo_identifier,
+        echo_sequence,
+        icmp_segment: packet[icmp_start..total_len].to_vec(),
+    })
+}
+
 fn build_ipv4_udp_packet(
     src_ip: Ipv4Addr,
     dst_ip: Ipv4Addr,
@@ -235,6 +405,45 @@ fn build_ipv4_udp_packet(
     let udp_checksum = udp_checksum_ipv4(src_ip, dst_ip, &packet[udp_start..]);
     packet[udp_start + 6..udp_start + 8].copy_from_slice(&udp_checksum.to_be_bytes());
 
+    Ok(packet)
+}
+
+fn build_ipv4_icmp_packet(
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    identification: u16,
+    icmp_segment: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let ip_header_len = 20usize;
+    if icmp_segment.len() < 8 {
+        anyhow::bail!("icmp response too short");
+    }
+
+    let total_len = ip_header_len + icmp_segment.len();
+    if total_len > u16::MAX as usize {
+        anyhow::bail!("icmp response too large for IPv4 packet");
+    }
+
+    let mut packet = vec![0_u8; total_len];
+    packet[0] = 0x45;
+    packet[1] = 0;
+    packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    packet[4..6].copy_from_slice(&identification.to_be_bytes());
+    packet[6..8].copy_from_slice(&0x4000_u16.to_be_bytes());
+    packet[8] = 64;
+    packet[9] = 1;
+    packet[10..12].copy_from_slice(&[0, 0]);
+    packet[12..16].copy_from_slice(&src_ip.octets());
+    packet[16..20].copy_from_slice(&dst_ip.octets());
+
+    packet[ip_header_len..].copy_from_slice(icmp_segment);
+    let icmp_start = ip_header_len;
+    packet[icmp_start + 2..icmp_start + 4].copy_from_slice(&[0, 0]);
+    let icmp_checksum = checksum_ones_complement(&packet[icmp_start..]);
+    packet[icmp_start + 2..icmp_start + 4].copy_from_slice(&icmp_checksum.to_be_bytes());
+
+    let ip_checksum = checksum_ones_complement(&packet[..ip_header_len]);
+    packet[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
     Ok(packet)
 }
 
@@ -405,5 +614,41 @@ mod tests {
     ) -> Vec<u8> {
         super::build_ipv4_udp_packet(src_ip, dst_ip, src_port, dst_port, 1234, payload)
             .expect("test packet should build")
+    }
+
+    #[test]
+    fn parses_and_builds_ipv4_icmp_echo_packets() {
+        let request_icmp = vec![8, 0, 0, 0, 0x12, 0x34, 0x00, 0x02, b'p', b'i', b'n', b'g'];
+        let request = super::build_ipv4_icmp_packet(
+            Ipv4Addr::new(10, 8, 0, 2),
+            Ipv4Addr::new(1, 1, 1, 1),
+            0x9abc,
+            &request_icmp,
+        )
+        .expect("request packet should build");
+
+        let parsed = super::parse_ipv4_icmp_echo_packet(&request)
+            .expect("request packet should parse as icmp echo");
+        assert_eq!(parsed.src_ip, Ipv4Addr::new(10, 8, 0, 2));
+        assert_eq!(parsed.dst_ip, Ipv4Addr::new(1, 1, 1, 1));
+        assert_eq!(parsed.identification, 0x9abc);
+        assert_eq!(parsed.echo_identifier, 0x1234);
+        assert_eq!(parsed.echo_sequence, 2);
+
+        let reply_icmp = vec![0, 0, 0, 0, 0x12, 0x34, 0x00, 0x02, b'p', b'o', b'n', b'g'];
+        let reply = super::build_ipv4_icmp_packet(
+            Ipv4Addr::new(1, 1, 1, 1),
+            Ipv4Addr::new(10, 8, 0, 2),
+            parsed.identification,
+            &reply_icmp,
+        )
+        .expect("reply packet should build");
+
+        assert_eq!(reply[9], 1, "reply must be IPv4 ICMP protocol");
+        let ihl = (reply[0] & 0x0f) as usize;
+        let icmp_start = ihl * 4;
+        assert_eq!(reply[icmp_start], 0, "icmp type must be echo reply");
+        assert_eq!(reply[icmp_start + 4], 0x12);
+        assert_eq!(reply[icmp_start + 5], 0x34);
     }
 }

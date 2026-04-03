@@ -1,7 +1,7 @@
 # Implementation Plan — Server, Linux Client, Android Client
 
 **Status:** In Progress
-**Last Updated:** 2026-04-03 (session 18)
+**Last Updated:** 2026-04-03 (session 19)
 
 This is a living document. Update the status column and notes as work progresses.
 
@@ -255,8 +255,8 @@ Build the server binary on top of `bonded-core`.
 | 2.2 | Authorized keys file — load, watch for changes, reload | completed | Added server authorized key store loading from TOML plus `notify` watcher callbacks; hardened watcher to ignore non-mutating access events and debounce rapid bursts to avoid self-triggered tight reload loops; server startup pre-creates missing state files/directories so operators only need to provide `server.toml` |
 | 2.3 | Accept NaiveTCP connections, perform auth handshake | completed | Added NaiveTCP listener accept loop and line-delimited JSON challenge-signature handshake with authorized-key enforcement |
 | 2.4 | Server-side session management (multiple concurrent clients) | completed | Added concurrent session registry keyed by authenticated client key with unique server session IDs and per-connection frame receive loop lifecycle |
-| 2.5 | IP packet forwarding — read from session, write to internet (TUN or raw socket) | completed | Added first user-space internet egress path for IPv4+UDP frames: parse IP/UDP from session payload, send UDP payload to destination via server-side `UdpSocket`, and retain optional upstream TCP relay path for non-UDP payloads |
-| 2.6 | Return traffic — read from internet, write back to correct client session | completed | Added user-space IPv4+UDP return-packet builder (IP+UDP headers/checksums) and wired `forward_frame` to optionally return no frame on timeout/no-response, preventing invalid echoing for tunneled UDP traffic |
+| 2.5 | IP packet forwarding — read from session, write to internet (TUN or raw socket) | completed | Added user-space internet egress for IPv4+UDP and IPv4 ICMP echo frames: UDP payloads are relayed via `UdpSocket`; ICMP echo requests are relayed via IPv4 ICMP datagram sockets (`socket2`) with echo-id/sequence matching; retains optional upstream TCP relay fallback for non-IP payloads |
+| 2.6 | Return traffic — read from internet, write back to correct client session | completed | Added checksum-correct IPv4 response synthesis for UDP and ICMP echo reply traffic, and wired `forward_frame` to return `None` on per-protocol timeout/no-response so tunneled packets are not spuriously echoed |
 | 2.7 | Invite token creation (on admin request / startup) | completed | Added startup invite-token bootstrap that reuses existing usable token or creates/persists a new single-use token |
 | 2.8 | QR code generation and emission to logs | completed | Added startup pairing payload JSON + terminal QR emission; logs warning and skips QR when `public_address` is not configured |
 | 2.9 | Health check endpoint (HTTP) | completed | Added lightweight HTTP 200 `OK` endpoint on configured `health_bind`, started alongside NaiveTCP listener |
@@ -431,6 +431,7 @@ Decisions made during implementation that aren't in the requirements docs.
 | Android VPN now disallows the app package from tunnel capture and treats `protect(fd)=false` as non-fatal on Android | 2026-04-02 | Prevents startup deadlocks when control-plane sockets would otherwise be captured by the VPN and removes brittle dependency on per-socket protect success |
 | Android launcher icon generation is managed via `flutter_launcher_icons` using workspace-root `icon.png` | 2026-04-03 | Keeps launcher assets reproducible across densities and Android adaptive-icon resources instead of hand-editing mipmap files |
 | Rust-only DNS tunnel diagnostics use an ignored localhost integration test in `bonded-server` that runs real server+client crates and injects synthetic UDP DNS probes | 2026-04-03 | Enables reproducible E2E debugging of server/client forwarding behavior without Android app/device dependencies |
+| Server frame forwarder now handles IPv4 ICMP echo request/reply in addition to UDP | 2026-04-03 | Uses Linux-compatible IPv4 ICMP datagram sockets through `socket2`, matches echo identifier/sequence, and synthesizes IPv4 ICMP reply packets with recomputed checksums for client return path |
 
 ---
 
