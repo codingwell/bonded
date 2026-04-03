@@ -8,6 +8,8 @@ import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
+import java.io.BufferedReader
+import java.io.InputStreamReader
 import java.time.Instant
 import java.util.UUID
 
@@ -64,6 +66,42 @@ class MainActivity : FlutterActivity() {
 		startActivityForResult(prepareIntent, REQUEST_CODE_VPN_PREPARE)
 	}
 
+	private fun readClientLogs(maxLines: Int): List<String> {
+		val cap = maxLines.coerceIn(50, 2000)
+		return try {
+			val process = ProcessBuilder("logcat", "-d", "-t", cap.toString())
+				.redirectErrorStream(true)
+				.start()
+
+			val lines = mutableListOf<String>()
+			BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
+				var line: String? = reader.readLine()
+				while (line != null) {
+					if (
+						line.contains("BondedVPN") ||
+						line.contains("bonded-ffi") ||
+						line.contains("bonded-client") ||
+						line.contains("Heartbeat") ||
+						line.contains("bonded_server") ||
+						line.contains("bonded")
+					) {
+						lines.add(line)
+					}
+					line = reader.readLine()
+				}
+			}
+			process.waitFor()
+
+			if (lines.size > cap) {
+				lines.takeLast(cap)
+			} else {
+				lines
+			}
+		} catch (e: Exception) {
+			listOf("Failed to read client logs: ${e.message}")
+		}
+	}
+
 	override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
 		super.onActivityResult(requestCode, resultCode, data)
 
@@ -94,6 +132,12 @@ class MainActivity : FlutterActivity() {
 		MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
 			.setMethodCallHandler { call, result ->
 				when (call.method) {
+					"getClientLogs" -> {
+						val args = call.arguments as? Map<*, *>
+						val maxLines = (args?.get("maxLines") as? Number)?.toInt() ?: 500
+						result.success(readClientLogs(maxLines))
+					}
+
 					"getNetworkTestLogs" -> {
 						result.success(NetworkTestReceiver.getBufferedLogs())
 					}

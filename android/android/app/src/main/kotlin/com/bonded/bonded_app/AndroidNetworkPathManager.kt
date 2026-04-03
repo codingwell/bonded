@@ -7,7 +7,6 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import java.net.Inet4Address
-import java.net.Inet6Address
 
 data class NetworkPathBinding(
     val transport: Int,
@@ -148,7 +147,6 @@ class AndroidNetworkPathManager(
             when {
                 address.isLoopbackAddress || address.isLinkLocalAddress || address.isAnyLocalAddress -> null
                 address is Inet4Address -> address.hostAddress
-                address is Inet6Address -> address.hostAddress?.substringBefore('%')
                 else -> null
             }
         }

@@ -320,6 +320,16 @@ fn start_android_session(
                         "[bonded-ffi] Transport paths established, count: {}",
                         transports.len()
                     );
+                    for (index, transport) in transports.iter().enumerate() {
+                        let kind = match transport {
+                            bonded_client::ClientTransport::NaiveTcp(_) => "NaiveTCP",
+                            bonded_client::ClientTransport::WebSocket(_) => "WebSocketTLS",
+                        };
+                        eprintln!(
+                            "[bonded-ffi] Transport path {}: {}",
+                            index, kind
+                        );
+                    }
                     let now_ms = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
@@ -370,11 +380,12 @@ fn start_android_session(
                                 }
 
                                 let packet_len = packet.len() as u64;
-                                eprintln!("[bonded-ffi] Worker: sending {} byte outbound packet via transport index {}", packet_len, active_index);
+                                eprintln!("[bonded-ffi] Worker: sending {} byte outbound packet via transport[{}] (active)", packet_len, active_index);
                                 let frame = session.create_outbound_frame(Bytes::from(packet), 0);
                                 if let Err(err) = transports[active_index].send(frame).await {
-                                    eprintln!("[bonded-ffi] Worker: send on transport {} failed: {}", active_index, err);
+                                    eprintln!("[bonded-ffi] Worker: send on transport[{}] failed: {}", active_index, err);
                                     if transports.len() == 1 {
+                                        eprintln!("[bonded-ffi] Worker: only one transport available, cannot failover");
                                         update_snapshot(&worker_snapshot, |session_snapshot| {
                                             session_snapshot.state = "error".to_owned();
                                             session_snapshot.last_error = Some(err.to_string());
@@ -382,11 +393,12 @@ fn start_android_session(
                                         break;
                                     }
 
+                                    let old_index = active_index;
                                     transports.remove(active_index);
                                     if active_index >= transports.len() {
                                         active_index = 0;
                                     }
-                                    eprintln!("[bonded-ffi] Worker: failover to transport index {}", active_index);
+                                    eprintln!("[bonded-ffi] Worker: failover from transport[{}] to transport[{}]", old_index, active_index);
                                     continue;
                                 }
                                 update_snapshot(&worker_snapshot, |session_snapshot| {
@@ -401,6 +413,7 @@ fn start_android_session(
                         }
                     }
                     frame_result = transports[active_index].recv() => {
+                        // Log which transport is receiving.
                         match frame_result {
                             Ok(frame) => {
                                 // Handle heartbeat pong — don't feed it to the session reorder buffer.
@@ -455,8 +468,9 @@ fn start_android_session(
                                 }
                             }
                             Err(err) => {
-                                eprintln!("[bonded-ffi] Worker: recv on transport {} failed: {}", active_index, err);
+                                eprintln!("[bonded-ffi] Worker: recv on transport[{}] failed: {}", active_index, err);
                                 if transports.len() == 1 {
+                                    eprintln!("[bonded-ffi] Worker: only one transport available, cannot failover");
                                     update_snapshot(&worker_snapshot, |session_snapshot| {
                                         session_snapshot.state = "error".to_owned();
                                         session_snapshot.last_error = Some(err.to_string());
@@ -464,11 +478,12 @@ fn start_android_session(
                                     break;
                                 }
 
+                                let old_index = active_index;
                                 transports.remove(active_index);
                                 if active_index >= transports.len() {
                                     active_index = 0;
                                 }
-                                eprintln!("[bonded-ffi] Worker: failover to transport index {}", active_index);
+                                eprintln!("[bonded-ffi] Worker: failover from recv error on transport[{}] to transport[{}]", old_index, active_index);
                             }
                         }
                     }

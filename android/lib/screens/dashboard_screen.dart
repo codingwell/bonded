@@ -191,6 +191,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
             onPressed: _refreshStatus,
           ),
           IconButton(
+            icon: const Icon(Icons.article_outlined),
+            tooltip: 'Client Logs',
+            onPressed: () => Navigator.of(context).pushNamed('/client-logs'),
+          ),
+          IconButton(
             icon: const Icon(Icons.settings),
             onPressed: () => Navigator.of(context).pushNamed('/settings'),
           ),
@@ -234,6 +239,13 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       onTap: _toggleVpn,
                     ),
                     const SizedBox(height: 16),
+                    OutlinedButton.icon(
+                      onPressed:
+                          () => Navigator.of(context).pushNamed('/client-logs'),
+                      icon: const Icon(Icons.article_outlined),
+                      label: const Text('View Client Logs'),
+                    ),
+                    const SizedBox(height: 8),
                     OutlinedButton(
                       onPressed: () => Navigator.of(context).pop(),
                       child: const Text('Back'),

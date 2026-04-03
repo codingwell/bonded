@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use bytes::BytesMut;
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -29,6 +30,8 @@ pub trait Transport: Send {
 
 pub struct NaiveTcpTransport {
     stream: TcpStream,
+    /// Accumulates bytes across `select!` cancellations so that `recv()` is cancel-safe.
+    read_buf: BytesMut,
 }
 
 enum WebSocketStreamInner {
@@ -44,11 +47,11 @@ pub struct WebSocketTlsTransport {
 impl NaiveTcpTransport {
     pub async fn connect(address: &str) -> anyhow::Result<Self> {
         let stream = TcpStream::connect(address).await?;
-        Ok(Self { stream })
+        Ok(Self { stream, read_buf: BytesMut::new() })
     }
 
     pub fn from_stream(stream: TcpStream) -> Self {
-        Self { stream }
+        Self { stream, read_buf: BytesMut::new() }
     }
 }
 
@@ -66,6 +69,12 @@ impl WebSocketTlsTransport {
         Ok(Self {
             stream: WebSocketStreamInner::Client(stream),
         })
+    }
+
+    pub fn from_client_stream(stream: WebSocketStream<MaybeTlsStream<TcpStream>>) -> Self {
+        Self {
+            stream: WebSocketStreamInner::Client(stream),
+        }
     }
 
     pub async fn accept(stream: TcpStream) -> anyhow::Result<Self> {
@@ -134,9 +143,24 @@ impl Transport for NaiveTcpTransport {
     }
 
     async fn recv(&mut self) -> anyhow::Result<SessionFrame> {
-        let mut len_buf = [0_u8; 4];
-        self.stream.read_exact(&mut len_buf).await?;
-        let len = u32::from_be_bytes(len_buf) as usize;
+        // Fill the internal buffer until we have the 4-byte length prefix.
+        // Bytes already in `self.read_buf` survive a `tokio::select!` cancellation,
+        // making this method cancel-safe.
+        while self.read_buf.len() < 4 {
+            let mut tmp = [0u8; 4096];
+            let n = self.stream.read(&mut tmp).await?;
+            if n == 0 {
+                anyhow::bail!("connection closed while reading frame length prefix");
+            }
+            self.read_buf.extend_from_slice(&tmp[..n]);
+        }
+
+        let len = u32::from_be_bytes([
+            self.read_buf[0],
+            self.read_buf[1],
+            self.read_buf[2],
+            self.read_buf[3],
+        ]) as usize;
 
         if len < MIN_SESSION_FRAME_LEN {
             anyhow::bail!(
@@ -144,9 +168,20 @@ impl Transport for NaiveTcpTransport {
             );
         }
 
-        let mut payload = vec![0_u8; len];
-        self.stream.read_exact(&mut payload).await?;
-        Ok(SessionFrame::decode(&payload)?)
+        // Fill the buffer until we have the full frame (length prefix + payload).
+        while self.read_buf.len() < 4 + len {
+            let mut tmp = [0u8; 4096];
+            let n = self.stream.read(&mut tmp).await?;
+            if n == 0 {
+                anyhow::bail!("connection closed while reading frame payload");
+            }
+            self.read_buf.extend_from_slice(&tmp[..n]);
+        }
+
+        // Consume exactly one frame from the front of the buffer.
+        let _ = self.read_buf.split_to(4); // discard 4-byte length prefix
+        let frame_bytes = self.read_buf.split_to(len);
+        Ok(SessionFrame::decode(&frame_bytes)?)
     }
 
     fn kind(&self) -> TransportKind {

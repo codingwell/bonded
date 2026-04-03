@@ -13,6 +13,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{lookup_host, TcpSocket, TcpStream};
+use tokio_tungstenite::client_async_tls_with_config;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 #[cfg(target_os = "linux")]
 use tokio::select;
 use tokio::time::{timeout, Duration};
@@ -226,9 +228,17 @@ pub async fn establish_naive_tcp_session(config: &ClientConfig) -> anyhow::Resul
     #[cfg(unix)]
     if let Some(protect) = &config.socket_protect {
         use std::os::unix::io::AsRawFd;
-        if !protect.0(socket.as_raw_fd()) {
+        let fd = socket.as_raw_fd();
+        eprintln!("[bonded-client] Protecting NaiveTCP socket fd={}", fd);
+        if !protect.0(fd) {
+            eprintln!("[bonded-client] FAILED to protect NaiveTCP socket fd={}", fd);
             anyhow::bail!("failed to protect NaiveTCP socket from VPN capture");
         }
+        eprintln!("[bonded-client] Successfully protected NaiveTCP socket fd={}", fd);
+    }
+    #[cfg(not(unix))]
+    if config.socket_protect.is_some() {
+        eprintln!("[bonded-client] Socket protect callback configured but platform is not Unix");
     }
     let stream = socket.connect(server_addr).await?;
     authenticate_naive_tcp_stream(config, stream).await
@@ -253,9 +263,17 @@ pub async fn establish_naive_tcp_session_with_bind(
     #[cfg(unix)]
     if let Some(protect) = &config.socket_protect {
         use std::os::unix::io::AsRawFd;
-        if !protect.0(socket.as_raw_fd()) {
+        let fd = socket.as_raw_fd();
+        eprintln!("[bonded-client] Protecting NaiveTCP bind-aware socket fd={} bind_ip={}", fd, bind_ip);
+        if !protect.0(fd) {
+            eprintln!("[bonded-client] FAILED to protect NaiveTCP bind-aware socket fd={}", fd);
             anyhow::bail!("failed to protect bind-aware NaiveTCP socket from VPN capture");
         }
+        eprintln!("[bonded-client] Successfully protected NaiveTCP bind-aware socket fd={}", fd);
+    }
+    #[cfg(not(unix))]
+    if config.socket_protect.is_some() {
+        eprintln!("[bonded-client] Socket protect callback configured but platform is not Unix");
     }
     let stream = socket.connect(server_address).await?;
     authenticate_naive_tcp_stream(config, stream).await
@@ -310,7 +328,52 @@ async fn establish_websocket_session(
             format!("ws://{websocket_address}")
         };
 
-    let mut transport = WebSocketTlsTransport::connect(&websocket_url).await?;
+    let request = websocket_url.as_str().into_client_request()?;
+    let uri = request.uri();
+    let host = uri
+        .host()
+        .ok_or_else(|| anyhow::anyhow!("websocket URL is missing host: {websocket_url}"))?;
+    let scheme = uri.scheme_str().unwrap_or("ws");
+    let default_port = if scheme.eq_ignore_ascii_case("wss") {
+        443
+    } else {
+        80
+    };
+    let port = uri.port_u16().unwrap_or(default_port);
+
+    let server_addr = resolve_server_address(&format!("{host}:{port}"), None).await?;
+    let socket = match server_addr {
+        SocketAddr::V4(_) => TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => TcpSocket::new_v6()?,
+    };
+    socket.bind(local_wildcard_bind_addr_for(server_addr))?;
+    #[cfg(unix)]
+    if let Some(protect) = &config.socket_protect {
+        use std::os::unix::io::AsRawFd;
+        let fd = socket.as_raw_fd();
+        eprintln!(
+            "[bonded-client] Protecting WebSocket socket fd={} target={}://{}:{}",
+            fd,
+            scheme,
+            host,
+            port
+        );
+        if !protect.0(fd) {
+            eprintln!("[bonded-client] FAILED to protect WebSocket socket fd={}", fd);
+            anyhow::bail!("failed to protect WebSocket socket from VPN capture");
+        }
+        eprintln!("[bonded-client] Successfully protected WebSocket socket fd={}", fd);
+    }
+    #[cfg(not(unix))]
+    if config.socket_protect.is_some() {
+        eprintln!("[bonded-client] Socket protect callback configured but platform is not Unix");
+    }
+
+    let stream = socket.connect(server_addr).await?;
+    let (ws_stream, _response) =
+        client_async_tls_with_config(request, stream, None, None).await?;
+
+    let mut transport = WebSocketTlsTransport::from_client_stream(ws_stream);
     perform_websocket_auth_handshake(&mut transport, &keypair, &config.client.invite_token).await?;
     Ok(transport)
 }

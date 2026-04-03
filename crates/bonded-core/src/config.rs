@@ -12,6 +12,22 @@ pub const DEFAULT_CLIENT_CONFIG_PATH: &str = "~/.config/bonded/client.toml";
 pub const DEFAULT_CLIENT_PRIVATE_KEY_PATH: &str = "~/.local/share/bonded/device-key.pem";
 pub const DEFAULT_CLIENT_PUBLIC_KEY_PATH: &str = "~/.local/share/bonded/device-key.pub";
 
+/// Transport kind identifier for diagnostics
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportKind {
+    NaiveTcp,
+    WebSocketTls,
+}
+
+impl TransportKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TransportKind::NaiveTcp => "NaiveTCP",
+            TransportKind::WebSocketTls => "WebSocketTLS",
+        }
+    }
+}
+
 /// Callback called with a raw socket file-descriptor just before the socket
 /// connects.  On Android this is used to call `VpnService.protect(fd)` so
 /// that the tunnel session's own TCP connections bypass the VPN routing table

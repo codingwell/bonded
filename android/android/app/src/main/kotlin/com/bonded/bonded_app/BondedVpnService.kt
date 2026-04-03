@@ -4,12 +4,9 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
-import android.content.pm.ServiceInfo
 import android.content.Intent
-import android.net.ConnectivityManager
-import android.net.NetworkCapabilities
+import android.content.pm.ServiceInfo
 import android.net.VpnService
-import android.content.pm.PackageManager
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import androidx.core.app.NotificationCompat
@@ -18,19 +15,19 @@ import java.io.FileOutputStream
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.util.ArrayDeque
+import kotlin.concurrent.thread
 import org.json.JSONArray
 import org.json.JSONObject
-import kotlin.concurrent.thread
 
 data class SessionSnapshot(
-    val state: String,
-    val serverAddress: String,
-    val outboundPackets: Long,
-    val inboundPackets: Long,
-    val outboundBytes: Long,
-    val inboundBytes: Long,
-    val connectedAtMs: Long,
-    val lastError: String?,
+        val state: String,
+        val serverAddress: String,
+        val outboundPackets: Long,
+        val inboundPackets: Long,
+        val outboundBytes: Long,
+        val inboundBytes: Long,
+        val connectedAtMs: Long,
+        val lastError: String?,
 )
 
 class BondedVpnService : VpnService() {
@@ -40,29 +37,21 @@ class BondedVpnService : VpnService() {
     private var networkPathManager: AndroidNetworkPathManager? = null
     private var activeDeviceId: String? = null
 
-    @Volatile
-    private var packetIoRunning = false
+    @Volatile private var packetIoRunning = false
 
-    @Volatile
-    private var nativeProcessingAvailable = nativeLoaded
+    @Volatile private var nativeProcessingAvailable = nativeLoaded
 
-    @Volatile
-    private var nativeAvailabilityReported = false
+    @Volatile private var nativeAvailabilityReported = false
 
-    @Volatile
-    private var sessionMonitorRunning = false
+    @Volatile private var sessionMonitorRunning = false
 
-    @Volatile
-    private var sessionStartupInProgress = false
+    @Volatile private var sessionStartupInProgress = false
 
-    @Volatile
-    private var networkRebindInProgress = false
+    @Volatile private var networkRebindInProgress = false
 
-    @Volatile
-    private var sessionRecoveryInProgress = false
+    @Volatile private var sessionRecoveryInProgress = false
 
-    @Volatile
-    private var lastRecoveryAttemptMs = 0L
+    @Volatile private var lastRecoveryAttemptMs = 0L
 
     private val pendingOutboundLock = Any()
     private val pendingOutboundPackets = ArrayDeque<ByteArray>()
@@ -73,8 +62,7 @@ class BondedVpnService : VpnService() {
     // Cached across recovery attempts so native code never needs in-tunnel DNS resolution.
     private var cachedServerAddress: String? = null
 
-    @Volatile
-    private var shutdownInProgress = false
+    @Volatile private var shutdownInProgress = false
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
@@ -107,9 +95,9 @@ class BondedVpnService : VpnService() {
             try {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     startForeground(
-                        NOTIFICATION_ID,
-                        notification,
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+                            NOTIFICATION_ID,
+                            notification,
+                            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
                     )
                 } else {
                     startForeground(NOTIFICATION_ID, notification)
@@ -133,29 +121,41 @@ class BondedVpnService : VpnService() {
 
         if (vpnInterface == null) {
             try {
-                android.util.Log.d("BondedVPN", "Establishing VPN interface: address=10.8.0.2/32, mtu=1500, route=0.0.0.0/0")
-                val builder = Builder()
-                    .setSession("Bonded")
-                    .setMtu(1500)
-                    .addAddress("10.8.0.2", 32)
-                    .addRoute("0.0.0.0", 0)
-                    .addDnsServer("8.8.8.8")
-                    .addDnsServer("1.1.1.1")
+                android.util.Log.d(
+                        "BondedVPN",
+                        "Establishing VPN interface: address=10.8.0.2/32, mtu=1500, route=0.0.0.0/0"
+                )
+                val builder =
+                        Builder()
+                                .setSession("Bonded")
+                                .setMtu(1500)
+                                .addAddress("10.8.0.2", 32)
+                                .addRoute("0.0.0.0", 0)
+                                .addDnsServer("8.8.8.8")
+                                .addDnsServer("1.1.1.1")
 
                 // Keep the app process itself outside the VPN so control-plane sockets
                 // (session establishment, pairing, health probes) are never captured.
                 // This makes startup resilient even when per-socket protect(fd) fails.
-                try {
-                   // builder.addDisallowedApplication(packageName)
-                    android.util.Log.i("BondedVPN", "Added disallowed application for VPN bypass: $packageName")
-                } catch (e: PackageManager.NameNotFoundException) {
-                    android.util.Log.w("BondedVPN", "Failed to add disallowed application $packageName: ${e.message}")
-                }
+                // Don't do this. It causes problems if we want to route some traffic through the
+                // VPN
+                // try {
+                //     builder.addDisallowedApplication(packageName)
+                //     android.util.Log.i(
+                //             "BondedVPN",
+                //             "Added disallowed application for VPN bypass: $packageName"
+                //     )
+                // } catch (e: PackageManager.NameNotFoundException) {
+                //     android.util.Log.w(
+                //             "BondedVPN",
+                //             "Failed to add disallowed application $packageName: ${e.message}"
+                //     )
+                // }
 
                 vpnInterface = builder.establish()
                 if (vpnInterface == null) {
                     throw IllegalStateException(
-                        "VpnService.Builder.establish() returned null (VPN permission missing or revoked)",
+                            "VpnService.Builder.establish() returned null (VPN permission missing or revoked)",
                     )
                 }
                 android.util.Log.d("BondedVPN", "VPN interface established successfully")
@@ -170,7 +170,8 @@ class BondedVpnService : VpnService() {
             }
         }
 
-        if (!startNativeSession(pairedServer, networkPathCount, pathManager.activeBindAddresses())) {
+        if (!startNativeSession(pairedServer, networkPathCount, pathManager.activeBindAddresses())
+        ) {
             sessionStartupInProgress = false
             emitEvent("error", "Failed to start native VPN session")
             stopSelf()
@@ -182,12 +183,12 @@ class BondedVpnService : VpnService() {
         startPacketIoLoopIfNeeded()
         startSessionMonitorIfNeeded()
         emitEvent(
-            "started",
-            if (backgroundRunning) {
-                "VPN started in background"
-            } else {
-                "VPN started"
-            },
+                "started",
+                if (backgroundRunning) {
+                    "VPN started in background"
+                } else {
+                    "VPN started"
+                },
         )
         return START_STICKY
     }
@@ -212,15 +213,12 @@ class BondedVpnService : VpnService() {
         networkRebindInProgress = false
         sessionRecoveryInProgress = false
         lastRecoveryAttemptMs = 0L
-        synchronized(pendingOutboundLock) {
-            pendingOutboundPackets.clear()
-        }
+        synchronized(pendingOutboundLock) { pendingOutboundPackets.clear() }
         cachedServerAddress = null
         stopNativeSession()
         try {
             vpnInterface?.close()
-        } catch (_: Exception) {
-        }
+        } catch (_: Exception) {}
         vpnInterface = null
         activeDeviceId = null
         if (backgroundRunning) {
@@ -239,22 +237,23 @@ class BondedVpnService : VpnService() {
         }
 
         val manager = getSystemService(NotificationManager::class.java)
-        val channel = NotificationChannel(
-            NOTIFICATION_CHANNEL_ID,
-            "Bonded VPN",
-            NotificationManager.IMPORTANCE_LOW,
-        )
+        val channel =
+                NotificationChannel(
+                        NOTIFICATION_CHANNEL_ID,
+                        "Bonded VPN",
+                        NotificationManager.IMPORTANCE_LOW,
+                )
         channel.description = "Background VPN status"
         manager.createNotificationChannel(channel)
     }
 
     private fun buildForegroundNotification(): Notification {
         return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
-            .setContentTitle("Bonded VPN")
-            .setContentText("VPN is running in the background")
-            .setSmallIcon(R.mipmap.ic_launcher)
-            .setOngoing(true)
-            .build()
+                .setContentTitle("Bonded VPN")
+                .setContentText("VPN is running in the background")
+                .setSmallIcon(R.mipmap.ic_launcher)
+                .setOngoing(true)
+                .build()
     }
 
     private fun startPacketIoLoopIfNeeded() {
@@ -264,66 +263,76 @@ class BondedVpnService : VpnService() {
         }
 
         packetIoRunning = true
-        packetIoThread = thread(name = "bonded-vpn-io", start = true) {
-            val input = FileInputStream(pfd.fileDescriptor)
-            val output = FileOutputStream(pfd.fileDescriptor)
-            val buffer = ByteArray(32767)
-            var packetCounter = 0L
-            var outboundCount = 0L
-            var inboundCount = 0L
-            var totalOutboundBytes = 0L
-            var totalInboundBytes = 0L
+        packetIoThread =
+                thread(name = "bonded-vpn-io", start = true) {
+                    val input = FileInputStream(pfd.fileDescriptor)
+                    val output = FileOutputStream(pfd.fileDescriptor)
+                    val buffer = ByteArray(32767)
+                    var packetCounter = 0L
+                    var outboundCount = 0L
+                    var inboundCount = 0L
+                    var totalOutboundBytes = 0L
+                    var totalInboundBytes = 0L
 
-            android.util.Log.d("BondedVPN", "Packet I/O loop started")
-            try {
-                while (packetIoRunning) {
-                    val readBytes = input.read(buffer)
-                    if (readBytes <= 0) {
-                        continue
-                    }
+                    android.util.Log.d("BondedVPN", "Packet I/O loop started")
+                    try {
+                        while (packetIoRunning) {
+                            val readBytes = input.read(buffer)
+                            if (readBytes <= 0) {
+                                continue
+                            }
 
-                    android.util.Log.d("BondedVPN", "Read $readBytes bytes from TUN device")
-                    totalOutboundBytes += readBytes
-                    processOutboundPacket(buffer, readBytes)
-                    outboundCount++
+                            android.util.Log.d("BondedVPN", "Read $readBytes bytes from TUN device")
+                            totalOutboundBytes += readBytes
+                            processOutboundPacket(buffer, readBytes)
+                            outboundCount++
 
-                    repeat(MAX_POLLED_INBOUND_PER_CYCLE) {
-                        val inbound = pollInboundPacket()
-                        if (inbound == null || inbound.isEmpty()) {
-                            return@repeat
+                            repeat(MAX_POLLED_INBOUND_PER_CYCLE) {
+                                val inbound = pollInboundPacket()
+                                if (inbound == null || inbound.isEmpty()) {
+                                    return@repeat
+                                }
+
+                                android.util.Log.d(
+                                        "BondedVPN",
+                                        "Writing ${inbound.size} inbound bytes to TUN device"
+                                )
+                                totalInboundBytes += inbound.size
+                                output.write(inbound)
+                                output.flush()
+                                inboundCount++
+                            }
+
+                            packetCounter += 1
+                            if (packetCounter % PACKET_IO_EVENT_EVERY == 0L) {
+                                val msg =
+                                        "I/O loop: $outboundCount outbound (${totalOutboundBytes}B), $inboundCount inbound (${totalInboundBytes}B)"
+                                android.util.Log.i("BondedVPN", msg)
+                                emitEvent("packet_io", msg)
+                            }
                         }
-
-                        android.util.Log.d("BondedVPN", "Writing ${inbound.size} inbound bytes to TUN device")
-                        totalInboundBytes += inbound.size
-                        output.write(inbound)
-                        output.flush()
-                        inboundCount++
+                    } catch (e: Exception) {
+                        android.util.Log.e(
+                                "BondedVPN",
+                                "VPN packet loop exception: ${e.message}",
+                                e
+                        )
+                        if (packetIoRunning) {
+                            emitEvent("error", "VPN packet loop stopped: ${e.message}")
+                        }
+                    } finally {
+                        android.util.Log.d(
+                                "BondedVPN",
+                                "Packet I/O loop stopped. Final: $outboundCount outbound, $inboundCount inbound"
+                        )
+                        try {
+                            input.close()
+                        } catch (_: Exception) {}
+                        try {
+                            output.close()
+                        } catch (_: Exception) {}
                     }
-
-                    packetCounter += 1
-                    if (packetCounter % PACKET_IO_EVENT_EVERY == 0L) {
-                        val msg = "I/O loop: $outboundCount outbound (${totalOutboundBytes}B), $inboundCount inbound (${totalInboundBytes}B)"
-                        android.util.Log.i("BondedVPN", msg)
-                        emitEvent("packet_io", msg)
-                    }
                 }
-            } catch (e: Exception) {
-                android.util.Log.e("BondedVPN", "VPN packet loop exception: ${e.message}", e)
-                if (packetIoRunning) {
-                    emitEvent("error", "VPN packet loop stopped: ${e.message}")
-                }
-            } finally {
-                android.util.Log.d("BondedVPN", "Packet I/O loop stopped. Final: $outboundCount outbound, $inboundCount inbound")
-                try {
-                    input.close()
-                } catch (_: Exception) {
-                }
-                try {
-                    output.close()
-                } catch (_: Exception) {
-                }
-            }
-        }
     }
 
     private fun stopPacketIoLoop() {
@@ -338,28 +347,29 @@ class BondedVpnService : VpnService() {
         }
 
         sessionMonitorRunning = true
-        sessionMonitorThread = thread(name = "bonded-session-monitor", start = true) {
-            var monitorTick = 0L
-            while (sessionMonitorRunning) {
-                val snapshot = getNativeSessionSnapshot()
-                if (snapshot != null) {
-                    updateSessionSnapshot(snapshot)
-                    monitorTick += 1
-                    if (monitorTick % 5L == 0L) {
-                        android.util.Log.i(
-                            "BondedVPN",
-                            "Native snapshot: state=${snapshot.state}, outbound=${snapshot.outboundPackets}/${snapshot.outboundBytes}B, inbound=${snapshot.inboundPackets}/${snapshot.inboundBytes}B, lastError=${snapshot.lastError}",
-                        )
+        sessionMonitorThread =
+                thread(name = "bonded-session-monitor", start = true) {
+                    var monitorTick = 0L
+                    while (sessionMonitorRunning) {
+                        val snapshot = getNativeSessionSnapshot()
+                        if (snapshot != null) {
+                            updateSessionSnapshot(snapshot)
+                            monitorTick += 1
+                            if (monitorTick % 5L == 0L) {
+                                android.util.Log.i(
+                                        "BondedVPN",
+                                        "Native snapshot: state=${snapshot.state}, outbound=${snapshot.outboundPackets}/${snapshot.outboundBytes}B, inbound=${snapshot.inboundPackets}/${snapshot.inboundBytes}B, lastError=${snapshot.lastError}",
+                                )
+                            }
+                        }
+
+                        try {
+                            Thread.sleep(1000)
+                        } catch (_: InterruptedException) {
+                            return@thread
+                        }
                     }
                 }
-
-                try {
-                    Thread.sleep(1000)
-                } catch (_: InterruptedException) {
-                    return@thread
-                }
-            }
-        }
     }
 
     private fun stopSessionMonitor() {
@@ -385,14 +395,15 @@ class BondedVpnService : VpnService() {
         return try {
             val json = JSONObject(raw)
             SessionSnapshot(
-                state = json.optString("state", "unknown"),
-                serverAddress = json.optString("serverAddress", ""),
-                outboundPackets = json.optLong("outboundPackets", 0),
-                inboundPackets = json.optLong("inboundPackets", 0),
-                outboundBytes = json.optLong("outboundBytes", 0),
-                inboundBytes = json.optLong("inboundBytes", 0),
-                connectedAtMs = json.optLong("connectedAtMs", 0),
-                lastError = json.optString("lastError").takeIf { it.isNotBlank() && it != "null" },
+                    state = json.optString("state", "unknown"),
+                    serverAddress = json.optString("serverAddress", ""),
+                    outboundPackets = json.optLong("outboundPackets", 0),
+                    inboundPackets = json.optLong("inboundPackets", 0),
+                    outboundBytes = json.optLong("outboundBytes", 0),
+                    inboundBytes = json.optLong("inboundBytes", 0),
+                    connectedAtMs = json.optLong("connectedAtMs", 0),
+                    lastError =
+                            json.optString("lastError").takeIf { it.isNotBlank() && it != "null" },
             )
         } catch (_: Exception) {
             null
@@ -445,8 +456,8 @@ class BondedVpnService : VpnService() {
         lastRecoveryAttemptMs = nowMs
         thread(name = "bonded-session-recovery", start = true) {
             android.util.Log.w(
-                "BondedVPN",
-                "Attempting native session recovery after error: ${lastError ?: "unknown"}",
+                    "BondedVPN",
+                    "Attempting native session recovery after error: ${lastError ?: "unknown"}",
             )
 
             stopNativeSession()
@@ -476,18 +487,24 @@ class BondedVpnService : VpnService() {
 
         try {
             flushPendingOutboundPackets(MAX_PENDING_FLUSH_PER_CYCLE)
-            android.util.Log.d("BondedVPN", "Sending $length bytes to native layer (packet type: ${describePacket(packet)})")
+            android.util.Log.d(
+                    "BondedVPN",
+                    "Sending $length bytes to native layer (packet type: ${describePacket(packet)})"
+            )
             val queued = tryQueueOutboundPacket(packet)
             if (!queued) {
                 enqueuePendingOutboundPacket(packet)
                 android.util.Log.w(
-                    "BondedVPN",
-                    "Native queue unavailable; buffered outbound packet (packet type: ${describePacket(packet)}, pending=${pendingOutboundSize()})",
+                        "BondedVPN",
+                        "Native queue unavailable; buffered outbound packet (packet type: ${describePacket(packet)}, pending=${pendingOutboundSize()})",
                 )
             }
         } catch (_: UnsatisfiedLinkError) {
             nativeProcessingAvailable = false
-            android.util.Log.e("BondedVPN", "Native packet symbols unavailable; packets are dropped")
+            android.util.Log.e(
+                    "BondedVPN",
+                    "Native packet symbols unavailable; packets are dropped"
+            )
             emitEvent("packet_io", "Native packet symbols unavailable; packets are dropped")
         } catch (e: Exception) {
             android.util.Log.e("BondedVPN", "Native packet processing failed: ${e.message}", e)
@@ -503,7 +520,10 @@ class BondedVpnService : VpnService() {
         return try {
             val packet = nativePollTunInbound()
             if (packet != null && packet.isNotEmpty()) {
-                android.util.Log.d("BondedVPN", "Received ${packet.size} bytes from native layer (packet type: ${describePacket(packet)})")
+                android.util.Log.d(
+                        "BondedVPN",
+                        "Received ${packet.size} bytes from native layer (packet type: ${describePacket(packet)})"
+                )
             }
             packet
         } catch (_: UnsatisfiedLinkError) {
@@ -525,8 +545,10 @@ class BondedVpnService : VpnService() {
         val version = (packet[0].toInt() shr 4) and 0x0F
         if (version == 4 && packet.size >= 20) {
             val protocol = packet[9].toInt() and 0xFF
-            val src = "${packet[12].toInt() and 0xFF}.${packet[13].toInt() and 0xFF}.${packet[14].toInt() and 0xFF}.${packet[15].toInt() and 0xFF}"
-            val dst = "${packet[16].toInt() and 0xFF}.${packet[17].toInt() and 0xFF}.${packet[18].toInt() and 0xFF}.${packet[19].toInt() and 0xFF}"
+            val src =
+                    "${packet[12].toInt() and 0xFF}.${packet[13].toInt() and 0xFF}.${packet[14].toInt() and 0xFF}.${packet[15].toInt() and 0xFF}"
+            val dst =
+                    "${packet[16].toInt() and 0xFF}.${packet[17].toInt() and 0xFF}.${packet[18].toInt() and 0xFF}.${packet[19].toInt() and 0xFF}"
             return "IPv4(proto=$protocol,$src->$dst)"
         } else if (version == 6) {
             return "IPv6"
@@ -542,11 +564,11 @@ class BondedVpnService : VpnService() {
     private external fun nativeGetSessionSnapshot(): String?
 
     private external fun nativeStartSession(
-        serverAddress: String,
-        protocolCsv: String,
-        pathCount: Int,
-        bindAddressesJson: String,
-        storageDir: String,
+            serverAddress: String,
+            protocolCsv: String,
+            pathCount: Int,
+            bindAddressesJson: String,
+            storageDir: String,
     ): Boolean
 
     private external fun nativeStopSession()
@@ -574,58 +596,85 @@ class BondedVpnService : VpnService() {
             return rawAddress
         }
         return try {
-            android.util.Log.d("BondedVPN", "Attempting DNS resolution for host: $host (this may take a moment)")
+            android.util.Log.d(
+                    "BondedVPN",
+                    "Attempting DNS resolution for host: $host (this may take a moment)"
+            )
             // Run DNS lookup on a background thread to avoid ANR and ensure it completes
             // even if the main thread has other work. Use a timeout to fail gracefully.
             var result = rawAddress
-            val resolved = try {
-                // Try to resolve with a short timeout
-                val futureHost = java.util.concurrent.FutureTask {
+            val resolved =
                     try {
-                        android.util.Log.d("BondedVPN", "FutureTask: calling InetAddress.getAllByName($host)")
-                        InetAddress.getAllByName(host)
+                        // Try to resolve with a short timeout
+                        val futureHost =
+                                java.util.concurrent.FutureTask {
+                                    try {
+                                        android.util.Log.d(
+                                                "BondedVPN",
+                                                "FutureTask: calling InetAddress.getAllByName($host)"
+                                        )
+                                        InetAddress.getAllByName(host)
+                                    } catch (e: Exception) {
+                                        android.util.Log.w(
+                                                "BondedVPN",
+                                                "FutureTask: InetAddress.getAllByName failed: ${e.message}"
+                                        )
+                                        throw e
+                                    }
+                                }
+                        val thread = Thread(futureHost, "bonded-dns-resolve")
+                        thread.start()
+                        try {
+                            // Wait up to 5 seconds for DNS resolution
+                            val addresses = futureHost.get(5, java.util.concurrent.TimeUnit.SECONDS)
+                            android.util.Log.d(
+                                    "BondedVPN",
+                                    "Resolved to ${addresses.size} address(es)"
+                            )
+                            addresses.forEach { addr ->
+                                android.util.Log.d(
+                                        "BondedVPN",
+                                        "  - ${addr.javaClass.simpleName}: ${addr.hostAddress}"
+                                )
+                            }
+                            addresses.filterIsInstance<Inet4Address>().firstOrNull()
+                                    ?: addresses.firstOrNull()
+                        } catch (e: java.util.concurrent.TimeoutException) {
+                            android.util.Log.w(
+                                    "BondedVPN",
+                                    "DNS resolution timed out after 5 seconds for $host"
+                            )
+                            null
+                        }
                     } catch (e: Exception) {
-                        android.util.Log.w("BondedVPN", "FutureTask: InetAddress.getAllByName failed: ${e.message}")
-                        throw e
+                        android.util.Log.w("BondedVPN", "Failed to resolve $host: ${e.message}", e)
+                        null
                     }
-                }
-                val thread = Thread(futureHost, "bonded-dns-resolve")
-                thread.start()
-                try {
-                    // Wait up to 5 seconds for DNS resolution
-                    val addresses = futureHost.get(5, java.util.concurrent.TimeUnit.SECONDS)
-                    android.util.Log.d("BondedVPN", "Resolved to ${addresses.size} address(es)")
-                    addresses.forEach { addr ->
-                        android.util.Log.d("BondedVPN", "  - ${addr.javaClass.simpleName}: ${addr.hostAddress}")
-                    }
-                    addresses.filterIsInstance<Inet4Address>().firstOrNull()
-                        ?: addresses.firstOrNull()
-                } catch (e: java.util.concurrent.TimeoutException) {
-                    android.util.Log.w("BondedVPN", "DNS resolution timed out after 5 seconds for $host")
-                    null
-                }
-            } catch (e: Exception) {
-                android.util.Log.w("BondedVPN", "Failed to resolve $host: ${e.message}", e)
-                null
-            }
 
             if (resolved != null && resolved.hostAddress != null) {
                 result = "${resolved.hostAddress}:$port"
                 android.util.Log.i("BondedVPN", "Pre-resolved $host -> $result")
             } else {
-                android.util.Log.w("BondedVPN", "Could not resolve $host, using original: $rawAddress")
+                android.util.Log.w(
+                        "BondedVPN",
+                        "Could not resolve $host, using original: $rawAddress"
+                )
             }
             result
         } catch (e: Exception) {
-            android.util.Log.e("BondedVPN", "Unexpected error in resolveServerAddressEarly: ${e.message}", e)
+            android.util.Log.e(
+                    "BondedVPN",
+                    "Unexpected error in resolveServerAddressEarly: ${e.message}",
+                    e
+            )
             rawAddress
         }
     }
 
     private fun startNativeSession(
-        server: PairedServerRecord,
-        pathCount: Int,
-        bindAddresses: List<String>,
+            server: PairedServerRecord,
+            pathCount: Int,
+            bindAddresses: List<String>,
     ): Boolean {
         return try {
             // Use the pre-resolved IP address if available so native code never needs to
@@ -634,16 +683,17 @@ class BondedVpnService : VpnService() {
             val protocolCsv = server.supportedProtocols.joinToString(",")
             val bindAddressesJson = JSONArray(bindAddresses).toString()
             android.util.Log.i(
-                "BondedVPN",
-                "Starting native session: server=$serverAddr (original: ${server.publicAddress}), protocols=$protocolCsv, pathCount=$pathCount, bindAddresses=$bindAddressesJson",
+                    "BondedVPN",
+                    "Starting native session: server=$serverAddr (original: ${server.publicAddress}), protocols=$protocolCsv, pathCount=$pathCount, bindAddresses=$bindAddressesJson",
             )
-            val started = nativeStartSession(
-                serverAddr,
-                protocolCsv,
-                pathCount,
-                bindAddressesJson,
-                filesDir.absolutePath,
-            )
+            val started =
+                    nativeStartSession(
+                            serverAddr,
+                            protocolCsv,
+                            pathCount,
+                            bindAddressesJson,
+                            filesDir.absolutePath,
+                    )
             android.util.Log.i("BondedVPN", "nativeStartSession returned: $started")
             if (started) {
                 lastNetworkBindingSignature = bindAddressesJson
@@ -677,18 +727,18 @@ class BondedVpnService : VpnService() {
     private fun flushPendingOutboundPackets(maxPackets: Int) {
         var flushed = 0
         while (flushed < maxPackets) {
-            val next = synchronized(pendingOutboundLock) {
-                if (pendingOutboundPackets.isEmpty()) {
-                    null
-                } else {
-                    pendingOutboundPackets.removeFirst()
-                }
-            } ?: return
+            val next =
+                    synchronized(pendingOutboundLock) {
+                        if (pendingOutboundPackets.isEmpty()) {
+                            null
+                        } else {
+                            pendingOutboundPackets.removeFirst()
+                        }
+                    }
+                            ?: return
 
             if (!tryQueueOutboundPacket(next)) {
-                synchronized(pendingOutboundLock) {
-                    pendingOutboundPackets.addFirst(next)
-                }
+                synchronized(pendingOutboundLock) { pendingOutboundPackets.addFirst(next) }
                 return
             }
 
@@ -697,13 +747,13 @@ class BondedVpnService : VpnService() {
     }
 
     private fun ensureNetworkPathManager(): AndroidNetworkPathManager {
-        return networkPathManager ?: AndroidNetworkPathManager(this) { count ->
-            setActiveNetworkPathCount(count)
-            emitEvent("network_paths", "Active network paths: $count")
-            handleNetworkPathChange(count)
-        }.also { manager ->
-            networkPathManager = manager
-        }
+        return networkPathManager
+                ?: AndroidNetworkPathManager(this) { count ->
+                    setActiveNetworkPathCount(count)
+                    emitEvent("network_paths", "Active network paths: $count")
+                    handleNetworkPathChange(count)
+                }
+                        .also { manager -> networkPathManager = manager }
     }
 
     private fun handleNetworkPathChange(count: Int) {
@@ -724,7 +774,10 @@ class BondedVpnService : VpnService() {
         thread(name = "bonded-network-path-restart", start = true) {
             stopNativeSession()
             if (startNativeSession(server, count, bindAddresses)) {
-                emitEvent("network_paths", "Rebound VPN session across ${bindAddresses.size.coerceAtLeast(count)} network path(s)")
+                emitEvent(
+                        "network_paths",
+                        "Rebound VPN session across ${bindAddresses.size.coerceAtLeast(count)} network path(s)"
+                )
             } else {
                 emitEvent("error", "Failed to rebind VPN session after network change")
             }
@@ -735,8 +788,7 @@ class BondedVpnService : VpnService() {
     private fun stopNativeSession() {
         try {
             nativeStopSession()
-        } catch (_: UnsatisfiedLinkError) {
-        }
+        } catch (_: UnsatisfiedLinkError) {}
     }
 
     // Called from Rust/JNI to protect socket FDs from VPN capture.
@@ -776,26 +828,22 @@ class BondedVpnService : VpnService() {
             }
         }
 
-        @Volatile
-        private var running = false
+        @Volatile private var running = false
 
-        @Volatile
-        private var backgroundRunning = false
+        @Volatile private var backgroundRunning = false
 
-        @Volatile
-        private var statusListener: ((String, String?) -> Unit)? = null
+        @Volatile private var statusListener: ((String, String?) -> Unit)? = null
 
-        @Volatile
-        private var lastSessionSnapshot: SessionSnapshot? = null
+        @Volatile private var lastSessionSnapshot: SessionSnapshot? = null
 
-        @Volatile
-        private var activeNetworkPathCount: Int = 1
+        @Volatile private var activeNetworkPathCount: Int = 1
 
         fun start(context: Context, deviceId: String, runInBackground: Boolean = false) {
-            val intent = Intent(context, BondedVpnService::class.java)
-                .setAction(ACTION_START)
-            .putExtra(EXTRA_DEVICE_ID, deviceId)
-                .putExtra(EXTRA_RUN_IN_BACKGROUND, runInBackground)
+            val intent =
+                    Intent(context, BondedVpnService::class.java)
+                            .setAction(ACTION_START)
+                            .putExtra(EXTRA_DEVICE_ID, deviceId)
+                            .putExtra(EXTRA_RUN_IN_BACKGROUND, runInBackground)
 
             if (runInBackground && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent)
@@ -808,12 +856,10 @@ class BondedVpnService : VpnService() {
             val intent = Intent(context, BondedVpnService::class.java).setAction(ACTION_STOP)
             try {
                 context.startService(intent)
-            } catch (_: Exception) {
-            }
+            } catch (_: Exception) {}
             try {
                 context.stopService(Intent(context, BondedVpnService::class.java))
-            } catch (_: Exception) {
-            }
+            } catch (_: Exception) {}
         }
 
         fun isRunning(): Boolean = running
@@ -823,15 +869,15 @@ class BondedVpnService : VpnService() {
         fun getSessionSnapshot(): Map<String, Any?>? {
             val snapshot = lastSessionSnapshot ?: return null
             return mapOf(
-                "state" to snapshot.state,
-                "serverAddress" to snapshot.serverAddress,
-                "outboundPackets" to snapshot.outboundPackets,
-                "inboundPackets" to snapshot.inboundPackets,
-                "outboundBytes" to snapshot.outboundBytes,
-                "inboundBytes" to snapshot.inboundBytes,
-                "connectedAtMs" to snapshot.connectedAtMs,
-                "lastError" to snapshot.lastError,
-                "networkPathCount" to activeNetworkPathCount,
+                    "state" to snapshot.state,
+                    "serverAddress" to snapshot.serverAddress,
+                    "outboundPackets" to snapshot.outboundPackets,
+                    "inboundPackets" to snapshot.inboundPackets,
+                    "outboundBytes" to snapshot.outboundBytes,
+                    "inboundBytes" to snapshot.inboundBytes,
+                    "connectedAtMs" to snapshot.connectedAtMs,
+                    "lastError" to snapshot.lastError,
+                    "networkPathCount" to activeNetworkPathCount,
             )
         }
 
