@@ -222,21 +222,14 @@ pub async fn establish_naive_tcp_session(config: &ClientConfig) -> anyhow::Resul
         SocketAddr::V4(_) => TcpSocket::new_v4()?,
         SocketAddr::V6(_) => TcpSocket::new_v6()?,
     };
+    socket.bind(local_wildcard_bind_addr_for(server_addr))?;
     #[cfg(unix)]
     if let Some(protect) = &config.socket_protect {
         use std::os::unix::io::AsRawFd;
         if !protect.0(socket.as_raw_fd()) {
-            #[cfg(target_os = "android")]
-            {
-                warn!(
-                    "protect(fd) returned false on Android; proceeding because app process may be disallowed from VPN capture"
-                );
-            }
-            #[cfg(not(target_os = "android"))]
             anyhow::bail!("failed to protect NaiveTCP socket from VPN capture");
         }
     }
-    socket.bind(local_wildcard_bind_addr_for(server_addr))?;
     let stream = socket.connect(server_addr).await?;
     authenticate_naive_tcp_stream(config, stream).await
 }
@@ -256,22 +249,14 @@ pub async fn establish_naive_tcp_session_with_bind(
         IpAddr::V4(_) => TcpSocket::new_v4()?,
         IpAddr::V6(_) => TcpSocket::new_v6()?,
     };
+    socket.bind(SocketAddr::new(bind_ip, 0))?;
     #[cfg(unix)]
     if let Some(protect) = &config.socket_protect {
         use std::os::unix::io::AsRawFd;
         if !protect.0(socket.as_raw_fd()) {
-            #[cfg(target_os = "android")]
-            {
-                warn!(
-                    bind_address,
-                    "protect(fd) returned false on Android for bind-aware socket; proceeding because app process may be disallowed from VPN capture"
-                );
-            }
-            #[cfg(not(target_os = "android"))]
             anyhow::bail!("failed to protect bind-aware NaiveTCP socket from VPN capture");
         }
     }
-    socket.bind(SocketAddr::new(bind_ip, 0))?;
     let stream = socket.connect(server_address).await?;
     authenticate_naive_tcp_stream(config, stream).await
 }

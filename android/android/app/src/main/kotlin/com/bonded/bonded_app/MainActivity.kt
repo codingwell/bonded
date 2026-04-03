@@ -3,6 +3,7 @@ package com.bonded.bonded_app
 import android.app.Activity
 import android.content.Intent
 import android.net.VpnService
+import android.os.Build
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
@@ -109,15 +110,29 @@ class MainActivity : FlutterActivity() {
 							result.error("invalid_args", "action is required", null)
 						} else {
 							try {
-								val intent = Intent(action).setClass(this, NetworkTestReceiver::class.java)
-								(args["host"] as? String)?.let { intent.putExtra("host", it) }
-								(args["expected_ip"] as? String)?.let { intent.putExtra("expected_ip", it) }
-								(args["url"] as? String)?.let { intent.putExtra("url", it) }
-								(args["port"] as? Int)?.let { intent.putExtra("port", it) }
-								sendBroadcast(intent)
+								val intent = Intent(this, NetworkTestForegroundService::class.java)
+									.setAction(NetworkTestForegroundService.ACTION_RUN)
+									.putExtra(NetworkTestForegroundService.EXTRA_TEST_ACTION, action)
+								(args["host"] as? String)?.let {
+									intent.putExtra(NetworkTestForegroundService.EXTRA_HOST, it)
+								}
+								(args["expected_ip"] as? String)?.let {
+									intent.putExtra(NetworkTestForegroundService.EXTRA_EXPECTED_IP, it)
+								}
+								(args["url"] as? String)?.let {
+									intent.putExtra(NetworkTestForegroundService.EXTRA_URL, it)
+								}
+								(args["port"] as? Int)?.let {
+									intent.putExtra(NetworkTestForegroundService.EXTRA_PORT, it)
+								}
+								if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+									startForegroundService(intent)
+								} else {
+									startService(intent)
+								}
 								result.success("sent")
 							} catch (e: Exception) {
-								result.error("broadcast_failed", e.message, null)
+								result.error("service_start_failed", e.message, null)
 							}
 						}
 					}

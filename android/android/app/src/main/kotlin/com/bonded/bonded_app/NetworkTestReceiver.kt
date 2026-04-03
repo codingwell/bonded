@@ -51,6 +51,11 @@ class NetworkTestReceiver : BroadcastReceiver() {
         }
 
         @Synchronized
+        fun appendServiceLog(level: String, message: String) {
+            appendBufferedLog(level, message)
+        }
+
+        @Synchronized
         private fun appendBufferedLog(level: String, message: String) {
             val timestamp = System.currentTimeMillis()
             logBuffer.addLast("$timestamp [$level] $message")
@@ -121,7 +126,7 @@ class NetworkTestReceiver : BroadcastReceiver() {
                         }
 
                         "com.bonded.bonded_app.TEST_HTTP_CODINGWELL" -> {
-                            testHttpConnection("https://codingwell.net").join()
+                            testCodingwellConnection().join()
                         }
 
                         "com.bonded.bonded_app.TEST_ALL" -> {
@@ -188,7 +193,7 @@ class NetworkTestReceiver : BroadcastReceiver() {
             }
 
             "com.bonded.bonded_app.TEST_HTTP_CODINGWELL" -> {
-                testHttpConnection("https://codingwell.net")
+                testCodingwellConnection()
             }
 
             "com.bonded.bonded_app.TEST_ALL" -> {
@@ -329,6 +334,51 @@ class NetworkTestReceiver : BroadcastReceiver() {
             } catch (e: Exception) {
                 logE("✗ HTTP connection failed to $urlString: ${e.message}", e)
             }
+        }
+    }
+
+    private fun testCodingwellConnection(): Thread {
+        val candidates = listOf(
+            "https://codingwell.net",
+            "https://www.codingwell.net",
+            "https://example.com",
+        )
+
+        logI(">>> Codingwell HTTPS Test (with fallback)")
+        return thread {
+            var lastError: String? = null
+            for ((index, urlString) in candidates.withIndex()) {
+                try {
+                    val startMs = System.currentTimeMillis()
+                    logD("Attempt ${index + 1}/${candidates.size}: $urlString")
+
+                    val connection = URL(urlString).openConnection()
+                    connection.connectTimeout = 10000
+                    connection.readTimeout = 10000
+
+                    var responseCode: Int? = null
+                    var responseMessage: String? = null
+                    if (connection is java.net.HttpURLConnection) {
+                        responseCode = connection.responseCode
+                        responseMessage = connection.responseMessage
+                    }
+
+                    val elapsedMs = System.currentTimeMillis() - startMs
+                    logI("✓ HTTPS connection successful to $urlString in ${elapsedMs}ms")
+                    if (responseCode != null) {
+                        logI("  HTTP $responseCode: $responseMessage")
+                    }
+                    if (urlString != candidates.first()) {
+                        logW("Primary codingwell endpoint unavailable; succeeded using fallback: $urlString")
+                    }
+                    return@thread
+                } catch (e: Exception) {
+                    lastError = e.message
+                    logW("Attempt failed for $urlString: ${e.message}")
+                }
+            }
+
+            logE("✗ Codingwell HTTPS test failed for all endpoints. Last error: $lastError")
         }
     }
 

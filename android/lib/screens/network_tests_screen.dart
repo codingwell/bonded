@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -124,6 +125,48 @@ class _NetworkTestsScreenState extends State<NetworkTestsScreen> {
     }
   }
 
+  Future<void> _runUiCodingwellProbe() async {
+    setState(() {
+      _running = true;
+      _lastResult = 'Running UI probe for https://codingwell.net...';
+    });
+
+    final stopwatch = Stopwatch()..start();
+    HttpClient? client;
+    try {
+      client = HttpClient();
+      client.connectionTimeout = const Duration(seconds: 10);
+
+      final request = await client.getUrl(Uri.parse('https://codingwell.net'));
+      request.followRedirects = true;
+      final response = await request.close().timeout(const Duration(seconds: 10));
+
+      await response.drain<void>();
+      stopwatch.stop();
+
+      if (!mounted) return;
+      setState(() {
+        _lastResult =
+            'UI probe success in ${stopwatch.elapsedMilliseconds}ms: '
+            'HTTP ${response.statusCode} (${response.reasonPhrase ?? 'OK'})';
+      });
+    } on Exception catch (e) {
+      stopwatch.stop();
+      if (!mounted) return;
+      setState(() {
+        _lastResult =
+            'UI probe failed in ${stopwatch.elapsedMilliseconds}ms: $e';
+      });
+    } finally {
+      client?.close(force: true);
+      if (mounted) {
+        setState(() {
+          _running = false;
+        });
+      }
+    }
+  }
+
   @override
   void dispose() {
     _logRefreshTimer?.cancel();
@@ -190,6 +233,10 @@ class _NetworkTestsScreenState extends State<NetworkTestsScreen> {
                         'com.bonded.bonded_app.TEST_HTTP_CODINGWELL',
                       ),
                 child: const Text('HTTP Codingwell'),
+              ),
+              ElevatedButton(
+                onPressed: _running ? null : _runUiCodingwellProbe,
+                child: const Text('UI Probe Codingwell'),
               ),
               OutlinedButton(
                 onPressed: _running

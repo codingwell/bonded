@@ -1,7 +1,7 @@
 # Implementation Plan — Server, Linux Client, Android Client
 
 **Status:** In Progress
-**Last Updated:** 2026-04-02 (session 16)
+**Last Updated:** 2026-04-03 (session 17)
 
 This is a living document. Update the status column and notes as work progresses.
 
@@ -428,6 +428,7 @@ Decisions made during implementation that aren't in the requirements docs.
 | Device-test workflow now gates DNS checks on explicit Android-side VPN state probe (`TEST_VPN_STATUS`) before running network diagnostics | 2026-04-02 | Avoids ambiguous results from DNS checks that run before VPN session establishment and keeps tunnel validation aligned with UDP-forwarding goals |
 | Android network diagnostics now default DNS checks to `unifi.g.codingwell.net` with optional `expected_ip` assertion and use explicit component broadcasts for deterministic receiver execution | 2026-04-02 | Ensures DNS test intent validates a concrete expected answer (`34.82.88.79`) and avoids implicit-broadcast delivery ambiguity during adb-driven validation |
 | Android VPN now disallows the app package from tunnel capture and treats `protect(fd)=false` as non-fatal on Android | 2026-04-02 | Prevents startup deadlocks when control-plane sockets would otherwise be captured by the VPN and removes brittle dependency on per-socket protect success |
+| Android launcher icon generation is managed via `flutter_launcher_icons` using workspace-root `icon.png` | 2026-04-03 | Keeps launcher assets reproducible across densities and Android adaptive-icon resources instead of hand-editing mipmap files |
 
 ---
 

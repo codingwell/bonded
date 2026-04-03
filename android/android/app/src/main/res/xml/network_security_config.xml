@@ -5,7 +5,7 @@
         <domain includeSubdomains="true">codingwell.net</domain>
     </domain-config>
     <!-- All other domains require HTTPS -->
-    <domain-config cleartextTrafficPermitted="false">
-        <domain includeSubdomains="true">.</domain>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">example.com</domain>
     </domain-config>
 </network-security-config>

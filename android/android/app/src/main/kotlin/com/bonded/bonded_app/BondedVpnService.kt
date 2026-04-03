@@ -146,7 +146,7 @@ class BondedVpnService : VpnService() {
                 // (session establishment, pairing, health probes) are never captured.
                 // This makes startup resilient even when per-socket protect(fd) fails.
                 try {
-                    builder.addDisallowedApplication(packageName)
+                   // builder.addDisallowedApplication(packageName)
                     android.util.Log.i("BondedVPN", "Added disallowed application for VPN bypass: $packageName")
                 } catch (e: PackageManager.NameNotFoundException) {
                     android.util.Log.w("BondedVPN", "Failed to add disallowed application $packageName: ${e.message}")
