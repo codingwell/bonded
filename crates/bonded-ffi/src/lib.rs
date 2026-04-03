@@ -439,31 +439,24 @@ fn start_android_session(
                                 }
 
                                 eprintln!("[bonded-ffi] Worker: received frame from transport {}", active_index);
-                                let ready = match session.ingest_inbound(frame) {
-                                    Ok(ready) => ready,
-                                    Err(err) => {
-                                        eprintln!("[bonded-ffi] Worker: failed to ingest inbound frame: {}", err);
-                                        update_snapshot(&worker_snapshot, |session_snapshot| {
-                                            session_snapshot.state = "error".to_owned();
-                                            session_snapshot.last_error = Some(err.to_string());
-                                        });
-                                        break;
-                                    }
-                                };
-
-                                if !ready.is_empty() {
-                                    let ready_len = ready.len() as u64;
-                                    let total_bytes = ready.iter().map(|f| f.payload.len() as u64).sum::<u64>();
-                                    eprintln!("[bonded-ffi] Worker: ingested {} packets, {} bytes total", ready_len, total_bytes);
-                                    let mut queue = worker_inbound_queue
+                                // Deliver the response payload immediately without reordering.
+                                // At the raw-IP VPN layer the Android kernel handles its own
+                                // TCP reordering; forcing in-order delivery here causes inbound
+                                // to stall whenever the server drops a response (e.g. UDP timeout).
+                                if !frame.payload.is_empty() {
+                                    let payload = frame.payload.to_vec();
+                                    let payload_len = payload.len() as u64;
+                                    eprintln!(
+                                        "[bonded-ffi] Worker: queuing {} byte inbound packet (seq={})",
+                                        payload_len, frame.header.sequence
+                                    );
+                                    worker_inbound_queue
                                         .lock()
-                                        .expect("android inbound queue lock poisoned");
-                                    for packet in ready {
-                                        queue.push_back(packet.payload.to_vec());
-                                    }
+                                        .expect("android inbound queue lock poisoned")
+                                        .push_back(payload);
                                     update_snapshot(&worker_snapshot, |session_snapshot| {
-                                        session_snapshot.inbound_packets = session_snapshot.inbound_packets.saturating_add(ready_len);
-                                        session_snapshot.inbound_bytes = session_snapshot.inbound_bytes.saturating_add(total_bytes);
+                                        session_snapshot.inbound_packets = session_snapshot.inbound_packets.saturating_add(1);
+                                        session_snapshot.inbound_bytes = session_snapshot.inbound_bytes.saturating_add(payload_len);
                                     });
                                 }
                             }
