@@ -33,6 +33,7 @@ data class SessionSnapshot(
 class BondedVpnService : VpnService() {
     private var vpnInterface: ParcelFileDescriptor? = null
     private var packetIoThread: Thread? = null
+    private var inboundDrainThread: Thread? = null
     private var sessionMonitorThread: Thread? = null
     private var networkPathManager: AndroidNetworkPathManager? = null
     private var activeDeviceId: String? = null
@@ -263,18 +264,16 @@ class BondedVpnService : VpnService() {
         }
 
         packetIoRunning = true
-        packetIoThread =
-                thread(name = "bonded-vpn-io", start = true) {
-                    val input = FileInputStream(pfd.fileDescriptor)
-                    val output = FileOutputStream(pfd.fileDescriptor)
-                    val buffer = ByteArray(32767)
-                    var packetCounter = 0L
-                    var outboundCount = 0L
-                    var inboundCount = 0L
-                    var totalOutboundBytes = 0L
-                    var totalInboundBytes = 0L
 
-                    android.util.Log.d("BondedVPN", "Packet I/O loop started")
+        // Outbound thread: reads raw IP packets from TUN and hands them to native.
+        packetIoThread =
+                thread(name = "bonded-vpn-outbound", start = true) {
+                    val input = FileInputStream(pfd.fileDescriptor)
+                    val buffer = ByteArray(32767)
+                    var outboundCount = 0L
+                    var totalOutboundBytes = 0L
+
+                    android.util.Log.d("BondedVPN", "Outbound packet loop started")
                     try {
                         while (packetIoRunning) {
                             val readBytes = input.read(buffer)
@@ -287,6 +286,46 @@ class BondedVpnService : VpnService() {
                             processOutboundPacket(buffer, readBytes)
                             outboundCount++
 
+                            if (outboundCount % PACKET_IO_EVENT_EVERY == 0L) {
+                                android.util.Log.i(
+                                        "BondedVPN",
+                                        "Outbound loop: $outboundCount packets (${totalOutboundBytes}B)"
+                                )
+                            }
+                        }
+                    } catch (e: Exception) {
+                        android.util.Log.e(
+                                "BondedVPN",
+                                "VPN outbound loop exception: ${e.message}",
+                                e
+                        )
+                        if (packetIoRunning) {
+                            emitEvent("error", "VPN outbound loop stopped: ${e.message}")
+                        }
+                    } finally {
+                        android.util.Log.d(
+                                "BondedVPN",
+                                "Outbound loop stopped. Total: $outboundCount packets"
+                        )
+                        try {
+                            input.close()
+                        } catch (_: Exception) {}
+                    }
+                }
+
+        // Inbound drain thread: continuously polls native for server responses and writes
+        // them back to TUN.  Runs independently so responses are delivered immediately
+        // rather than only when a new outbound packet unblocks input.read().
+        inboundDrainThread =
+                thread(name = "bonded-vpn-inbound", start = true) {
+                    val output = FileOutputStream(pfd.fileDescriptor)
+                    var inboundCount = 0L
+                    var totalInboundBytes = 0L
+
+                    android.util.Log.d("BondedVPN", "Inbound drain loop started")
+                    try {
+                        while (packetIoRunning) {
+                            var drained = 0
                             repeat(MAX_POLLED_INBOUND_PER_CYCLE) {
                                 val inbound = pollInboundPacket()
                                 if (inbound == null || inbound.isEmpty()) {
@@ -301,33 +340,37 @@ class BondedVpnService : VpnService() {
                                 output.write(inbound)
                                 output.flush()
                                 inboundCount++
+                                drained++
                             }
 
-                            packetCounter += 1
-                            if (packetCounter % PACKET_IO_EVENT_EVERY == 0L) {
-                                val msg =
-                                        "I/O loop: $outboundCount outbound (${totalOutboundBytes}B), $inboundCount inbound (${totalInboundBytes}B)"
-                                android.util.Log.i("BondedVPN", msg)
-                                emitEvent("packet_io", msg)
+                            // If nothing was available, sleep briefly to avoid busy-spinning.
+                            if (drained == 0) {
+                                Thread.sleep(5)
+                            }
+
+                            if (inboundCount > 0 && inboundCount % PACKET_IO_EVENT_EVERY == 0L) {
+                                android.util.Log.i(
+                                        "BondedVPN",
+                                        "Inbound drain: $inboundCount packets (${totalInboundBytes}B)"
+                                )
                             }
                         }
+                    } catch (_: InterruptedException) {
+                        // Normal shutdown signal.
                     } catch (e: Exception) {
                         android.util.Log.e(
                                 "BondedVPN",
-                                "VPN packet loop exception: ${e.message}",
+                                "VPN inbound drain exception: ${e.message}",
                                 e
                         )
                         if (packetIoRunning) {
-                            emitEvent("error", "VPN packet loop stopped: ${e.message}")
+                            emitEvent("error", "VPN inbound drain stopped: ${e.message}")
                         }
                     } finally {
                         android.util.Log.d(
                                 "BondedVPN",
-                                "Packet I/O loop stopped. Final: $outboundCount outbound, $inboundCount inbound"
+                                "Inbound drain loop stopped. Total: $inboundCount packets"
                         )
-                        try {
-                            input.close()
-                        } catch (_: Exception) {}
                         try {
                             output.close()
                         } catch (_: Exception) {}
@@ -339,6 +382,8 @@ class BondedVpnService : VpnService() {
         packetIoRunning = false
         packetIoThread?.interrupt()
         packetIoThread = null
+        inboundDrainThread?.interrupt()
+        inboundDrainThread = null
     }
 
     private fun startSessionMonitorIfNeeded() {

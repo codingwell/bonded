@@ -173,14 +173,13 @@ class _DashboardScreenState extends State<DashboardScreen> {
     final isConnected = _vpnStatus == 'Connected';
     final isConnecting = _vpnStatus == 'Connecting';
     final isError = _vpnStatus == 'Error';
-    final statusColor =
-        isConnected
-            ? Colors.green
-            : isConnecting
-            ? Colors.orange
-            : isError
-            ? Colors.red
-            : Colors.grey;
+    final statusColor = isConnected
+        ? Colors.green
+        : isConnecting
+        ? Colors.orange
+        : isError
+        ? Colors.red
+        : Colors.grey;
 
     return Scaffold(
       appBar: AppBar(
@@ -240,8 +239,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     ),
                     const SizedBox(height: 16),
                     OutlinedButton.icon(
-                      onPressed:
-                          () => Navigator.of(context).pushNamed('/client-logs'),
+                      onPressed: () =>
+                          Navigator.of(context).pushNamed('/client-logs'),
                       icon: const Icon(Icons.article_outlined),
                       label: const Text('View Client Logs'),
                     ),
@@ -440,20 +439,16 @@ class _ConnectButton extends StatelessWidget {
         padding: const EdgeInsets.symmetric(horizontal: 48, vertical: 18),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(32)),
       ),
-      icon:
-          isConnecting
-              ? const SizedBox(
-                width: 18,
-                height: 18,
-                child: CircularProgressIndicator(
-                  strokeWidth: 2,
-                  color: Colors.white,
-                ),
-              )
-              : Icon(
-                isConnected ? Icons.stop_circle : Icons.play_circle,
-                size: 22,
+      icon: isConnecting
+          ? const SizedBox(
+              width: 18,
+              height: 18,
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                color: Colors.white,
               ),
+            )
+          : Icon(isConnected ? Icons.stop_circle : Icons.play_circle, size: 22),
       label: Text(
         isConnected ? 'Disconnect' : 'Connect',
         style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w600),

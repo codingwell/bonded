@@ -233,7 +233,7 @@ async fn run_websocket_server(
                         );
                         match transport.recv().await {
                             Ok(frame) => {
-                                debug!(
+                                info!(
                                     peer = %peer,
                                     session_id = handle.session_id,
                                     connection_id = frame.header.connection_id,
@@ -295,7 +295,7 @@ async fn run_websocket_server(
                                 };
 
                                 let Some(response) = response else {
-                                    debug!(
+                                    info!(
                                         peer = %peer,
                                         session_id = handle.session_id,
                                         "websocket frame forwarding returned no response (timeout or no upstream)"
@@ -303,7 +303,7 @@ async fn run_websocket_server(
                                     continue;
                                 };
 
-                                debug!(
+                                info!(
                                     peer = %peer,
                                     session_id = handle.session_id,
                                     connection_id = response.header.connection_id,
@@ -444,7 +444,7 @@ async fn run_server(
                         );
                         match transport.recv().await {
                             Ok(frame) => {
-                                debug!(
+                                info!(
                                     peer = %peer,
                                     session_id = handle.session_id,
                                     connection_id = frame.header.connection_id,
@@ -506,7 +506,7 @@ async fn run_server(
                                 };
 
                                 let Some(response) = response else {
-                                    debug!(
+                                    info!(
                                         peer = %peer,
                                         session_id = handle.session_id,
                                         "frame forwarding returned no response (timeout or no upstream)"
@@ -514,7 +514,7 @@ async fn run_server(
                                     continue;
                                 };
 
-                                debug!(
+                                info!(
                                     peer = %peer,
                                     session_id = handle.session_id,
                                     connection_id = response.header.connection_id,

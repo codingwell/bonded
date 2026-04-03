@@ -13,11 +13,11 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{lookup_host, TcpSocket, TcpStream};
-use tokio_tungstenite::client_async_tls_with_config;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 #[cfg(target_os = "linux")]
 use tokio::select;
 use tokio::time::{timeout, Duration};
+use tokio_tungstenite::client_async_tls_with_config;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tracing::{info, warn};
 #[cfg(target_os = "linux")]
 use tun::Configuration;
@@ -231,10 +231,16 @@ pub async fn establish_naive_tcp_session(config: &ClientConfig) -> anyhow::Resul
         let fd = socket.as_raw_fd();
         eprintln!("[bonded-client] Protecting NaiveTCP socket fd={}", fd);
         if !protect.0(fd) {
-            eprintln!("[bonded-client] FAILED to protect NaiveTCP socket fd={}", fd);
+            eprintln!(
+                "[bonded-client] FAILED to protect NaiveTCP socket fd={}",
+                fd
+            );
             anyhow::bail!("failed to protect NaiveTCP socket from VPN capture");
         }
-        eprintln!("[bonded-client] Successfully protected NaiveTCP socket fd={}", fd);
+        eprintln!(
+            "[bonded-client] Successfully protected NaiveTCP socket fd={}",
+            fd
+        );
     }
     #[cfg(not(unix))]
     if config.socket_protect.is_some() {
@@ -264,12 +270,21 @@ pub async fn establish_naive_tcp_session_with_bind(
     if let Some(protect) = &config.socket_protect {
         use std::os::unix::io::AsRawFd;
         let fd = socket.as_raw_fd();
-        eprintln!("[bonded-client] Protecting NaiveTCP bind-aware socket fd={} bind_ip={}", fd, bind_ip);
+        eprintln!(
+            "[bonded-client] Protecting NaiveTCP bind-aware socket fd={} bind_ip={}",
+            fd, bind_ip
+        );
         if !protect.0(fd) {
-            eprintln!("[bonded-client] FAILED to protect NaiveTCP bind-aware socket fd={}", fd);
+            eprintln!(
+                "[bonded-client] FAILED to protect NaiveTCP bind-aware socket fd={}",
+                fd
+            );
             anyhow::bail!("failed to protect bind-aware NaiveTCP socket from VPN capture");
         }
-        eprintln!("[bonded-client] Successfully protected NaiveTCP bind-aware socket fd={}", fd);
+        eprintln!(
+            "[bonded-client] Successfully protected NaiveTCP bind-aware socket fd={}",
+            fd
+        );
     }
     #[cfg(not(unix))]
     if config.socket_protect.is_some() {
@@ -353,16 +368,19 @@ async fn establish_websocket_session(
         let fd = socket.as_raw_fd();
         eprintln!(
             "[bonded-client] Protecting WebSocket socket fd={} target={}://{}:{}",
-            fd,
-            scheme,
-            host,
-            port
+            fd, scheme, host, port
         );
         if !protect.0(fd) {
-            eprintln!("[bonded-client] FAILED to protect WebSocket socket fd={}", fd);
+            eprintln!(
+                "[bonded-client] FAILED to protect WebSocket socket fd={}",
+                fd
+            );
             anyhow::bail!("failed to protect WebSocket socket from VPN capture");
         }
-        eprintln!("[bonded-client] Successfully protected WebSocket socket fd={}", fd);
+        eprintln!(
+            "[bonded-client] Successfully protected WebSocket socket fd={}",
+            fd
+        );
     }
     #[cfg(not(unix))]
     if config.socket_protect.is_some() {
@@ -370,8 +388,7 @@ async fn establish_websocket_session(
     }
 
     let stream = socket.connect(server_addr).await?;
-    let (ws_stream, _response) =
-        client_async_tls_with_config(request, stream, None, None).await?;
+    let (ws_stream, _response) = client_async_tls_with_config(request, stream, None, None).await?;
 
     let mut transport = WebSocketTlsTransport::from_client_stream(ws_stream);
     perform_websocket_auth_handshake(&mut transport, &keypair, &config.client.invite_token).await?;

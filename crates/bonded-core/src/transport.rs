@@ -47,11 +47,17 @@ pub struct WebSocketTlsTransport {
 impl NaiveTcpTransport {
     pub async fn connect(address: &str) -> anyhow::Result<Self> {
         let stream = TcpStream::connect(address).await?;
-        Ok(Self { stream, read_buf: BytesMut::new() })
+        Ok(Self {
+            stream,
+            read_buf: BytesMut::new(),
+        })
     }
 
     pub fn from_stream(stream: TcpStream) -> Self {
-        Self { stream, read_buf: BytesMut::new() }
+        Self {
+            stream,
+            read_buf: BytesMut::new(),
+        }
     }
 }
 

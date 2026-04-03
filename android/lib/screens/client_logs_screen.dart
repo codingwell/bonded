@@ -96,9 +96,9 @@ class _ClientLogsScreenState extends State<ClientLogsScreen> {
     if (!mounted) {
       return;
     }
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Logs copied to clipboard')),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('Logs copied to clipboard')));
   }
 
   @override
@@ -129,15 +129,11 @@ class _ClientLogsScreenState extends State<ClientLogsScreen> {
               _startAutoRefresh();
             },
           ),
-          if (_loading)
-            const LinearProgressIndicator(minHeight: 2),
+          if (_loading) const LinearProgressIndicator(minHeight: 2),
           if (_error != null)
             Padding(
               padding: const EdgeInsets.all(12),
-              child: Text(
-                _error!,
-                style: const TextStyle(color: Colors.red),
-              ),
+              child: Text(_error!, style: const TextStyle(color: Colors.red)),
             ),
           Expanded(
             child: _logs.isEmpty
