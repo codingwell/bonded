@@ -3,6 +3,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::{timeout, Duration};
+use tracing::debug;
 
 #[derive(Debug, Clone)]
 struct Ipv4UdpPacket {
@@ -19,18 +20,61 @@ pub async fn forward_frame(
     upstream_tcp_target: Option<&str>,
 ) -> anyhow::Result<Option<SessionFrame>> {
     if let Some(udp_packet) = parse_ipv4_udp_packet(&frame.payload) {
+        debug!(
+            src_ip = %udp_packet.src_ip,
+            dst_ip = %udp_packet.dst_ip,
+            src_port = udp_packet.src_port,
+            dst_port = udp_packet.dst_port,
+            payload_size = udp_packet.payload.len(),
+            "UDP packet forwarding outbound"
+        );
+
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        let bound_addr = socket.local_addr()?;
+        debug!(
+            src_ip = %udp_packet.src_ip,
+            dst_ip = %udp_packet.dst_ip,
+            src_port = udp_packet.src_port,
+            dst_port = udp_packet.dst_port,
+            bound_addr = %bound_addr,
+            "UDP socket bound for forwarding"
+        );
+
         let target = SocketAddrV4::new(udp_packet.dst_ip, udp_packet.dst_port);
         socket.send_to(&udp_packet.payload, target).await?;
+        debug!(
+            dst_ip = %udp_packet.dst_ip,
+            dst_port = udp_packet.dst_port,
+            payload_size = udp_packet.payload.len(),
+            "UDP packet sent to target"
+        );
 
         let mut response = vec![0_u8; 65535];
         let read_size = match timeout(Duration::from_millis(1200), socket.recv(&mut response)).await
         {
             Ok(result) => result?,
-            Err(_) => return Ok(None),
+            Err(_) => {
+                debug!(
+                    src_ip = %udp_packet.src_ip,
+                    dst_ip = %udp_packet.dst_ip,
+                    src_port = udp_packet.src_port,
+                    dst_port = udp_packet.dst_port,
+                    "UDP response timeout (1200ms) - no response received"
+                );
+                return Ok(None);
+            }
         };
 
         response.truncate(read_size);
+        debug!(
+            src_ip = %udp_packet.src_ip,
+            dst_ip = %udp_packet.dst_ip,
+            src_port = udp_packet.src_port,
+            dst_port = udp_packet.dst_port,
+            response_size = read_size,
+            "UDP response received from target"
+        );
+
         let response_packet = build_ipv4_udp_packet(
             udp_packet.dst_ip,
             udp_packet.src_ip,
@@ -39,6 +83,14 @@ pub async fn forward_frame(
             udp_packet.identification,
             &response,
         )?;
+        debug!(
+            src_ip = %udp_packet.dst_ip,
+            dst_ip = %udp_packet.src_ip,
+            src_port = udp_packet.dst_port,
+            dst_port = udp_packet.src_port,
+            response_packet_size = response_packet.len(),
+            "UDP response packet built for client"
+        );
         return Ok(Some(SessionFrame {
             header: frame.header,
             payload: response_packet.into(),
@@ -46,9 +98,21 @@ pub async fn forward_frame(
     }
 
     if let Some(target) = upstream_tcp_target.filter(|value| !value.trim().is_empty()) {
+        debug!(
+            target = %target,
+            payload_size = frame.payload.len(),
+            "TCP payload forwarding to upstream"
+        );
         let mut upstream = TcpStream::connect(target).await?;
+        debug!(target = %target, "upstream TCP connection established");
+
         upstream.write_all(&frame.payload).await?;
         upstream.flush().await?;
+        debug!(
+            target = %target,
+            payload_size = frame.payload.len(),
+            "TCP payload sent to upstream"
+        );
 
         let mut response = vec![0_u8; 8192];
         let read_size = timeout(Duration::from_millis(500), upstream.read(&mut response))
@@ -56,11 +120,18 @@ pub async fn forward_frame(
             .unwrap_or(Ok(0))?;
 
         if read_size > 0 {
+            debug!(
+                target = %target,
+                response_size = read_size,
+                "TCP response received from upstream"
+            );
             response.truncate(read_size);
             return Ok(Some(SessionFrame {
                 header: frame.header,
                 payload: response.into(),
             }));
+        } else {
+            debug!(target = %target, "TCP response timeout (500ms) - no response received");
         }
     }
 

@@ -27,7 +27,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
-use tracing::{error, info, warn, Level};
+use tracing::{debug, error, info, warn, Level};
 
 #[derive(Debug, Parser)]
 #[command(name = "bonded-server")]
@@ -221,6 +221,15 @@ async fn run_websocket_server(
                     loop {
                         match transport.recv().await {
                             Ok(frame) => {
+                                debug!(
+                                    peer = %peer,
+                                    session_id = handle.session_id,
+                                    connection_id = frame.header.connection_id,
+                                    frame_size = frame.payload.len(),
+                                    sequence = frame.header.sequence,
+                                    "websocket frame received from client"
+                                );
+
                                 let response = match forward_frame(
                                     frame,
                                     if upstream_tcp_target.is_empty() {
@@ -245,8 +254,21 @@ async fn run_websocket_server(
                                 };
 
                                 let Some(response) = response else {
+                                    debug!(
+                                        peer = %peer,
+                                        session_id = handle.session_id,
+                                        "websocket frame forwarding returned no response (timeout or no upstream)"
+                                    );
                                     continue;
                                 };
+
+                                debug!(
+                                    peer = %peer,
+                                    session_id = handle.session_id,
+                                    connection_id = response.header.connection_id,
+                                    response_size = response.payload.len(),
+                                    "websocket response frame sending to client"
+                                );
 
                                 if let Err(err) = transport.send(response).await {
                                     warn!(
@@ -371,6 +393,15 @@ async fn run_server(
                     loop {
                         match transport.recv().await {
                             Ok(frame) => {
+                                debug!(
+                                    peer = %peer,
+                                    session_id = handle.session_id,
+                                    connection_id = frame.header.connection_id,
+                                    frame_size = frame.payload.len(),
+                                    sequence = frame.header.sequence,
+                                    "frame received from client"
+                                );
+
                                 let response = match forward_frame(
                                     frame,
                                     if upstream_tcp_target.is_empty() {
@@ -395,8 +426,21 @@ async fn run_server(
                                 };
 
                                 let Some(response) = response else {
+                                    debug!(
+                                        peer = %peer,
+                                        session_id = handle.session_id,
+                                        "frame forwarding returned no response (timeout or no upstream)"
+                                    );
                                     continue;
                                 };
+
+                                debug!(
+                                    peer = %peer,
+                                    session_id = handle.session_id,
+                                    connection_id = response.header.connection_id,
+                                    response_size = response.payload.len(),
+                                    "response frame sending to client"
+                                );
 
                                 if let Err(err) = transport.send(response).await {
                                     warn!(
