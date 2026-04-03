@@ -234,6 +234,7 @@ name = "bonded-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bonded-client",
  "bonded-core",
  "bytes",
  "clap",
