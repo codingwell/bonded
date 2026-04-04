@@ -147,6 +147,7 @@ fn android_client_config(server_address: &str, storage_dir: &str) -> ClientConfi
     config.client.device_name = "android-client".to_owned();
     config.client.server_public_address = server_address.to_owned();
     config.client.server_websocket_address = server_address.to_owned();
+    config.client.preferred_protocols = vec!["wss".to_owned(), "naive_tcp".to_owned()];
     config.client.private_key_path = storage_root
         .join("bonded-device-key.pem")
         .display()

@@ -890,7 +890,9 @@ async fn localhost_server_and_rust_client_can_run_smtp_commands_over_tcp_packets
                     .expect("QUIT response should be valid IPv4/TCP packet");
                 let quit_text = String::from_utf8_lossy(&quit_resp.payload);
                 assert!(
-                    quit_text.contains("221") || quit_text.contains("250") || quit_text.contains("220"),
+                    quit_text.contains("221")
+                        || quit_text.contains("250")
+                        || quit_text.contains("220"),
                     "expected SMTP QUIT/server response code in payload, got: {quit_text}"
                 );
 

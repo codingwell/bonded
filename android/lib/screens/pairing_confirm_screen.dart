@@ -34,7 +34,6 @@ class _PairingConfirmScreenState extends State<PairingConfirmScreen> {
         deviceId: deviceId,
         publicAddress: widget.payload.publicAddress,
         serverPublicKey: widget.payload.serverPublicKey,
-        supportedProtocols: widget.payload.supportedProtocols,
       );
 
       // Success - navigate to dashboard
@@ -81,11 +80,6 @@ class _PairingConfirmScreenState extends State<PairingConfirmScreen> {
               const SizedBox(height: 32),
               // Server details
               _buildDetailRow('Server Address', widget.payload.publicAddress),
-              const SizedBox(height: 16),
-              _buildDetailRow(
-                'Protocols',
-                widget.payload.supportedProtocols.join(', '),
-              ),
               const SizedBox(height: 16),
               _buildDetailRow(
                 'Server Key (first 16 chars)',

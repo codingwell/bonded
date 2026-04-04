@@ -211,7 +211,6 @@ pub struct PairingPayload {
     pub server_public_address: String,
     pub invite_token: String,
     pub server_public_key: String,
-    pub supported_protocols: Vec<String>,
 }
 
 pub async fn establish_naive_tcp_session(config: &ClientConfig) -> anyhow::Result<TcpStream> {
@@ -566,9 +565,6 @@ pub fn apply_pairing_payload(config: &mut ClientConfig, payload_json: &str) -> a
     config.client.server_websocket_address = config.client.server_public_address.clone();
     config.client.server_public_key = payload.server_public_key;
     config.client.invite_token = payload.invite_token;
-    if !payload.supported_protocols.is_empty() {
-        config.client.preferred_protocols = payload.supported_protocols;
-    }
     Ok(())
 }
 
@@ -757,17 +753,17 @@ mod tests {
     #[test]
     fn pairing_payload_updates_client_config() {
         let mut cfg = ClientConfig::default();
+        let original_protocols = cfg.client.preferred_protocols.clone();
         let payload = r#"{
             "server_public_address": "bonded.example.com:8080",
             "invite_token": "token-abc",
-            "server_public_key": "server-pub",
-            "supported_protocols": ["naive_tcp", "wss"]
+            "server_public_key": "server-pub"
         }"#;
 
         super::apply_pairing_payload(&mut cfg, payload).expect("payload should apply");
         assert_eq!(cfg.client.server_public_address, "bonded.example.com:8080");
         assert_eq!(cfg.client.invite_token, "token-abc");
         assert_eq!(cfg.client.server_public_key, "server-pub");
-        assert_eq!(cfg.client.preferred_protocols, vec!["naive_tcp", "wss"]);
+        assert_eq!(cfg.client.preferred_protocols, original_protocols);
     }
 }

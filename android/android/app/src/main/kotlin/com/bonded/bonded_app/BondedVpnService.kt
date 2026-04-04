@@ -725,7 +725,9 @@ class BondedVpnService : VpnService() {
             // Use the pre-resolved IP address if available so native code never needs to
             // perform DNS resolution inside an active VPN (which would route through TUN).
             val serverAddr = cachedServerAddress ?: server.publicAddress
-            val protocolCsv = server.supportedProtocols.joinToString(",")
+            // Protocols are selected at VPN startup by the native runtime; pairing metadata does
+            // not dictate transport preference.
+            val protocolCsv = ""
             val bindAddressesJson = JSONArray(bindAddresses).toString()
             android.util.Log.i(
                     "BondedVPN",

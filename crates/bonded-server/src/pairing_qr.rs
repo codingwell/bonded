@@ -9,21 +9,14 @@ pub struct PairingPayload {
     pub server_public_address: String,
     pub invite_token: String,
     pub server_public_key: String,
-    pub supported_protocols: Vec<String>,
 }
 
 pub fn emit_pairing_qr(
     public_address: &str,
     invite: &InviteToken,
     server_public_key: &str,
-    supported_protocols: &[String],
 ) -> Option<String> {
-    let payload_json = match build_pairing_payload_json(
-        public_address,
-        invite,
-        server_public_key,
-        supported_protocols,
-    ) {
+    let payload_json = match build_pairing_payload_json(public_address, invite, server_public_key) {
         Some(payload) => payload,
         None => {
             warn!("server public address not configured; skipping startup pairing QR emission");
@@ -49,7 +42,6 @@ fn build_pairing_payload_json(
     public_address: &str,
     invite: &InviteToken,
     server_public_key: &str,
-    supported_protocols: &[String],
 ) -> Option<String> {
     if public_address.trim().is_empty() {
         return None;
@@ -59,7 +51,6 @@ fn build_pairing_payload_json(
         server_public_address: public_address.to_owned(),
         invite_token: invite.token.clone(),
         server_public_key: server_public_key.to_owned(),
-        supported_protocols: supported_protocols.to_vec(),
     };
     serde_json::to_string(&payload).ok()
 }
@@ -81,7 +72,6 @@ mod tests {
             "bonded.example.com:8080",
             &invite,
             "pub-key",
-            &["naive_tcp".to_owned(), "wss".to_owned()],
         )
         .expect("payload json should build");
 
@@ -89,7 +79,6 @@ mod tests {
         assert_eq!(parsed.server_public_address, "bonded.example.com:8080");
         assert_eq!(parsed.invite_token, "token-123");
         assert_eq!(parsed.server_public_key, "pub-key");
-        assert_eq!(parsed.supported_protocols, vec!["naive_tcp", "wss"]);
     }
 
     #[test]
@@ -100,7 +89,7 @@ mod tests {
             uses_remaining: 1,
         };
 
-        let payload = build_pairing_payload_json("", &invite, "pub-key", &["naive_tcp".to_owned()]);
+        let payload = build_pairing_payload_json("", &invite, "pub-key");
         assert!(payload.is_none());
     }
 }

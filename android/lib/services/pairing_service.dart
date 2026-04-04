@@ -31,7 +31,7 @@ class PairingService {
     required String deviceId,
     required String publicAddress,
     required String serverPublicKey,
-    required List<String> supportedProtocols,
+    List<String> supportedProtocols = const [],
   }) async {
     try {
       await _channel.invokeMethod<void>('storePairedServer', {

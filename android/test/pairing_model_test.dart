@@ -3,9 +3,9 @@ import 'package:flutter_test/flutter_test.dart';
 
 void main() {
   group('ServerPairingPayload.parseQrData', () {
-    test('parses server_public_address payload from server QR JSON', () {
+    test('parses protocol-agnostic server QR payload', () {
       const qrData =
-          '{"server_public_address":"bonded.example.com:8080","invite_token":"token-123","server_public_key":"pub-key","supported_protocols":["naive_tcp"]}';
+          '{"server_public_address":"bonded.example.com:8080","invite_token":"token-123","server_public_key":"pub-key"}';
 
       final payload = ServerPairingPayload.parseQrData(qrData);
 
@@ -13,17 +13,27 @@ void main() {
       expect(payload!.publicAddress, 'bonded.example.com:8080');
       expect(payload.inviteToken, 'token-123');
       expect(payload.serverPublicKey, 'pub-key');
-      expect(payload.supportedProtocols, ['naive_tcp']);
+      expect(payload.supportedProtocols, isEmpty);
     });
 
     test('accepts legacy public_address key for compatibility', () {
       const qrData =
-          '{"public_address":"legacy.example.com:9000","invite_token":"token-legacy","server_public_key":"legacy-key","supported_protocols":["naive_tcp"]}';
+          '{"public_address":"legacy.example.com:9000","invite_token":"token-legacy","server_public_key":"legacy-key"}';
 
       final payload = ServerPairingPayload.parseQrData(qrData);
 
       expect(payload, isNotNull);
       expect(payload!.publicAddress, 'legacy.example.com:9000');
+    });
+
+    test('accepts older QR payloads that include supported_protocols', () {
+      const qrData =
+          '{"server_public_address":"bonded.example.com:8080","invite_token":"token-123","server_public_key":"pub-key","supported_protocols":["naive_tcp","wss"]}';
+
+      final payload = ServerPairingPayload.parseQrData(qrData);
+
+      expect(payload, isNotNull);
+      expect(payload!.supportedProtocols, ['naive_tcp', 'wss']);
     });
 
     test('returns null when required fields are missing', () {

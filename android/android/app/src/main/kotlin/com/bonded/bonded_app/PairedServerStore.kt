@@ -16,6 +16,10 @@ data class PairedServerRecord(
 object PairedServerStore {
     private const val PREFS_NAME = "bonded.paired_servers"
     private const val KEY_RECORDS = "records"
+    private const val LEGACY_KEY_DEVICE_ID = "deviceId"
+    private const val LEGACY_KEY_PUBLIC_ADDRESS = "publicAddress"
+    private const val LEGACY_KEY_SERVER_PUBLIC_KEY = "serverPublicKey"
+    private const val LEGACY_KEY_PAIRED_AT = "pairedAt"
 
     fun save(context: Context, record: PairedServerRecord) {
         val records = loadAll(context).filterNot { it.id == record.id }.toMutableList()
@@ -26,21 +30,19 @@ object PairedServerStore {
     fun loadAll(context: Context): List<PairedServerRecord> {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val raw = prefs.getString(KEY_RECORDS, "[]") ?: "[]"
-        val array = JSONArray(raw)
-        return buildList {
-            for (index in 0 until array.length()) {
-                val item = array.optJSONObject(index) ?: continue
-                add(
-                    PairedServerRecord(
-                        id = item.optString("id"),
-                        publicAddress = item.optString("publicAddress"),
-                        serverPublicKey = item.optString("serverPublicKey"),
-                        supportedProtocols = parseProtocols(item.optJSONArray("supportedProtocols")),
-                        pairedAt = item.optString("pairedAt", Instant.now().toString()),
-                    ),
-                )
-            }
+        val parsed = parseRecords(raw)
+        if (parsed.isNotEmpty()) {
+            return parsed
         }
+
+        // Backward-compatibility migration path for pre-array storage.
+        val legacy = parseLegacySingleRecord(prefs)
+        if (legacy != null) {
+            persist(context, listOf(legacy))
+            return listOf(legacy)
+        }
+
+        return emptyList()
     }
 
     fun findById(context: Context, id: String): PairedServerRecord? {
@@ -82,5 +84,56 @@ object PairedServerStore {
                 add(array.optString(index))
             }
         }
+    }
+
+    private fun parseRecords(raw: String): List<PairedServerRecord> {
+        val array = try {
+            JSONArray(raw)
+        } catch (_: Exception) {
+            return emptyList()
+        }
+
+        return buildList {
+            for (index in 0 until array.length()) {
+                val item = array.optJSONObject(index) ?: continue
+
+                val id = item.optString("id").trim()
+                val publicAddress = item.optString("publicAddress").trim()
+                val serverPublicKey = item.optString("serverPublicKey").trim()
+                if (id.isEmpty() || publicAddress.isEmpty() || serverPublicKey.isEmpty()) {
+                    continue
+                }
+
+                add(
+                    PairedServerRecord(
+                        id = id,
+                        publicAddress = publicAddress,
+                        serverPublicKey = serverPublicKey,
+                        supportedProtocols = parseProtocols(item.optJSONArray("supportedProtocols")),
+                        pairedAt = item.optString("pairedAt", Instant.now().toString()),
+                    ),
+                )
+            }
+        }
+    }
+
+    private fun parseLegacySingleRecord(
+        prefs: android.content.SharedPreferences
+    ): PairedServerRecord? {
+        val id = prefs.getString(LEGACY_KEY_DEVICE_ID, "")?.trim().orEmpty()
+        val publicAddress = prefs.getString(LEGACY_KEY_PUBLIC_ADDRESS, "")?.trim().orEmpty()
+        val serverPublicKey = prefs.getString(LEGACY_KEY_SERVER_PUBLIC_KEY, "")?.trim().orEmpty()
+        if (id.isEmpty() || publicAddress.isEmpty() || serverPublicKey.isEmpty()) {
+            return null
+        }
+
+        return PairedServerRecord(
+            id = id,
+            publicAddress = publicAddress,
+            serverPublicKey = serverPublicKey,
+            supportedProtocols = emptyList(),
+            pairedAt = prefs.getString(LEGACY_KEY_PAIRED_AT, Instant.now().toString())
+                ?: Instant.now().toString(),
+        )
     }
 }

@@ -341,14 +341,14 @@ Add a production transport protocol and harden.
 | 5.2 | Test WSS transport end-to-end (Linux client + server) | completed | Added TLS-enabled websocket integration test in `bonded-server` using self-signed cert trust bootstrap and authenticated framed traffic exchange over `wss://` |
 | 5.3 | Test mixed transports (one path NaiveTCP, one path WSS) | completed | Added client integration test that establishes one NaiveTCP path and one websocket path, then verifies framed traffic exchange on both |
 | 5.4 | QUIC transport (evaluate `quinn` crate) | completed | Evaluated QUIC scope and deferred implementation until WSS TLS endpoint and certificate lifecycle are stabilized; tracked as next transport hardening step |
-| 5.5 | Server advertises supported protocols in QR code | completed | Pairing QR payload already advertises configured `supported_protocols`; websocket protocol can now be included and consumed by clients |
+| 5.5 | Server advertises supported protocols in QR code | completed | Updated design: pairing QR payload now excludes protocol metadata; protocol selection happens at VPN session startup via runtime transport negotiation/fallback |
 | 5.6 | Client tries all advertised protocols per interface | completed | Client path establishment now rotates configured preferred protocols per path and falls back across protocol attempts (`naive_tcp`/`wss`) |
 
 Acceptance gate:
 
 - WSS transport functions end-to-end
 - Mixed-protocol paths work in one session
-- Supported protocols are advertised and attempted correctly
+- Supported protocols are attempted correctly at session startup
 
 ---
 
@@ -384,13 +384,13 @@ Decisions made during implementation that aren't in the requirements docs.
 | Server startup ensures at least one usable invite token exists in `invite_tokens.toml` | 2026-03-31 | Supports immediate pairing bootstrap before admin tooling exists |
 | Health check endpoint uses a minimal raw-TCP HTTP responder returning `200 OK` with body `OK` | 2026-03-31 | Keeps health probe dependency-free and easy to container-check |
 | Server session IDs are assigned from an in-memory registry keyed by authenticated client key | 2026-03-31 | Allows concurrent client session tracking before full packet-forwarding pipeline is wired |
-| Pairing QR payload is JSON containing public address, invite token, server public key, and supported protocols | 2026-03-31 | Meets CR-6a/OQ-5 metadata requirements while keeping scanner parsing straightforward |
+| Pairing QR payload is JSON containing only public address, invite token, and server public key | 2026-04-04 | Transport protocol metadata removed from pairing so clients negotiate protocols when starting VPN sessions |
 | Container runtime defaults mount config/state at `/etc/bonded` and `/var/lib/bonded` | 2026-03-31 | Aligns image behavior with documented server file conventions |
 | Server integration tests exercise full auth handshake then framed payload exchange on the same TCP stream | 2026-03-31 | Ensures session traffic can continue immediately after authentication |
 | Initial server internet-forwarding mode is payload relay to optional upstream TCP target with echo fallback | 2026-03-31 | Provides deterministic end-to-end forward/return behavior before full TUN/raw-socket integration |
 | Linux client interface enumeration uses `pnet_datalink`; TUN provisioning uses `tun` with explicit interface name | 2026-03-31 | Keeps Linux-specific plumbing isolated in shared client runtime |
 | Linux client persists private/public key material to configured paths and reuses it for reconnect auth | 2026-03-31 | Aligns runtime behavior with per-device identity requirement and avoids regenerating identity each launch |
-| Pairing payload ingestion updates client config with server endpoint/key/token and advertised protocols | 2026-03-31 | Lets Linux client bootstrap from QR payload even before full invite redemption API exists |
+| Pairing payload ingestion updates client config with server endpoint/key/token only | 2026-04-04 | Prevents stale protocol hints from pairing and keeps transport negotiation runtime-driven |
 | Linux packet loop uses `tun::create_as_async` + `tokio::select!` to bridge TUN packets and NaiveTCP session frames | 2026-03-31 | Establishes bidirectional TUN transport plumbing in a single runtime loop |
 | Linux multipath uses active-primary with failover-to-survivor strategy for first implementation | 2026-03-31 | Delivers CR-1/CR-2 behavior without introducing concurrent scheduler complexity in the initial client loop |
 | Linux failover integration tests treat first-path send closure as acceptable and assert survivor-path continuity | 2026-03-31 | Avoids flaky timing assumptions while still validating failover behavior under path loss |
@@ -428,6 +428,7 @@ Decisions made during implementation that aren't in the requirements docs.
 | Android socket-protect path now emits explicit protect(fd) success/failure diagnostics from both Kotlin and Rust layers | 2026-04-02 | JNI now calls `protectSocketForNative(fd)` (with fallback to `protect(fd)`), logging each result to distinguish true protect failures from downstream transport/auth disconnects |
 | NaiveTCP session-frame receive path now fails fast on invalid tiny frame lengths and logs exact sizes for header-underflow decode errors | 2026-04-02 | Distinguishes malformed/corrupted framed data (`len < 16`) from generic transport disconnects and makes Android/server recovery diagnostics actionable |
 | NaiveTCP auth handshake now reads newline-delimited JSON directly from TcpStream (byte-by-byte) instead of BufReader split/reunite | 2026-04-02 | Prevents buffered over-read during auth from consuming first framed session bytes, which could desynchronize length-prefix parsing and trigger `buffer too small for frame header` recovery loops |
+| Android paired-server persistence is schema-tolerant across app updates | 2026-04-04 | `PairedServerStore` now tolerates malformed/partial entries, skips invalid records, and migrates legacy single-record preference keys into the current records array to avoid apparent unpairing after upgrades |
 | Device-test workflow now gates DNS checks on explicit Android-side VPN state probe (`TEST_VPN_STATUS`) before running network diagnostics | 2026-04-02 | Avoids ambiguous results from DNS checks that run before VPN session establishment and keeps tunnel validation aligned with UDP-forwarding goals |
 | Android network diagnostics now default DNS checks to `unifi.g.codingwell.net` with optional `expected_ip` assertion and use explicit component broadcasts for deterministic receiver execution | 2026-04-02 | Ensures DNS test intent validates a concrete expected answer (`34.82.88.79`) and avoids implicit-broadcast delivery ambiguity during adb-driven validation |
 | Android VPN now disallows the app package from tunnel capture and treats `protect(fd)=false` as non-fatal on Android | 2026-04-02 | Prevents startup deadlocks when control-plane sockets would otherwise be captured by the VPN and removes brittle dependency on per-socket protect success |
