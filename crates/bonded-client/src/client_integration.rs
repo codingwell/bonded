@@ -1,6 +1,6 @@
 use crate::{
     establish_naive_tcp_session, establish_naive_tcp_session_with_bind,
-    establish_naive_tcp_sessions, establish_transport_paths,
+    establish_naive_tcp_sessions, establish_transport_paths, ClientTransport,
 };
 use bonded_core::auth::{create_auth_challenge, verify_auth_challenge, DeviceKeypair};
 use bonded_core::config::{ClientConfig, ClientSection};
@@ -380,6 +380,89 @@ async fn multipath_can_mix_websocket_and_naive_tcp() {
     assert_eq!(&echoed1.payload[..], b"websocket-path");
 
     server_task.await.expect("server task should join");
+
+    let _ = fs::remove_file(&cfg.client.private_key_path);
+    let _ = fs::remove_file(&cfg.client.public_key_path);
+}
+
+#[tokio::test]
+async fn bind_aware_path_honors_websocket_first_preference() {
+    let keypair = DeviceKeypair::generate();
+    let naive_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("naive listener should bind");
+    let ws_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("websocket listener should bind");
+    let naive_addr = naive_listener
+        .local_addr()
+        .expect("naive addr should resolve");
+    let ws_addr = ws_listener.local_addr().expect("ws addr should resolve");
+
+    let expected_public_key = keypair.public_key_b64.clone();
+    let ws_public_key = expected_public_key.clone();
+    let naive_task = tokio::spawn(async move {
+        let accepted = timeout(Duration::from_millis(500), naive_listener.accept()).await;
+        if accepted.is_err() {
+            return;
+        }
+
+        let (naive_stream, _) = accepted
+            .expect("timeout should be handled")
+            .expect("naive accept should succeed when connected");
+        let naive_stream = server_handshake(naive_stream, &expected_public_key).await;
+        let mut naive_transport = NaiveTcpTransport::from_stream(naive_stream);
+
+        // If a NaiveTCP path is selected, a frame would arrive quickly; it should not.
+        let naive_result = timeout(Duration::from_millis(300), naive_transport.recv()).await;
+        assert!(naive_result.is_err(), "naive path should remain idle");
+    });
+
+    let ws_task = tokio::spawn(async move {
+        let (ws_stream, _) = ws_listener
+            .accept()
+            .await
+            .expect("websocket accept should succeed");
+        let mut ws_transport = websocket_server_handshake(ws_stream, &ws_public_key).await;
+
+        let ws_frame = ws_transport.recv().await.expect("ws frame should arrive");
+        ws_transport
+            .send(ws_frame)
+            .await
+            .expect("ws echo should send");
+    });
+
+    let mut cfg = test_client_config(naive_addr.to_string(), &keypair);
+    cfg.client.server_websocket_address = format!("ws://{ws_addr}");
+    cfg.client.preferred_protocols = vec!["wss".to_owned(), "naive_tcp".to_owned()];
+    cfg.client.path_bind_addresses = vec!["127.0.0.2".to_owned()];
+
+    let mut paths = establish_transport_paths(&cfg, 1)
+        .await
+        .expect("path should establish with websocket preference");
+    assert_eq!(paths.len(), 1);
+    assert!(matches!(paths[0], ClientTransport::WebSocket(_)));
+
+    let frame = SessionFrame {
+        header: SessionHeader {
+            connection_id: 13,
+            sequence: 0,
+            flags: 0,
+        },
+        payload: Bytes::from_static(b"websocket-first"),
+    };
+    paths[0]
+        .send(frame)
+        .await
+        .expect("websocket send should succeed");
+    let echoed = paths[0]
+        .recv()
+        .await
+        .expect("websocket echo should arrive");
+    assert_eq!(&echoed.payload[..], b"websocket-first");
+
+    ws_task.await.expect("ws task should join");
+    naive_task.await.expect("naive task should join");
 
     let _ = fs::remove_file(&cfg.client.private_key_path);
     let _ = fs::remove_file(&cfg.client.public_key_path);

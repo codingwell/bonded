@@ -103,41 +103,41 @@ pub async fn establish_transport_paths(
     for path_index in 0..target {
         let mut last_err: Option<anyhow::Error> = None;
 
-        if let Some(bind_address) = config.client.path_bind_addresses.get(path_index) {
-            match timeout(
-                PATH_ESTABLISH_TIMEOUT,
-                establish_naive_tcp_session_with_bind(config, bind_address),
-            )
-            .await
-            {
-                Ok(Ok(stream)) => {
-                    paths.push(ClientTransport::NaiveTcp(NaiveTcpTransport::from_stream(
-                        stream,
-                    )));
-                    continue;
-                }
-                Ok(Err(err)) => {
-                    last_err = Some(err);
-                }
-                Err(_) => {
-                    last_err = Some(anyhow::anyhow!(
-                        "timed out after {}s while establishing bind-aware NaiveTCP session",
-                        PATH_ESTABLISH_TIMEOUT.as_secs()
-                    ));
-                }
-            }
-        }
+        let bind_address = config
+            .client
+            .path_bind_addresses
+            .get(path_index)
+            .map(String::as_str);
 
         let mut connected: Option<ClientTransport> = None;
         for protocol in rotated_protocols(&protocols, path_index) {
-            let attempt = match protocol.as_str() {
-                "naive_tcp" => timeout(PATH_ESTABLISH_TIMEOUT, establish_naive_tcp_session(config))
-                    .await
-                    .map_err(anyhow::Error::from)
-                    .and_then(|result| result)
-                    .map(NaiveTcpTransport::from_stream)
-                    .map(ClientTransport::NaiveTcp),
-                "wss" | "websocket_tls" => {
+            let attempt = match (protocol.as_str(), bind_address) {
+                ("naive_tcp", Some(bind)) => timeout(
+                    PATH_ESTABLISH_TIMEOUT,
+                    establish_naive_tcp_session_with_bind(config, bind),
+                )
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result)
+                .map(NaiveTcpTransport::from_stream)
+                .map(ClientTransport::NaiveTcp),
+                ("naive_tcp", None) => {
+                    timeout(PATH_ESTABLISH_TIMEOUT, establish_naive_tcp_session(config))
+                        .await
+                        .map_err(anyhow::Error::from)
+                        .and_then(|result| result)
+                        .map(NaiveTcpTransport::from_stream)
+                        .map(ClientTransport::NaiveTcp)
+                }
+                ("wss" | "websocket_tls", Some(bind)) => timeout(
+                    PATH_ESTABLISH_TIMEOUT,
+                    establish_websocket_session_with_bind(config, bind),
+                )
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result)
+                .map(ClientTransport::WebSocket),
+                ("wss" | "websocket_tls", None) => {
                     timeout(PATH_ESTABLISH_TIMEOUT, establish_websocket_session(config))
                         .await
                         .map_err(anyhow::Error::from)
@@ -378,6 +378,85 @@ async fn establish_websocket_session(
         }
         eprintln!(
             "[bonded-client] Successfully protected WebSocket socket fd={}",
+            fd
+        );
+    }
+    #[cfg(not(unix))]
+    if config.socket_protect.is_some() {
+        eprintln!("[bonded-client] Socket protect callback configured but platform is not Unix");
+    }
+
+    let stream = socket.connect(server_addr).await?;
+    let (ws_stream, _response) = client_async_tls_with_config(request, stream, None, None).await?;
+
+    let mut transport = WebSocketTlsTransport::from_client_stream(ws_stream);
+    perform_websocket_auth_handshake(&mut transport, &keypair, &config.client.invite_token).await?;
+    Ok(transport)
+}
+
+async fn establish_websocket_session_with_bind(
+    config: &ClientConfig,
+    bind_address: &str,
+) -> anyhow::Result<WebSocketTlsTransport> {
+    if config.client.server_public_address.trim().is_empty() {
+        anyhow::bail!("server_public_address is required for websocket connection");
+    }
+
+    let bind_ip = parse_bind_ip(bind_address)?;
+    let keypair = load_or_create_device_keypair(
+        &expand_home_path(&config.client.private_key_path),
+        &expand_home_path(&config.client.public_key_path),
+    )?;
+
+    let address = &config.client.server_public_address;
+    let websocket_address = if config.client.server_websocket_address.trim().is_empty() {
+        address
+    } else {
+        &config.client.server_websocket_address
+    };
+    let websocket_url =
+        if websocket_address.starts_with("ws://") || websocket_address.starts_with("wss://") {
+            websocket_address.clone()
+        } else {
+            format!("ws://{websocket_address}")
+        };
+
+    let request = websocket_url.as_str().into_client_request()?;
+    let uri = request.uri();
+    let host = uri
+        .host()
+        .ok_or_else(|| anyhow::anyhow!("websocket URL is missing host: {websocket_url}"))?;
+    let scheme = uri.scheme_str().unwrap_or("ws");
+    let default_port = if scheme.eq_ignore_ascii_case("wss") {
+        443
+    } else {
+        80
+    };
+    let port = uri.port_u16().unwrap_or(default_port);
+
+    let server_addr = resolve_server_address(&format!("{host}:{port}"), Some(bind_ip)).await?;
+    let socket = match bind_ip {
+        IpAddr::V4(_) => TcpSocket::new_v4()?,
+        IpAddr::V6(_) => TcpSocket::new_v6()?,
+    };
+    socket.bind(SocketAddr::new(bind_ip, 0))?;
+    #[cfg(unix)]
+    if let Some(protect) = &config.socket_protect {
+        use std::os::unix::io::AsRawFd;
+        let fd = socket.as_raw_fd();
+        eprintln!(
+            "[bonded-client] Protecting WebSocket bind-aware socket fd={} bind_ip={} target={}://{}:{}",
+            fd, bind_ip, scheme, host, port
+        );
+        if !protect.0(fd) {
+            eprintln!(
+                "[bonded-client] FAILED to protect WebSocket bind-aware socket fd={}",
+                fd
+            );
+            anyhow::bail!("failed to protect bind-aware WebSocket socket from VPN capture");
+        }
+        eprintln!(
+            "[bonded-client] Successfully protected WebSocket bind-aware socket fd={}",
             fd
         );
     }
