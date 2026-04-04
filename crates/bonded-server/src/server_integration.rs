@@ -639,3 +639,692 @@ fn udp_checksum_ipv4(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, udp_segment: &[u8]) -> 
         checksum
     }
 }
+
+fn build_ipv4_icmp_echo_request(
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    echo_id: u16,
+    echo_seq: u16,
+    data: &[u8],
+) -> Vec<u8> {
+    let icmp_len = 8 + data.len();
+    let total_len = 20 + icmp_len;
+    let mut packet = vec![0u8; total_len];
+
+    // IPv4 header
+    packet[0] = 0x45;
+    packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    packet[4..6].copy_from_slice(&0x1234_u16.to_be_bytes()); // identification
+    packet[6..8].copy_from_slice(&0x4000_u16.to_be_bytes()); // DF flag
+    packet[8] = 64; // TTL
+    packet[9] = 1; // protocol = ICMP
+    packet[12..16].copy_from_slice(&src_ip.octets());
+    packet[16..20].copy_from_slice(&dst_ip.octets());
+    let ip_cksum = checksum_ones_complement(&packet[..20]);
+    packet[10..12].copy_from_slice(&ip_cksum.to_be_bytes());
+
+    // ICMP echo request header + data
+    packet[20] = 8; // type = echo request
+    packet[21] = 0; // code
+    packet[24..26].copy_from_slice(&echo_id.to_be_bytes());
+    packet[26..28].copy_from_slice(&echo_seq.to_be_bytes());
+    packet[28..].copy_from_slice(data);
+    let icmp_cksum = checksum_ones_complement(&packet[20..]);
+    packet[22..24].copy_from_slice(&icmp_cksum.to_be_bytes());
+
+    packet
+}
+
+#[derive(Debug)]
+struct Ipv4IcmpReplyPacket {
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    icmp_type: u8,
+    echo_id: u16,
+    echo_seq: u16,
+}
+
+fn parse_ipv4_icmp_packet(packet: &[u8]) -> Option<Ipv4IcmpReplyPacket> {
+    if packet.len() < 28 {
+        return None;
+    }
+    let version = packet[0] >> 4;
+    let ihl = (packet[0] & 0x0f) as usize;
+    if version != 4 || ihl < 5 {
+        return None;
+    }
+    let header_len = ihl * 4;
+    if packet[9] != 1 {
+        return None; // not ICMP
+    }
+    if packet.len() < header_len + 8 {
+        return None;
+    }
+    let src_ip = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+    let dst_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+    let icmp = &packet[header_len..];
+    let icmp_type = icmp[0];
+    let echo_id = u16::from_be_bytes([icmp[4], icmp[5]]);
+    let echo_seq = u16::from_be_bytes([icmp[6], icmp[7]]);
+    Some(Ipv4IcmpReplyPacket {
+        src_ip,
+        dst_ip,
+        icmp_type,
+        echo_id,
+        echo_seq,
+    })
+}
+
+#[tokio::test]
+async fn localhost_server_and_rust_client_can_relay_udp_echo() {
+    use tokio::net::UdpSocket;
+
+    // Start a local UDP echo server that reflects one datagram.
+    let udp_echo = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("udp echo server should bind");
+    let udp_echo_port = udp_echo
+        .local_addr()
+        .expect("udp echo addr should resolve")
+        .port();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 4096];
+        if let Ok((size, peer)) = udp_echo.recv_from(&mut buf).await {
+            let _ = udp_echo.send_to(&buf[..size], peer).await;
+        }
+    });
+
+    let keypair = DeviceKeypair::generate();
+    let authorized_path = temp_file_path("server-udp-echo-keys");
+    let invites_path = temp_file_path("server-udp-echo-invites");
+    let private_key_path = temp_file_path("server-udp-echo-private");
+    let public_key_path = temp_file_path("server-udp-echo-public");
+
+    fs::write(
+        &authorized_path,
+        format!(
+            "[[devices]]\ndevice_id = \"udp-echo-test\"\npublic_key = \"{}\"\n",
+            keypair.public_key_b64
+        ),
+    )
+    .expect("authorized keys should write");
+    fs::write(
+        &invites_path,
+        "[[tokens]]\ntoken = \"unused\"\nexpires_at = \"unix:9999999999\"\nuses_remaining = 1\n",
+    )
+    .expect("invites file should write");
+    fs::write(&private_key_path, format!("{}\n", keypair.private_key_b64))
+        .expect("private key should write");
+    fs::write(&public_key_path, format!("{}\n", keypair.public_key_b64))
+        .expect("public key should write");
+
+    let bind = pick_ephemeral_bind();
+    let store = AuthorizedKeysStore::load(&authorized_path).expect("authorized keys should load");
+    let bind_for_server = bind.clone();
+    let invite_for_server = invites_path
+        .to_str()
+        .expect("path should be utf-8")
+        .to_owned();
+    let server_task = tokio::spawn(async move {
+        crate::run_server(
+            &bind_for_server,
+            "",
+            &invite_for_server,
+            store,
+            crate::session_registry::SessionRegistry::default(),
+        )
+        .await
+    });
+
+    let udp_payload = b"hello-udp-echo";
+    let mut connected = false;
+    let mut last_error = String::new();
+    for _ in 0..20 {
+        match try_establish_client_stream(&bind, &private_key_path, &public_key_path).await {
+            Ok(stream) => {
+                connected = true;
+                let mut transport = NaiveTcpTransport::from_stream(stream);
+
+                let packet = build_ipv4_udp_packet(
+                    Ipv4Addr::new(10, 8, 0, 2),
+                    Ipv4Addr::LOCALHOST,
+                    54321,
+                    udp_echo_port,
+                    0xabcd,
+                    udp_payload,
+                )
+                .expect("udp packet should build");
+
+                transport
+                    .send(SessionFrame {
+                        header: SessionHeader {
+                            connection_id: 1,
+                            sequence: 0,
+                            flags: 0,
+                        },
+                        payload: packet.into(),
+                    })
+                    .await
+                    .expect("udp frame should send");
+
+                let frame = timeout(Duration::from_secs(5), transport.recv())
+                    .await
+                    .expect("udp echo should respond within timeout")
+                    .expect("udp response frame should arrive");
+
+                let parsed = parse_ipv4_udp_packet(&frame.payload)
+                    .expect("response should be a valid IPv4 UDP packet");
+                assert_eq!(parsed.src_ip, Ipv4Addr::LOCALHOST);
+                assert_eq!(parsed.dst_ip, Ipv4Addr::new(10, 8, 0, 2));
+                assert_eq!(parsed.src_port, udp_echo_port);
+                assert_eq!(parsed.dst_port, 54321);
+                assert_eq!(&parsed.payload[..], udp_payload);
+                break;
+            }
+            Err(err) => {
+                last_error = err;
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+
+    assert!(
+        connected,
+        "rust client failed to connect to local server: {last_error}"
+    );
+    server_task.abort();
+    let _ = fs::remove_file(authorized_path);
+    let _ = fs::remove_file(&invites_path);
+    let _ = fs::remove_file(private_key_path);
+    let _ = fs::remove_file(public_key_path);
+}
+
+#[tokio::test]
+async fn localhost_server_and_rust_client_can_relay_icmp_echo_to_localhost() {
+    let keypair = DeviceKeypair::generate();
+    let authorized_path = temp_file_path("server-icmp-echo-keys");
+    let invites_path = temp_file_path("server-icmp-echo-invites");
+    let private_key_path = temp_file_path("server-icmp-echo-private");
+    let public_key_path = temp_file_path("server-icmp-echo-public");
+
+    fs::write(
+        &authorized_path,
+        format!(
+            "[[devices]]\ndevice_id = \"icmp-echo-test\"\npublic_key = \"{}\"\n",
+            keypair.public_key_b64
+        ),
+    )
+    .expect("authorized keys should write");
+    fs::write(
+        &invites_path,
+        "[[tokens]]\ntoken = \"unused\"\nexpires_at = \"unix:9999999999\"\nuses_remaining = 1\n",
+    )
+    .expect("invites file should write");
+    fs::write(&private_key_path, format!("{}\n", keypair.private_key_b64))
+        .expect("private key should write");
+    fs::write(&public_key_path, format!("{}\n", keypair.public_key_b64))
+        .expect("public key should write");
+
+    let bind = pick_ephemeral_bind();
+    let store = AuthorizedKeysStore::load(&authorized_path).expect("authorized keys should load");
+    let bind_for_server = bind.clone();
+    let invite_for_server = invites_path
+        .to_str()
+        .expect("path should be utf-8")
+        .to_owned();
+    let server_task = tokio::spawn(async move {
+        crate::run_server(
+            &bind_for_server,
+            "",
+            &invite_for_server,
+            store,
+            crate::session_registry::SessionRegistry::default(),
+        )
+        .await
+    });
+
+    let echo_id: u16 = 0x4242;
+    let echo_seq: u16 = 7;
+    let icmp_data = b"bonded-icmp";
+    let packet = build_ipv4_icmp_echo_request(
+        Ipv4Addr::new(10, 8, 0, 2),
+        Ipv4Addr::LOCALHOST,
+        echo_id,
+        echo_seq,
+        icmp_data,
+    );
+
+    let mut connected = false;
+    let mut last_error = String::new();
+    for _ in 0..20 {
+        match try_establish_client_stream(&bind, &private_key_path, &public_key_path).await {
+            Ok(stream) => {
+                connected = true;
+                let mut transport = NaiveTcpTransport::from_stream(stream);
+
+                transport
+                    .send(SessionFrame {
+                        header: SessionHeader {
+                            connection_id: 2,
+                            sequence: 0,
+                            flags: 0,
+                        },
+                        payload: Bytes::copy_from_slice(&packet),
+                    })
+                    .await
+                    .expect("icmp frame should send");
+
+                let frame = timeout(Duration::from_secs(5), transport.recv())
+                    .await
+                    .expect("icmp echo should respond within timeout")
+                    .expect("icmp response frame should arrive");
+
+                let parsed = parse_ipv4_icmp_packet(&frame.payload)
+                    .expect("response should be a valid IPv4 ICMP packet");
+                assert_eq!(
+                    parsed.src_ip,
+                    Ipv4Addr::LOCALHOST,
+                    "src_ip should be 127.0.0.1"
+                );
+                assert_eq!(
+                    parsed.dst_ip,
+                    Ipv4Addr::new(10, 8, 0, 2),
+                    "dst_ip should be the virtual client address"
+                );
+                assert_eq!(parsed.icmp_type, 0, "ICMP type should be 0 (echo reply)");
+                assert_eq!(parsed.echo_id, echo_id, "echo identifier should match");
+                assert_eq!(parsed.echo_seq, echo_seq, "echo sequence should match");
+                break;
+            }
+            Err(err) => {
+                last_error = err;
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+
+    assert!(
+        connected,
+        "rust client failed to connect to local server: {last_error}"
+    );
+    server_task.abort();
+    let _ = fs::remove_file(authorized_path);
+    let _ = fs::remove_file(&invites_path);
+    let _ = fs::remove_file(private_key_path);
+    let _ = fs::remove_file(public_key_path);
+}
+
+// ─── TCP VPN packet-level forwarding ────────────────────────────────────────
+//
+// How VPN TCP forwarding works (required to make the test below pass):
+//
+//   1. The TUN device on the client captures full IPv4+TCP packets (SYN, ACK,
+//      PSH+ACK, FIN, …) and wraps them in SessionFrames.
+//   2. frame_forwarder detects protocol=6 (TCP) by inspecting packet[9].
+//   3. It maintains a NAT flow table keyed on (src_ip, src_port, dst_ip, dst_port).
+//   4. On SYN  → open a real TcpStream to (dst_ip, dst_port); synthesise SYN-ACK
+//              with a server-chosen ISN; ack = client_seq + 1.
+//   5. On ACK  → update flow state; no response needed.
+//   6. On data → write payload to the TcpStream; read response; synthesise a
+//              PSH+ACK response packet addressed back to the client virtual IP.
+//   7. On FIN  → half-close the TcpStream; synthesise FIN+ACK.
+//
+// The `upstream_tcp_target` field that exists in the current server is an
+// entirely different concept (a raw byte-pipe to a fixed host) and is NOT the
+// mechanism used here.
+
+#[derive(Debug)]
+struct Ipv4TcpPacket {
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack_seq: u32,
+    flags: u8,
+    payload: Vec<u8>,
+}
+
+fn parse_ipv4_tcp_packet(packet: &[u8]) -> Option<Ipv4TcpPacket> {
+    if packet.len() < 40 {
+        return None;
+    }
+    let version = packet[0] >> 4;
+    let ihl = (packet[0] & 0x0f) as usize;
+    if version != 4 || ihl < 5 {
+        return None;
+    }
+    let header_len = ihl * 4;
+    if packet[9] != 6 {
+        return None; // not TCP
+    }
+    let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+    if total_len > packet.len() {
+        return None;
+    }
+    let src_ip = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+    let dst_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+    let tcp = &packet[header_len..total_len];
+    if tcp.len() < 20 {
+        return None;
+    }
+    let src_port = u16::from_be_bytes([tcp[0], tcp[1]]);
+    let dst_port = u16::from_be_bytes([tcp[2], tcp[3]]);
+    let seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
+    let ack_seq = u32::from_be_bytes([tcp[8], tcp[9], tcp[10], tcp[11]]);
+    let tcp_header_bytes = ((tcp[12] >> 4) as usize) * 4;
+    if tcp_header_bytes < 20 || tcp.len() < tcp_header_bytes {
+        return None;
+    }
+    let flags = tcp[13];
+    let payload = tcp[tcp_header_bytes..].to_vec();
+    Some(Ipv4TcpPacket {
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        seq,
+        ack_seq,
+        flags,
+        payload,
+    })
+}
+
+fn build_ipv4_tcp_packet(
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack_seq: u32,
+    flags: u8,
+    window: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let ip_hlen = 20usize;
+    let tcp_hlen = 20usize;
+    let total = ip_hlen + tcp_hlen + payload.len();
+    let mut pkt = vec![0u8; total];
+
+    // IPv4 header
+    pkt[0] = 0x45; // version=4, IHL=5
+    pkt[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+    pkt[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // DF flag
+    pkt[8] = 64; // TTL
+    pkt[9] = 6; // TCP
+    pkt[12..16].copy_from_slice(&src_ip.octets());
+    pkt[16..20].copy_from_slice(&dst_ip.octets());
+    let ip_cksum = checksum_ones_complement(&pkt[..ip_hlen]);
+    pkt[10..12].copy_from_slice(&ip_cksum.to_be_bytes());
+
+    // TCP header
+    pkt[20..22].copy_from_slice(&src_port.to_be_bytes());
+    pkt[22..24].copy_from_slice(&dst_port.to_be_bytes());
+    pkt[24..28].copy_from_slice(&seq.to_be_bytes());
+    pkt[28..32].copy_from_slice(&ack_seq.to_be_bytes());
+    pkt[32] = 0x50; // data offset=5 (20 bytes), no options
+    pkt[33] = flags;
+    pkt[34..36].copy_from_slice(&window.to_be_bytes());
+    if !payload.is_empty() {
+        pkt[40..].copy_from_slice(payload);
+    }
+    let tcp_cksum = tcp_checksum_ipv4(src_ip, dst_ip, &pkt[ip_hlen..]);
+    pkt[36..38].copy_from_slice(&tcp_cksum.to_be_bytes());
+
+    pkt
+}
+
+fn tcp_checksum_ipv4(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, tcp_segment: &[u8]) -> u16 {
+    let mut pseudo = Vec::with_capacity(12 + tcp_segment.len() + 1);
+    pseudo.extend_from_slice(&src_ip.octets());
+    pseudo.extend_from_slice(&dst_ip.octets());
+    pseudo.push(0);
+    pseudo.push(6); // TCP protocol number
+    pseudo.extend_from_slice(&(tcp_segment.len() as u16).to_be_bytes());
+    pseudo.extend_from_slice(tcp_segment);
+    if tcp_segment.len() % 2 == 1 {
+        pseudo.push(0);
+    }
+    let cksum = checksum_ones_complement(&pseudo);
+    if cksum == 0 {
+        0xffff
+    } else {
+        cksum
+    }
+}
+
+/// End-to-end test for TCP packet-level NAT/proxy through the bonded server.
+///
+/// Sequence:
+///   client → SYN       → server            (server opens real TCP to echo host)
+///   client ← SYN-ACK   ← server            (server synthesises reply)
+///   client → ACK        → server
+///   client → PSH+ACK    → server            (data "hello-tcp-vpn")
+///   client ← PSH+ACK    ← server → echo    (server proxies, echo replies)
+///
+/// To make this test pass, implement parse_ipv4_tcp_packet + a per-flow NAT
+/// table in frame_forwarder.rs (see the design comment above).
+#[tokio::test]
+#[ignore = "requires TCP packet-level NAT/proxy support in frame_forwarder (not yet implemented)"]
+async fn localhost_server_and_rust_client_can_relay_tcp_as_ipv4_packets() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt as _};
+
+    const TCP_SYN: u8 = 0x02;
+    const TCP_ACK: u8 = 0x10;
+    const TCP_PSH: u8 = 0x08;
+    const TCP_SYN_ACK: u8 = TCP_SYN | TCP_ACK;
+    const TCP_PSH_ACK: u8 = TCP_PSH | TCP_ACK;
+    const CLIENT_VIRTUAL_IP: Ipv4Addr = Ipv4Addr::new(10, 8, 0, 2);
+    const CLIENT_PORT: u16 = 54321;
+    const CLIENT_ISN: u32 = 1000;
+    const WINDOW: u16 = 65535;
+
+    // Start a local TCP echo server: accept one connection, read, echo the bytes back.
+    let echo_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("tcp echo listener should bind");
+    let echo_port = echo_listener
+        .local_addr()
+        .expect("echo addr should resolve")
+        .port();
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = echo_listener.accept().await {
+            let mut buf = vec![0u8; 4096];
+            if let Ok(n) = stream.read(&mut buf).await {
+                let _ = stream.write_all(&buf[..n]).await;
+            }
+        }
+    });
+
+    let keypair = DeviceKeypair::generate();
+    let authorized_path = temp_file_path("server-tcp-ipv4-keys");
+    let invites_path = temp_file_path("server-tcp-ipv4-invites");
+    let private_key_path = temp_file_path("server-tcp-ipv4-private");
+    let public_key_path = temp_file_path("server-tcp-ipv4-public");
+
+    fs::write(
+        &authorized_path,
+        format!(
+            "[[devices]]\ndevice_id = \"tcp-ipv4-test\"\npublic_key = \"{}\"\n",
+            keypair.public_key_b64
+        ),
+    )
+    .expect("authorized keys should write");
+    fs::write(
+        &invites_path,
+        "[[tokens]]\ntoken = \"unused\"\nexpires_at = \"unix:9999999999\"\nuses_remaining = 1\n",
+    )
+    .expect("invites file should write");
+    fs::write(&private_key_path, format!("{}\n", keypair.private_key_b64))
+        .expect("private key should write");
+    fs::write(&public_key_path, format!("{}\n", keypair.public_key_b64))
+        .expect("public key should write");
+
+    let bind = pick_ephemeral_bind();
+    let echo_target_ip = Ipv4Addr::LOCALHOST;
+    let store = AuthorizedKeysStore::load(&authorized_path).expect("authorized keys should load");
+    let bind_for_server = bind.clone();
+    let invite_for_server = invites_path
+        .to_str()
+        .expect("path should be utf-8")
+        .to_owned();
+    let server_task = tokio::spawn(async move {
+        crate::run_server(
+            &bind_for_server,
+            "",
+            &invite_for_server,
+            store,
+            crate::session_registry::SessionRegistry::default(),
+        )
+        .await
+    });
+
+    let mut connected = false;
+    let mut last_error = String::new();
+    for _ in 0..20 {
+        match try_establish_client_stream(&bind, &private_key_path, &public_key_path).await {
+            Ok(stream) => {
+                connected = true;
+                let mut transport = NaiveTcpTransport::from_stream(stream);
+
+                // ── Step 1: SYN ────────────────────────────────────────────
+                let syn_packet = build_ipv4_tcp_packet(
+                    CLIENT_VIRTUAL_IP,
+                    echo_target_ip,
+                    CLIENT_PORT,
+                    echo_port,
+                    CLIENT_ISN,
+                    0,
+                    TCP_SYN,
+                    WINDOW,
+                    &[],
+                );
+                transport
+                    .send(SessionFrame {
+                        header: SessionHeader {
+                            connection_id: 10,
+                            sequence: 0,
+                            flags: 0,
+                        },
+                        payload: Bytes::copy_from_slice(&syn_packet),
+                    })
+                    .await
+                    .expect("SYN frame should send");
+
+                // ── Step 2: expect SYN-ACK ─────────────────────────────────
+                let syn_ack_frame = timeout(Duration::from_secs(5), transport.recv())
+                    .await
+                    .expect("SYN-ACK should arrive within timeout")
+                    .expect("SYN-ACK frame should be readable");
+                let syn_ack = parse_ipv4_tcp_packet(&syn_ack_frame.payload)
+                    .expect("SYN-ACK should be a valid IPv4/TCP packet");
+                assert_eq!(
+                    syn_ack.flags & TCP_SYN_ACK,
+                    TCP_SYN_ACK,
+                    "flags should include SYN+ACK (got 0x{:02x})",
+                    syn_ack.flags
+                );
+                assert_eq!(
+                    syn_ack.ack_seq,
+                    CLIENT_ISN.wrapping_add(1),
+                    "SYN-ACK ack_seq should be client ISN + 1"
+                );
+                assert_eq!(syn_ack.src_ip, echo_target_ip, "SYN-ACK src_ip");
+                assert_eq!(syn_ack.dst_ip, CLIENT_VIRTUAL_IP, "SYN-ACK dst_ip");
+                assert_eq!(syn_ack.src_port, echo_port, "SYN-ACK src_port");
+                assert_eq!(syn_ack.dst_port, CLIENT_PORT, "SYN-ACK dst_port");
+                let server_isn = syn_ack.seq;
+
+                // ── Step 3: ACK to complete the handshake ──────────────────
+                let ack_packet = build_ipv4_tcp_packet(
+                    CLIENT_VIRTUAL_IP,
+                    echo_target_ip,
+                    CLIENT_PORT,
+                    echo_port,
+                    CLIENT_ISN.wrapping_add(1),
+                    server_isn.wrapping_add(1),
+                    TCP_ACK,
+                    WINDOW,
+                    &[],
+                );
+                transport
+                    .send(SessionFrame {
+                        header: SessionHeader {
+                            connection_id: 10,
+                            sequence: 1,
+                            flags: 0,
+                        },
+                        payload: Bytes::copy_from_slice(&ack_packet),
+                    })
+                    .await
+                    .expect("ACK frame should send");
+
+                // ── Step 4: PSH+ACK with payload ───────────────────────────
+                let data: &[u8] = b"hello-tcp-vpn";
+                let psh_ack_packet = build_ipv4_tcp_packet(
+                    CLIENT_VIRTUAL_IP,
+                    echo_target_ip,
+                    CLIENT_PORT,
+                    echo_port,
+                    CLIENT_ISN.wrapping_add(1),
+                    server_isn.wrapping_add(1),
+                    TCP_PSH_ACK,
+                    WINDOW,
+                    data,
+                );
+                transport
+                    .send(SessionFrame {
+                        header: SessionHeader {
+                            connection_id: 10,
+                            sequence: 2,
+                            flags: 0,
+                        },
+                        payload: Bytes::copy_from_slice(&psh_ack_packet),
+                    })
+                    .await
+                    .expect("PSH+ACK frame should send");
+
+                // ── Step 5: expect echoed data ─────────────────────────────
+                // The server may return a bare ACK before the data frame; drain
+                // ACK-only frames until we see one carrying a payload.
+                let data_pkt = loop {
+                    let frame = timeout(Duration::from_secs(5), transport.recv())
+                        .await
+                        .expect("data response should arrive within timeout")
+                        .expect("data response frame should be readable");
+                    let pkt = parse_ipv4_tcp_packet(&frame.payload)
+                        .expect("data response should be a valid IPv4/TCP packet");
+                    if !pkt.payload.is_empty() {
+                        break pkt;
+                    }
+                };
+
+                assert_eq!(data_pkt.src_ip, echo_target_ip, "response src_ip");
+                assert_eq!(data_pkt.dst_ip, CLIENT_VIRTUAL_IP, "response dst_ip");
+                assert_eq!(data_pkt.src_port, echo_port, "response src_port");
+                assert_eq!(data_pkt.dst_port, CLIENT_PORT, "response dst_port");
+                assert_eq!(
+                    &data_pkt.payload[..],
+                    data,
+                    "echoed payload should match sent data"
+                );
+
+                break;
+            }
+            Err(err) => {
+                last_error = err;
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+
+    assert!(
+        connected,
+        "rust client failed to connect to local server: {last_error}"
+    );
+    server_task.abort();
+    let _ = fs::remove_file(authorized_path);
+    let _ = fs::remove_file(&invites_path);
+    let _ = fs::remove_file(private_key_path);
+    let _ = fs::remove_file(public_key_path);
+}

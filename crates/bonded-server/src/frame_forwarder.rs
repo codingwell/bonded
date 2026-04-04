@@ -240,14 +240,19 @@ async fn send_icmp_echo_and_wait_reply(
                 .collect();
             let reply_type = response[0];
             let reply_code = response[1];
-            let reply_identifier = u16::from_be_bytes([response[4], response[5]]);
+            // SOCK_DGRAM ICMP sockets cause the Linux kernel to rewrite the echo
+            // identifier with the socket's own ephemeral identifier.  Only check
+            // the sequence number to match the reply; restore the caller-supplied
+            // identifier afterwards so that the VPN client sees a coherent packet.
             let reply_sequence = u16::from_be_bytes([response[6], response[7]]);
-            if reply_type == 0
-                && reply_code == 0
-                && reply_identifier == echo_identifier
-                && reply_sequence == echo_sequence
-            {
-                return Ok(Some(response));
+            if reply_type == 0 && reply_code == 0 && reply_sequence == echo_sequence {
+                let mut fixed = response;
+                fixed[4..6].copy_from_slice(&echo_identifier.to_be_bytes());
+                // Recompute the ICMP checksum after patching the identifier field.
+                fixed[2..4].copy_from_slice(&[0, 0]);
+                let new_cksum = checksum_ones_complement(&fixed);
+                fixed[2..4].copy_from_slice(&new_cksum.to_be_bytes());
+                return Ok(Some(fixed));
             }
         }
     })
