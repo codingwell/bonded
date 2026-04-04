@@ -1,8 +1,8 @@
 use bonded_core::session::SessionFrame;
-use std::collections::HashMap;
-use std::sync::Arc;
 use socket2::{Domain, Protocol, Socket, Type};
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
@@ -328,12 +328,7 @@ async fn handle_tcp_frame(
     // ── PSH: forward payload to upstream, read response ───────────────────────
     if pkt.flags & TCP_PSH != 0 && !pkt.payload.is_empty() {
         // Grab a clone of the stream Arc without holding the table lock during I/O.
-        let stream_arc = flows
-            .flows
-            .lock()
-            .await
-            .get(&key)
-            .map(|e| e.stream.clone());
+        let stream_arc = flows.flows.lock().await.get(&key).map(|e| e.stream.clone());
 
         let Some(stream_arc) = stream_arc else {
             debug!(

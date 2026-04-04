@@ -264,6 +264,8 @@ Build the server binary on top of `bonded-core`.
 | 2.11 | Dockerfile update for new workspace structure | completed | Updated Docker build to target workspace crates, expose app+health ports, and set runtime config/state defaults under `/etc/bonded` and `/var/lib/bonded` |
 | 2.12 | Integration test: server starts, accepts connection, forwards traffic | completed | Added integration test that authenticates a client over NaiveTCP and verifies framed session payload exchange on the authenticated stream |
 | 2.13 | Rust-only localhost E2E DNS diagnostic harness | completed | Added ignored/manual `bonded-server` integration test that boots `run_server` on localhost, connects using `bonded-client::establish_naive_tcp_session`, injects synthetic IPv4 UDP DNS query packet to `8.8.8.8:53`, and asserts/prints response-path diagnostics |
+| 2.14 | Rust-only localhost E2E HTTP diagnostic harness | completed | Added ignored/manual `bonded-server` integration test that boots `run_server` on localhost, resolves `example.com`, drives synthetic IPv4 TCP handshake + HTTP GET over packet relay, and asserts a valid HTTP status line in returned payload |
+| 2.15 | Rust-only localhost E2E SMTP diagnostic harness | completed | Added ignored/manual `bonded-server` integration test that boots `run_server` on localhost, resolves `smtp.gmail.com:587`, drives synthetic IPv4 TCP handshake, sends SMTP `EHLO` and `QUIT`, and asserts SMTP reply codes in returned payload |
 
 Acceptance gate:
 

@@ -8,7 +8,7 @@ use bonded_core::transport::{NaiveTcpTransport, Transport, WebSocketTlsTransport
 use bytes::Bytes;
 use serde_json::Value;
 use std::fs;
-use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -455,6 +455,460 @@ async fn localhost_server_and_rust_client_can_probe_public_dns_udp() {
 
     server_task.abort();
 
+    let _ = fs::remove_file(authorized_path);
+    let _ = fs::remove_file(&invites_path);
+    let _ = fs::remove_file(private_key_path);
+    let _ = fs::remove_file(public_key_path);
+}
+
+#[tokio::test]
+#[ignore = "manual diagnostic: requires internet egress from server host and may be flaky in CI"]
+async fn localhost_server_and_rust_client_can_fetch_example_com_http_over_tcp_packets() {
+    const TCP_SYN: u8 = 0x02;
+    const TCP_ACK: u8 = 0x10;
+    const TCP_PSH: u8 = 0x08;
+    const TCP_SYN_ACK: u8 = TCP_SYN | TCP_ACK;
+    const TCP_PSH_ACK: u8 = TCP_PSH | TCP_ACK;
+    const CLIENT_VIRTUAL_IP: Ipv4Addr = Ipv4Addr::new(10, 8, 0, 2);
+    const CLIENT_PORT: u16 = 54322;
+    const CLIENT_ISN: u32 = 4000;
+    const WINDOW: u16 = 65535;
+
+    let mut example_ipv4 = None;
+    let resolved = tokio::net::lookup_host(("example.com", 80))
+        .await
+        .expect("example.com should resolve");
+    for addr in resolved {
+        if let SocketAddr::V4(v4) = addr {
+            example_ipv4 = Some(*v4.ip());
+            break;
+        }
+    }
+    let target_ip = example_ipv4.expect("example.com should resolve to an IPv4 address");
+
+    let keypair = DeviceKeypair::generate();
+    let authorized_path = temp_file_path("server-http-ipv4-keys");
+    let invites_path = temp_file_path("server-http-ipv4-invites");
+    let private_key_path = temp_file_path("server-http-ipv4-private");
+    let public_key_path = temp_file_path("server-http-ipv4-public");
+
+    fs::write(
+        &authorized_path,
+        format!(
+            "[[devices]]\ndevice_id = \"http-ipv4-test\"\npublic_key = \"{}\"\n",
+            keypair.public_key_b64
+        ),
+    )
+    .expect("authorized keys should write");
+    fs::write(
+        &invites_path,
+        "[[tokens]]\ntoken = \"unused\"\nexpires_at = \"unix:9999999999\"\nuses_remaining = 1\n",
+    )
+    .expect("invites file should write");
+    fs::write(&private_key_path, format!("{}\n", keypair.private_key_b64))
+        .expect("private key should write");
+    fs::write(&public_key_path, format!("{}\n", keypair.public_key_b64))
+        .expect("public key should write");
+
+    let bind = pick_ephemeral_bind();
+    let store = AuthorizedKeysStore::load(&authorized_path).expect("authorized keys should load");
+    let bind_for_server = bind.clone();
+    let invite_for_server = invites_path
+        .to_str()
+        .expect("path should be utf-8")
+        .to_owned();
+    let server_task = tokio::spawn(async move {
+        crate::run_server(
+            &bind_for_server,
+            "",
+            &invite_for_server,
+            store,
+            crate::session_registry::SessionRegistry::default(),
+        )
+        .await
+    });
+
+    let mut connected = false;
+    let mut last_error = String::new();
+
+    for _ in 0..20 {
+        match try_establish_client_stream(&bind, &private_key_path, &public_key_path).await {
+            Ok(stream) => {
+                connected = true;
+                let mut transport = NaiveTcpTransport::from_stream(stream);
+
+                let syn_packet = build_ipv4_tcp_packet(
+                    CLIENT_VIRTUAL_IP,
+                    target_ip,
+                    CLIENT_PORT,
+                    80,
+                    CLIENT_ISN,
+                    0,
+                    TCP_SYN,
+                    WINDOW,
+                    &[],
+                );
+                transport
+                    .send(SessionFrame {
+                        header: SessionHeader {
+                            connection_id: 11,
+                            sequence: 0,
+                            flags: 0,
+                        },
+                        payload: Bytes::copy_from_slice(&syn_packet),
+                    })
+                    .await
+                    .expect("SYN frame should send");
+
+                let syn_ack_frame = timeout(Duration::from_secs(6), transport.recv())
+                    .await
+                    .expect("SYN-ACK should arrive within timeout")
+                    .expect("SYN-ACK frame should be readable");
+                let syn_ack = parse_ipv4_tcp_packet(&syn_ack_frame.payload)
+                    .expect("SYN-ACK should be a valid IPv4/TCP packet");
+                assert_eq!(
+                    syn_ack.flags & TCP_SYN_ACK,
+                    TCP_SYN_ACK,
+                    "flags should include SYN+ACK (got 0x{:02x})",
+                    syn_ack.flags
+                );
+                let server_isn = syn_ack.seq;
+
+                let ack_packet = build_ipv4_tcp_packet(
+                    CLIENT_VIRTUAL_IP,
+                    target_ip,
+                    CLIENT_PORT,
+                    80,
+                    CLIENT_ISN.wrapping_add(1),
+                    server_isn.wrapping_add(1),
+                    TCP_ACK,
+                    WINDOW,
+                    &[],
+                );
+                transport
+                    .send(SessionFrame {
+                        header: SessionHeader {
+                            connection_id: 11,
+                            sequence: 1,
+                            flags: 0,
+                        },
+                        payload: Bytes::copy_from_slice(&ack_packet),
+                    })
+                    .await
+                    .expect("ACK frame should send");
+
+                let request = b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\nUser-Agent: bonded-e2e\r\nAccept: */*\r\n\r\n";
+                let req_packet = build_ipv4_tcp_packet(
+                    CLIENT_VIRTUAL_IP,
+                    target_ip,
+                    CLIENT_PORT,
+                    80,
+                    CLIENT_ISN.wrapping_add(1),
+                    server_isn.wrapping_add(1),
+                    TCP_PSH_ACK,
+                    WINDOW,
+                    request,
+                );
+                transport
+                    .send(SessionFrame {
+                        header: SessionHeader {
+                            connection_id: 11,
+                            sequence: 2,
+                            flags: 0,
+                        },
+                        payload: Bytes::copy_from_slice(&req_packet),
+                    })
+                    .await
+                    .expect("HTTP request frame should send");
+
+                let mut http_bytes = Vec::new();
+                for _ in 0..12 {
+                    let frame = timeout(Duration::from_secs(6), transport.recv())
+                        .await
+                        .expect("response should arrive within timeout")
+                        .expect("response frame should be readable");
+                    let pkt = parse_ipv4_tcp_packet(&frame.payload)
+                        .expect("response should be valid IPv4/TCP packet");
+
+                    if pkt.payload.is_empty() {
+                        continue;
+                    }
+                    http_bytes.extend_from_slice(&pkt.payload);
+
+                    if http_bytes.windows(2).any(|w| w == b"\r\n") {
+                        break;
+                    }
+                }
+
+                let line_end = http_bytes
+                    .windows(2)
+                    .position(|w| w == b"\r\n")
+                    .expect("HTTP status line should be present");
+                let status_line = String::from_utf8_lossy(&http_bytes[..line_end]);
+                assert!(
+                    status_line.starts_with("HTTP/1."),
+                    "unexpected status line: {status_line}"
+                );
+
+                let status_code = status_line
+                    .split_whitespace()
+                    .nth(1)
+                    .expect("status code should be present")
+                    .parse::<u16>()
+                    .expect("status code should parse");
+                assert!(
+                    (200..500).contains(&status_code),
+                    "status code should indicate non-server-error response, got {status_code}"
+                );
+
+                break;
+            }
+            Err(err) => {
+                last_error = err;
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+
+    assert!(
+        connected,
+        "rust client failed to connect/authenticate to local server: {last_error}"
+    );
+
+    server_task.abort();
+    let _ = fs::remove_file(authorized_path);
+    let _ = fs::remove_file(&invites_path);
+    let _ = fs::remove_file(private_key_path);
+    let _ = fs::remove_file(public_key_path);
+}
+
+#[tokio::test]
+#[ignore = "manual diagnostic: requires internet egress from server host and may be flaky in CI"]
+async fn localhost_server_and_rust_client_can_run_smtp_commands_over_tcp_packets() {
+    const TCP_SYN: u8 = 0x02;
+    const TCP_ACK: u8 = 0x10;
+    const TCP_PSH: u8 = 0x08;
+    const TCP_SYN_ACK: u8 = TCP_SYN | TCP_ACK;
+    const TCP_PSH_ACK: u8 = TCP_PSH | TCP_ACK;
+    const CLIENT_VIRTUAL_IP: Ipv4Addr = Ipv4Addr::new(10, 8, 0, 2);
+    const CLIENT_PORT: u16 = 54323;
+    const CLIENT_ISN: u32 = 7000;
+    const WINDOW: u16 = 65535;
+
+    let mut smtp_ipv4 = None;
+    let resolved = tokio::net::lookup_host(("smtp.gmail.com", 587))
+        .await
+        .expect("smtp server should resolve");
+    for addr in resolved {
+        if let SocketAddr::V4(v4) = addr {
+            smtp_ipv4 = Some(*v4.ip());
+            break;
+        }
+    }
+    let target_ip = smtp_ipv4.expect("smtp server should resolve to an IPv4 address");
+
+    let keypair = DeviceKeypair::generate();
+    let authorized_path = temp_file_path("server-smtp-ipv4-keys");
+    let invites_path = temp_file_path("server-smtp-ipv4-invites");
+    let private_key_path = temp_file_path("server-smtp-ipv4-private");
+    let public_key_path = temp_file_path("server-smtp-ipv4-public");
+
+    fs::write(
+        &authorized_path,
+        format!(
+            "[[devices]]\ndevice_id = \"smtp-ipv4-test\"\npublic_key = \"{}\"\n",
+            keypair.public_key_b64
+        ),
+    )
+    .expect("authorized keys should write");
+    fs::write(
+        &invites_path,
+        "[[tokens]]\ntoken = \"unused\"\nexpires_at = \"unix:9999999999\"\nuses_remaining = 1\n",
+    )
+    .expect("invites file should write");
+    fs::write(&private_key_path, format!("{}\n", keypair.private_key_b64))
+        .expect("private key should write");
+    fs::write(&public_key_path, format!("{}\n", keypair.public_key_b64))
+        .expect("public key should write");
+
+    let bind = pick_ephemeral_bind();
+    let store = AuthorizedKeysStore::load(&authorized_path).expect("authorized keys should load");
+    let bind_for_server = bind.clone();
+    let invite_for_server = invites_path
+        .to_str()
+        .expect("path should be utf-8")
+        .to_owned();
+    let server_task = tokio::spawn(async move {
+        crate::run_server(
+            &bind_for_server,
+            "",
+            &invite_for_server,
+            store,
+            crate::session_registry::SessionRegistry::default(),
+        )
+        .await
+    });
+
+    let mut connected = false;
+    let mut last_error = String::new();
+
+    for _ in 0..20 {
+        match try_establish_client_stream(&bind, &private_key_path, &public_key_path).await {
+            Ok(stream) => {
+                connected = true;
+                let mut transport = NaiveTcpTransport::from_stream(stream);
+
+                let syn_packet = build_ipv4_tcp_packet(
+                    CLIENT_VIRTUAL_IP,
+                    target_ip,
+                    CLIENT_PORT,
+                    587,
+                    CLIENT_ISN,
+                    0,
+                    TCP_SYN,
+                    WINDOW,
+                    &[],
+                );
+                transport
+                    .send(SessionFrame {
+                        header: SessionHeader {
+                            connection_id: 12,
+                            sequence: 0,
+                            flags: 0,
+                        },
+                        payload: Bytes::copy_from_slice(&syn_packet),
+                    })
+                    .await
+                    .expect("SYN frame should send");
+
+                let syn_ack_frame = timeout(Duration::from_secs(8), transport.recv())
+                    .await
+                    .expect("SYN-ACK should arrive within timeout")
+                    .expect("SYN-ACK frame should be readable");
+                let syn_ack = parse_ipv4_tcp_packet(&syn_ack_frame.payload)
+                    .expect("SYN-ACK should be a valid IPv4/TCP packet");
+                assert_eq!(
+                    syn_ack.flags & TCP_SYN_ACK,
+                    TCP_SYN_ACK,
+                    "flags should include SYN+ACK (got 0x{:02x})",
+                    syn_ack.flags
+                );
+                let server_isn = syn_ack.seq;
+
+                let ack_packet = build_ipv4_tcp_packet(
+                    CLIENT_VIRTUAL_IP,
+                    target_ip,
+                    CLIENT_PORT,
+                    587,
+                    CLIENT_ISN.wrapping_add(1),
+                    server_isn.wrapping_add(1),
+                    TCP_ACK,
+                    WINDOW,
+                    &[],
+                );
+                transport
+                    .send(SessionFrame {
+                        header: SessionHeader {
+                            connection_id: 12,
+                            sequence: 1,
+                            flags: 0,
+                        },
+                        payload: Bytes::copy_from_slice(&ack_packet),
+                    })
+                    .await
+                    .expect("ACK frame should send");
+
+                let ehlo = b"EHLO bonded.test\r\n";
+                let ehlo_packet = build_ipv4_tcp_packet(
+                    CLIENT_VIRTUAL_IP,
+                    target_ip,
+                    CLIENT_PORT,
+                    587,
+                    CLIENT_ISN.wrapping_add(1),
+                    server_isn.wrapping_add(1),
+                    TCP_PSH_ACK,
+                    WINDOW,
+                    ehlo,
+                );
+                transport
+                    .send(SessionFrame {
+                        header: SessionHeader {
+                            connection_id: 12,
+                            sequence: 2,
+                            flags: 0,
+                        },
+                        payload: Bytes::copy_from_slice(&ehlo_packet),
+                    })
+                    .await
+                    .expect("EHLO frame should send");
+
+                let ehlo_frame = timeout(Duration::from_secs(8), transport.recv())
+                    .await
+                    .expect("EHLO response should arrive within timeout")
+                    .expect("EHLO response frame should be readable");
+                let ehlo_resp = parse_ipv4_tcp_packet(&ehlo_frame.payload)
+                    .expect("EHLO response should be valid IPv4/TCP packet");
+                assert!(
+                    !ehlo_resp.payload.is_empty(),
+                    "EHLO response payload should not be empty"
+                );
+                let ehlo_text = String::from_utf8_lossy(&ehlo_resp.payload);
+                assert!(
+                    ehlo_text.contains("220") || ehlo_text.contains("250"),
+                    "expected SMTP banner/EHLO response codes in payload, got: {ehlo_text}"
+                );
+
+                let quit = b"QUIT\r\n";
+                let quit_packet = build_ipv4_tcp_packet(
+                    CLIENT_VIRTUAL_IP,
+                    target_ip,
+                    CLIENT_PORT,
+                    587,
+                    CLIENT_ISN.wrapping_add(1 + ehlo.len() as u32),
+                    server_isn.wrapping_add(1),
+                    TCP_PSH_ACK,
+                    WINDOW,
+                    quit,
+                );
+                transport
+                    .send(SessionFrame {
+                        header: SessionHeader {
+                            connection_id: 12,
+                            sequence: 3,
+                            flags: 0,
+                        },
+                        payload: Bytes::copy_from_slice(&quit_packet),
+                    })
+                    .await
+                    .expect("QUIT frame should send");
+
+                let quit_frame = timeout(Duration::from_secs(8), transport.recv())
+                    .await
+                    .expect("QUIT response should arrive within timeout")
+                    .expect("QUIT response frame should be readable");
+                let quit_resp = parse_ipv4_tcp_packet(&quit_frame.payload)
+                    .expect("QUIT response should be valid IPv4/TCP packet");
+                let quit_text = String::from_utf8_lossy(&quit_resp.payload);
+                assert!(
+                    quit_text.contains("221") || quit_text.contains("250") || quit_text.contains("220"),
+                    "expected SMTP QUIT/server response code in payload, got: {quit_text}"
+                );
+
+                break;
+            }
+            Err(err) => {
+                last_error = err;
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+
+    assert!(
+        connected,
+        "rust client failed to connect/authenticate to local server: {last_error}"
+    );
+
+    server_task.abort();
     let _ = fs::remove_file(authorized_path);
     let _ = fs::remove_file(&invites_path);
     let _ = fs::remove_file(private_key_path);
