@@ -70,7 +70,11 @@ async fn main() -> anyhow::Result<()> {
         "startup invite token ready"
     );
     let server_identity = DeviceKeypair::generate();
-    let _ = emit_pairing_qr(&cfg.server.public_address, &invite, &server_identity.public_key_b64);
+    let _ = emit_pairing_qr(
+        &cfg.server.public_address,
+        &invite,
+        &server_identity.public_key_b64,
+    );
 
     let health_bind = cfg.server.health_bind.clone();
     tokio::spawn(async move {

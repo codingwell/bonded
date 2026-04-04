@@ -68,12 +68,8 @@ mod tests {
             uses_remaining: 1,
         };
 
-        let json = build_pairing_payload_json(
-            "bonded.example.com:8080",
-            &invite,
-            "pub-key",
-        )
-        .expect("payload json should build");
+        let json = build_pairing_payload_json("bonded.example.com:8080", &invite, "pub-key")
+            .expect("payload json should build");
 
         let parsed: PairingPayload = serde_json::from_str(&json).expect("payload should parse");
         assert_eq!(parsed.server_public_address, "bonded.example.com:8080");

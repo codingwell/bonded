@@ -1,16 +1,16 @@
 package com.bonded.bonded_app
 
 import android.content.Context
+import java.time.Instant
 import org.json.JSONArray
 import org.json.JSONObject
-import java.time.Instant
 
 data class PairedServerRecord(
-    val id: String,
-    val publicAddress: String,
-    val serverPublicKey: String,
-    val supportedProtocols: List<String>,
-    val pairedAt: String,
+        val id: String,
+        val publicAddress: String,
+        val serverPublicKey: String,
+        val supportedProtocols: List<String>,
+        val pairedAt: String,
 )
 
 object PairedServerStore {
@@ -58,20 +58,19 @@ object PairedServerStore {
         val array = JSONArray()
         records.forEach { record ->
             array.put(
-                JSONObject()
-                    .put("id", record.id)
-                    .put("publicAddress", record.publicAddress)
-                    .put("serverPublicKey", record.serverPublicKey)
-                    .put("supportedProtocols", JSONArray(record.supportedProtocols))
-                    .put("pairedAt", record.pairedAt),
+                    JSONObject()
+                            .put("id", record.id)
+                            .put("publicAddress", record.publicAddress)
+                            .put("serverPublicKey", record.serverPublicKey)
+                            .put("supportedProtocols", JSONArray(record.supportedProtocols))
+                            .put("pairedAt", record.pairedAt),
             )
         }
 
-        context
-            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .edit()
-            .putString(KEY_RECORDS, array.toString())
-            .apply()
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putString(KEY_RECORDS, array.toString())
+                .apply()
     }
 
     private fun parseProtocols(array: JSONArray?): List<String> {
@@ -87,11 +86,12 @@ object PairedServerStore {
     }
 
     private fun parseRecords(raw: String): List<PairedServerRecord> {
-        val array = try {
-            JSONArray(raw)
-        } catch (_: Exception) {
-            return emptyList()
-        }
+        val array =
+                try {
+                    JSONArray(raw)
+                } catch (_: Exception) {
+                    return emptyList()
+                }
 
         return buildList {
             for (index in 0 until array.length()) {
@@ -105,20 +105,21 @@ object PairedServerStore {
                 }
 
                 add(
-                    PairedServerRecord(
-                        id = id,
-                        publicAddress = publicAddress,
-                        serverPublicKey = serverPublicKey,
-                        supportedProtocols = parseProtocols(item.optJSONArray("supportedProtocols")),
-                        pairedAt = item.optString("pairedAt", Instant.now().toString()),
-                    ),
+                        PairedServerRecord(
+                                id = id,
+                                publicAddress = publicAddress,
+                                serverPublicKey = serverPublicKey,
+                                supportedProtocols =
+                                        parseProtocols(item.optJSONArray("supportedProtocols")),
+                                pairedAt = item.optString("pairedAt", Instant.now().toString()),
+                        ),
                 )
             }
         }
     }
 
     private fun parseLegacySingleRecord(
-        prefs: android.content.SharedPreferences
+            prefs: android.content.SharedPreferences
     ): PairedServerRecord? {
         val id = prefs.getString(LEGACY_KEY_DEVICE_ID, "")?.trim().orEmpty()
         val publicAddress = prefs.getString(LEGACY_KEY_PUBLIC_ADDRESS, "")?.trim().orEmpty()
@@ -128,12 +129,12 @@ object PairedServerStore {
         }
 
         return PairedServerRecord(
-            id = id,
-            publicAddress = publicAddress,
-            serverPublicKey = serverPublicKey,
-            supportedProtocols = emptyList(),
-            pairedAt = prefs.getString(LEGACY_KEY_PAIRED_AT, Instant.now().toString())
-                ?: Instant.now().toString(),
+                id = id,
+                publicAddress = publicAddress,
+                serverPublicKey = serverPublicKey,
+                supportedProtocols = emptyList(),
+                pairedAt = prefs.getString(LEGACY_KEY_PAIRED_AT, Instant.now().toString())
+                                ?: Instant.now().toString(),
         )
     }
 }

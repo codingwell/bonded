@@ -110,19 +110,18 @@ class _PairingConfirmScreenState extends State<PairingConfirmScreen> {
               // Action buttons
               ElevatedButton.icon(
                 onPressed: _isPairing ? null : _confirmPairing,
-                icon:
-                    _isPairing
-                        ? const SizedBox(
-                          width: 20,
-                          height: 20,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2,
-                            valueColor: AlwaysStoppedAnimation<Color>(
-                              Colors.white,
-                            ),
+                icon: _isPairing
+                    ? const SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          valueColor: AlwaysStoppedAnimation<Color>(
+                            Colors.white,
                           ),
-                        )
-                        : const Icon(Icons.check),
+                        ),
+                      )
+                    : const Icon(Icons.check),
                 label: Text(_isPairing ? 'Pairing...' : 'Confirm Pairing'),
                 style: ElevatedButton.styleFrom(
                   padding: const EdgeInsets.symmetric(
@@ -135,8 +134,9 @@ class _PairingConfirmScreenState extends State<PairingConfirmScreen> {
               ),
               const SizedBox(height: 16),
               OutlinedButton.icon(
-                onPressed:
-                    _isPairing ? null : () => Navigator.of(context).pop(),
+                onPressed: _isPairing
+                    ? null
+                    : () => Navigator.of(context).pop(),
                 icon: const Icon(Icons.close),
                 label: const Text('Cancel'),
               ),
