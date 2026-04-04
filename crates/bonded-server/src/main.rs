@@ -18,7 +18,7 @@ use bonded_core::config::{load_server_config, ServerConfig, DEFAULT_SERVER_CONFI
 use bonded_core::session::{SessionFrame, SessionHeader, FLAG_PING, FLAG_PONG};
 use bonded_core::transport::{NaiveTcpTransport, Transport};
 use clap::Parser;
-use frame_forwarder::forward_frame;
+use frame_forwarder::{forward_frame, TcpFlowTable};
 use health::run_health_server;
 use invite_tokens::ensure_startup_invite;
 use pairing_qr::emit_pairing_qr;
@@ -224,6 +224,7 @@ async fn run_websocket_server(
                         session_id = handle.session_id,
                         "starting websocket frame receive loop"
                     );
+                    let tcp_flows = TcpFlowTable::default();
 
                     loop {
                         debug!(
@@ -278,6 +279,7 @@ async fn run_websocket_server(
                                     } else {
                                         Some(upstream_tcp_target.as_str())
                                     },
+                                    &tcp_flows,
                                 )
                                 .await
                                 {
@@ -436,6 +438,7 @@ async fn run_server(
                         session_id = handle.session_id,
                         "starting frame receive loop"
                     );
+                    let tcp_flows = TcpFlowTable::default();
                     loop {
                         debug!(
                             peer = %peer,
@@ -489,6 +492,7 @@ async fn run_server(
                                     } else {
                                         Some(upstream_tcp_target.as_str())
                                     },
+                                    &tcp_flows,
                                 )
                                 .await
                                 {

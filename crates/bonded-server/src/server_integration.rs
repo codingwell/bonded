@@ -1105,7 +1105,6 @@ fn tcp_checksum_ipv4(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, tcp_segment: &[u8]) -> 
 /// To make this test pass, implement parse_ipv4_tcp_packet + a per-flow NAT
 /// table in frame_forwarder.rs (see the design comment above).
 #[tokio::test]
-#[ignore = "requires TCP packet-level NAT/proxy support in frame_forwarder (not yet implemented)"]
 async fn localhost_server_and_rust_client_can_relay_tcp_as_ipv4_packets() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt as _};
 

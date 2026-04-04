@@ -1,10 +1,15 @@
 use bonded_core::session::SessionFrame;
+use std::collections::HashMap;
+use std::sync::Arc;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
+use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
 use tracing::debug;
+
+// ── UDP ───────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 struct Ipv4UdpPacket {
@@ -16,6 +21,8 @@ struct Ipv4UdpPacket {
     identification: u16,
 }
 
+// ── ICMP ──────────────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone)]
 struct Ipv4IcmpEchoPacket {
     src_ip: Ipv4Addr,
@@ -26,10 +33,51 @@ struct Ipv4IcmpEchoPacket {
     icmp_segment: Vec<u8>,
 }
 
+// ── TCP flow table ────────────────────────────────────────────────────────────
+
+const TCP_SYN: u8 = 0x02;
+const TCP_ACK: u8 = 0x10;
+const TCP_PSH: u8 = 0x08;
+const TCP_FIN: u8 = 0x01;
+
+/// 4-tuple key: (client_virtual_ip, client_port, server_ip, server_port)
+type FlowKey = (Ipv4Addr, u16, Ipv4Addr, u16);
+
+struct TcpFlowEntry {
+    stream: Arc<Mutex<TcpStream>>,
+    /// Next sequence number the server will use when sending data.
+    server_seq: u32,
+}
+
+/// Per-client-session TCP NAT flow table.  One instance is created per
+/// authenticated VPN session before the frame-receive loop starts, and dropped
+/// when the session ends.
+#[derive(Clone, Default)]
+pub struct TcpFlowTable {
+    flows: Arc<Mutex<HashMap<FlowKey, TcpFlowEntry>>>,
+}
+
+#[derive(Debug)]
+struct Ipv4TcpPacket {
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    #[allow(dead_code)]
+    ack_seq: u32,
+    flags: u8,
+    payload: Vec<u8>,
+}
+
+// ── Main forwarding entry-point ───────────────────────────────────────────────
+
 pub async fn forward_frame(
     frame: SessionFrame,
     upstream_tcp_target: Option<&str>,
+    tcp_flows: &TcpFlowTable,
 ) -> anyhow::Result<Option<SessionFrame>> {
+    // ── UDP ───────────────────────────────────────────────────────────────────
     if let Some(udp_packet) = parse_ipv4_udp_packet(&frame.payload) {
         debug!(
             src_ip = %udp_packet.src_ip,
@@ -108,6 +156,7 @@ pub async fn forward_frame(
         }));
     }
 
+    // ── ICMP ──────────────────────────────────────────────────────────────────
     if let Some(icmp_packet) = parse_ipv4_icmp_echo_packet(&frame.payload) {
         debug!(
             src_ip = %icmp_packet.src_ip,
@@ -157,6 +206,12 @@ pub async fn forward_frame(
         }));
     }
 
+    // ── TCP (VPN packet-level NAT/proxy) ──────────────────────────────────────
+    if let Some(tcp_pkt) = parse_ipv4_tcp_packet(&frame.payload) {
+        return handle_tcp_frame(frame, tcp_pkt, tcp_flows).await;
+    }
+
+    // ── Raw upstream TCP byte-pipe (legacy fallback) ──────────────────────────
     if let Some(target) = upstream_tcp_target.filter(|value| !value.trim().is_empty()) {
         debug!(
             target = %target,
@@ -197,6 +252,167 @@ pub async fn forward_frame(
 
     Ok(Some(frame))
 }
+
+// ── TCP NAT handler ───────────────────────────────────────────────────────────
+
+async fn handle_tcp_frame(
+    frame: SessionFrame,
+    pkt: Ipv4TcpPacket,
+    flows: &TcpFlowTable,
+) -> anyhow::Result<Option<SessionFrame>> {
+    // Fixed ISN for simplicity; a production implementation would use a random value.
+    const SERVER_ISN: u32 = 0x1234_5678;
+    const WINDOW: u16 = 65535;
+
+    let key: FlowKey = (pkt.src_ip, pkt.src_port, pkt.dst_ip, pkt.dst_port);
+
+    // ── SYN: open upstream connection, synthesise SYN-ACK ────────────────────
+    if pkt.flags & TCP_SYN != 0 && pkt.flags & TCP_ACK == 0 {
+        let target = SocketAddrV4::new(pkt.dst_ip, pkt.dst_port);
+        let upstream = TcpStream::connect(target).await?;
+        debug!(
+            src_ip = %pkt.src_ip, src_port = pkt.src_port,
+            dst_ip = %pkt.dst_ip, dst_port = pkt.dst_port,
+            "TCP SYN: upstream connected"
+        );
+        flows.flows.lock().await.insert(
+            key,
+            TcpFlowEntry {
+                stream: Arc::new(Mutex::new(upstream)),
+                // SYN-ACK consumes one sequence number; first data byte is ISN+1.
+                server_seq: SERVER_ISN.wrapping_add(1),
+            },
+        );
+        let syn_ack = build_ipv4_tcp_packet(
+            pkt.dst_ip,
+            pkt.src_ip,
+            pkt.dst_port,
+            pkt.src_port,
+            SERVER_ISN,
+            pkt.seq.wrapping_add(1),
+            TCP_SYN | TCP_ACK,
+            WINDOW,
+            &[],
+        );
+        return Ok(Some(SessionFrame {
+            header: frame.header,
+            payload: syn_ack.into(),
+        }));
+    }
+
+    // ── FIN: tear down flow, send FIN-ACK ────────────────────────────────────
+    if pkt.flags & TCP_FIN != 0 {
+        let entry = flows.flows.lock().await.remove(&key);
+        let server_seq = entry.map_or(SERVER_ISN.wrapping_add(1), |e| e.server_seq);
+        debug!(
+            src_ip = %pkt.src_ip, src_port = pkt.src_port,
+            "TCP FIN: removing flow"
+        );
+        let fin_ack = build_ipv4_tcp_packet(
+            pkt.dst_ip,
+            pkt.src_ip,
+            pkt.dst_port,
+            pkt.src_port,
+            server_seq,
+            pkt.seq.wrapping_add(1),
+            TCP_FIN | TCP_ACK,
+            WINDOW,
+            &[],
+        );
+        return Ok(Some(SessionFrame {
+            header: frame.header,
+            payload: fin_ack.into(),
+        }));
+    }
+
+    // ── PSH: forward payload to upstream, read response ───────────────────────
+    if pkt.flags & TCP_PSH != 0 && !pkt.payload.is_empty() {
+        // Grab a clone of the stream Arc without holding the table lock during I/O.
+        let stream_arc = flows
+            .flows
+            .lock()
+            .await
+            .get(&key)
+            .map(|e| e.stream.clone());
+
+        let Some(stream_arc) = stream_arc else {
+            debug!(
+                src_ip = %pkt.src_ip, src_port = pkt.src_port,
+                "TCP PSH for unknown flow, dropping"
+            );
+            return Ok(None);
+        };
+
+        let (n, response) = {
+            let mut stream = stream_arc.lock().await;
+            stream.write_all(&pkt.payload).await?;
+            stream.flush().await?;
+
+            let mut buf = vec![0u8; 65535];
+            let n = match timeout(Duration::from_millis(1200), stream.read(&mut buf)).await {
+                Ok(Ok(n)) => n,
+                Ok(Err(err)) => return Err(err.into()),
+                Err(_) => {
+                    debug!(
+                        src_ip = %pkt.src_ip, src_port = pkt.src_port,
+                        "TCP upstream read timeout (1200ms)"
+                    );
+                    return Ok(None);
+                }
+            };
+            buf.truncate(n);
+            (n, buf)
+        };
+
+        if n == 0 {
+            // Upstream closed connection; no data to return.
+            return Ok(None);
+        }
+
+        // Advance the server's tracked sequence number.
+        let server_seq = {
+            let mut table = flows.flows.lock().await;
+            if let Some(entry) = table.get_mut(&key) {
+                let seq = entry.server_seq;
+                entry.server_seq = seq.wrapping_add(n as u32);
+                seq
+            } else {
+                SERVER_ISN.wrapping_add(1)
+            }
+        };
+
+        let resp_pkt = build_ipv4_tcp_packet(
+            pkt.dst_ip,
+            pkt.src_ip,
+            pkt.dst_port,
+            pkt.src_port,
+            server_seq,
+            pkt.seq.wrapping_add(pkt.payload.len() as u32),
+            TCP_PSH | TCP_ACK,
+            WINDOW,
+            &response,
+        );
+        debug!(
+            src_ip = %pkt.src_ip, src_port = pkt.src_port,
+            response_bytes = n,
+            "TCP PSH: forwarded and built response"
+        );
+        return Ok(Some(SessionFrame {
+            header: frame.header,
+            payload: resp_pkt.into(),
+        }));
+    }
+
+    // ── Pure ACK (handshake completion or keepalive): no response needed ──────
+    debug!(
+        src_ip = %pkt.src_ip, src_port = pkt.src_port,
+        flags = pkt.flags,
+        "TCP ACK (no data): no response"
+    );
+    Ok(None)
+}
+
+// ── ICMP helper ───────────────────────────────────────────────────────────────
 
 async fn send_icmp_echo_and_wait_reply(
     dst_ip: Ipv4Addr,
@@ -241,7 +457,7 @@ async fn send_icmp_echo_and_wait_reply(
             let reply_type = response[0];
             let reply_code = response[1];
             // SOCK_DGRAM ICMP sockets cause the Linux kernel to rewrite the echo
-            // identifier with the socket's own ephemeral identifier.  Only check
+            // identifier with the socket'"'"'s own ephemeral identifier.  Only check
             // the sequence number to match the reply; restore the caller-supplied
             // identifier afterwards so that the VPN client sees a coherent packet.
             let reply_sequence = u16::from_be_bytes([response[6], response[7]]);
@@ -258,6 +474,8 @@ async fn send_icmp_echo_and_wait_reply(
     })
     .await?
 }
+
+// ── Packet parsers ────────────────────────────────────────────────────────────
 
 fn parse_ipv4_udp_packet(packet: &[u8]) -> Option<Ipv4UdpPacket> {
     if packet.len() < 28 {
@@ -368,6 +586,50 @@ fn parse_ipv4_icmp_echo_packet(packet: &[u8]) -> Option<Ipv4IcmpEchoPacket> {
     })
 }
 
+fn parse_ipv4_tcp_packet(packet: &[u8]) -> Option<Ipv4TcpPacket> {
+    if packet.len() < 40 {
+        return None;
+    }
+    let version = packet[0] >> 4;
+    let ihl = (packet[0] & 0x0f) as usize;
+    if version != 4 || ihl < 5 {
+        return None;
+    }
+    let ip_hdr_len = ihl * 4;
+    if packet[9] != 6 {
+        return None; // not TCP
+    }
+    let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+    if total_len > packet.len() || total_len < ip_hdr_len + 20 {
+        return None;
+    }
+    let src_ip = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+    let dst_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+    let tcp = &packet[ip_hdr_len..total_len];
+    let src_port = u16::from_be_bytes([tcp[0], tcp[1]]);
+    let dst_port = u16::from_be_bytes([tcp[2], tcp[3]]);
+    let seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
+    let ack_seq = u32::from_be_bytes([tcp[8], tcp[9], tcp[10], tcp[11]]);
+    let tcp_hdr_len = ((tcp[12] >> 4) as usize) * 4;
+    if tcp_hdr_len < 20 || tcp.len() < tcp_hdr_len {
+        return None;
+    }
+    let flags = tcp[13];
+    let payload = tcp[tcp_hdr_len..].to_vec();
+    Some(Ipv4TcpPacket {
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        seq,
+        ack_seq,
+        flags,
+        payload,
+    })
+}
+
+// ── Packet builders ───────────────────────────────────────────────────────────
+
 fn build_ipv4_udp_packet(
     src_ip: Ipv4Addr,
     dst_ip: Ipv4Addr,
@@ -452,6 +714,52 @@ fn build_ipv4_icmp_packet(
     Ok(packet)
 }
 
+fn build_ipv4_tcp_packet(
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack_seq: u32,
+    flags: u8,
+    window: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let ip_hlen = 20usize;
+    let tcp_hlen = 20usize;
+    let total = ip_hlen + tcp_hlen + payload.len();
+    let mut pkt = vec![0u8; total];
+
+    // IPv4 header
+    pkt[0] = 0x45; // version=4, IHL=5
+    pkt[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+    pkt[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // DF
+    pkt[8] = 64; // TTL
+    pkt[9] = 6; // TCP
+    pkt[12..16].copy_from_slice(&src_ip.octets());
+    pkt[16..20].copy_from_slice(&dst_ip.octets());
+    let ip_cksum = checksum_ones_complement(&pkt[..ip_hlen]);
+    pkt[10..12].copy_from_slice(&ip_cksum.to_be_bytes());
+
+    // TCP header
+    pkt[20..22].copy_from_slice(&src_port.to_be_bytes());
+    pkt[22..24].copy_from_slice(&dst_port.to_be_bytes());
+    pkt[24..28].copy_from_slice(&seq.to_be_bytes());
+    pkt[28..32].copy_from_slice(&ack_seq.to_be_bytes());
+    pkt[32] = 0x50; // data offset = 5 (20 bytes, no options)
+    pkt[33] = flags;
+    pkt[34..36].copy_from_slice(&window.to_be_bytes());
+    // [36..38] = checksum (computed below); [38..40] = urgent pointer = 0
+    if !payload.is_empty() {
+        pkt[40..].copy_from_slice(payload);
+    }
+    let tcp_cksum = tcp_checksum_ipv4(src_ip, dst_ip, &pkt[ip_hlen..]);
+    pkt[36..38].copy_from_slice(&tcp_cksum.to_be_bytes());
+    pkt
+}
+
+// ── Checksum helpers ──────────────────────────────────────────────────────────
+
 fn checksum_ones_complement(bytes: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     let mut i = 0usize;
@@ -491,9 +799,31 @@ fn udp_checksum_ipv4(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, udp_segment: &[u8]) -> 
     }
 }
 
+fn tcp_checksum_ipv4(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, tcp_segment: &[u8]) -> u16 {
+    let seg_len = tcp_segment.len();
+    let mut pseudo = Vec::with_capacity(12 + seg_len + (seg_len % 2));
+    pseudo.extend_from_slice(&src_ip.octets());
+    pseudo.extend_from_slice(&dst_ip.octets());
+    pseudo.push(0);
+    pseudo.push(6); // TCP protocol number
+    pseudo.extend_from_slice(&(seg_len as u16).to_be_bytes());
+    pseudo.extend_from_slice(tcp_segment);
+    if seg_len % 2 == 1 {
+        pseudo.push(0);
+    }
+    let cksum = checksum_ones_complement(&pseudo);
+    if cksum == 0 {
+        0xffff
+    } else {
+        cksum
+    }
+}
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
-    use super::forward_frame;
+    use super::{forward_frame, TcpFlowTable};
     use bonded_core::session::{SessionFrame, SessionHeader};
     use bytes::Bytes;
     use std::net::Ipv4Addr;
@@ -511,7 +841,7 @@ mod tests {
             payload: Bytes::from_static(b"hello"),
         };
 
-        let result = forward_frame(frame.clone(), None)
+        let result = forward_frame(frame.clone(), None, &TcpFlowTable::default())
             .await
             .expect("forwarding should succeed")
             .expect("non-udp frame should be returned");
@@ -547,7 +877,7 @@ mod tests {
             payload: Bytes::from_static(b"hello"),
         };
 
-        let result = forward_frame(frame, Some(&addr.to_string()))
+        let result = forward_frame(frame, Some(&addr.to_string()), &TcpFlowTable::default())
             .await
             .expect("forwarding should succeed")
             .expect("upstream response should be returned");
@@ -595,7 +925,7 @@ mod tests {
             payload: request_payload.into(),
         };
 
-        let response = forward_frame(frame, None)
+        let response = forward_frame(frame, None, &TcpFlowTable::default())
             .await
             .expect("forwarding should succeed")
             .expect("udp relay should return response frame");
