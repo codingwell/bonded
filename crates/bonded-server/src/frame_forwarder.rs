@@ -1,6 +1,6 @@
 use bonded_core::session::{SessionFrame, SessionHeader};
 use socket2::{Domain, Protocol, Socket, Type};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
@@ -118,6 +118,13 @@ impl UdpSessionTracker {
             .remove(&(session_id, key.clone()));
     }
 
+    pub fn clear_session(&self, session_id: u64) {
+        self.inner
+            .write()
+            .expect("udp tracker write lock should not be poisoned")
+            .retain(|(entry_session_id, _), _| *entry_session_id != session_id);
+    }
+
     pub fn snapshot(&self) -> Vec<UdpFlowSnapshot> {
         let now = SystemTime::now();
         let mut rows: Vec<UdpFlowSnapshot> = self
@@ -145,6 +152,179 @@ impl UdpSessionTracker {
                 .then_with(|| left.client_dst.cmp(&right.client_dst))
         });
         rows
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TcpFlowStatus {
+    session_id: u64,
+    src_ip: Ipv4Addr,
+    src_port: u16,
+    dst_ip: Ipv4Addr,
+    dst_port: u16,
+    created_at: SystemTime,
+    last_activity_at: SystemTime,
+}
+
+#[derive(Debug, Clone)]
+pub struct TcpFlowSnapshot {
+    pub session_id: u64,
+    pub client_src: String,
+    pub client_dst: String,
+    pub created_ago: String,
+    pub last_activity_ago: String,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct TcpSessionTracker {
+    inner: Arc<RwLock<HashMap<(u64, (Ipv4Addr, u16, Ipv4Addr, u16)), TcpFlowStatus>>>,
+}
+
+impl TcpSessionTracker {
+    fn register_flow(&self, session_id: u64, key: (Ipv4Addr, u16, Ipv4Addr, u16)) {
+        let now = SystemTime::now();
+        self.inner
+            .write()
+            .expect("tcp tracker write lock should not be poisoned")
+            .insert(
+                (session_id, key),
+                TcpFlowStatus {
+                    session_id,
+                    src_ip: key.0,
+                    src_port: key.1,
+                    dst_ip: key.2,
+                    dst_port: key.3,
+                    created_at: now,
+                    last_activity_at: now,
+                },
+            );
+    }
+
+    fn touch_flow(&self, session_id: u64, key: (Ipv4Addr, u16, Ipv4Addr, u16)) {
+        if let Some(entry) = self
+            .inner
+            .write()
+            .expect("tcp tracker write lock should not be poisoned")
+            .get_mut(&(session_id, key))
+        {
+            entry.last_activity_at = SystemTime::now();
+        }
+    }
+
+    fn remove_flow(&self, session_id: u64, key: (Ipv4Addr, u16, Ipv4Addr, u16)) {
+        self.inner
+            .write()
+            .expect("tcp tracker write lock should not be poisoned")
+            .remove(&(session_id, key));
+    }
+
+    pub fn clear_session(&self, session_id: u64) {
+        self.inner
+            .write()
+            .expect("tcp tracker write lock should not be poisoned")
+            .retain(|(entry_session_id, _), _| *entry_session_id != session_id);
+    }
+
+    pub fn snapshot(&self) -> Vec<TcpFlowSnapshot> {
+        let now = SystemTime::now();
+        let mut rows: Vec<TcpFlowSnapshot> = self
+            .inner
+            .read()
+            .expect("tcp tracker read lock should not be poisoned")
+            .values()
+            .map(|entry| TcpFlowSnapshot {
+                session_id: entry.session_id,
+                client_src: format!("{}:{}", entry.src_ip, entry.src_port),
+                client_dst: format!("{}:{}", entry.dst_ip, entry.dst_port),
+                created_ago: format_elapsed(now, entry.created_at),
+                last_activity_ago: format_elapsed(now, entry.last_activity_at),
+            })
+            .collect();
+
+        rows.sort_by(|left, right| {
+            left.session_id
+                .cmp(&right.session_id)
+                .then_with(|| left.client_src.cmp(&right.client_src))
+                .then_with(|| left.client_dst.cmp(&right.client_dst))
+        });
+        rows
+    }
+}
+
+#[derive(Debug, Clone)]
+struct IcmpProbeStatus {
+    session_id: u64,
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    echo_identifier: u16,
+    echo_sequence: u16,
+    outcome: String,
+    observed_at: SystemTime,
+}
+
+#[derive(Debug, Clone)]
+pub struct IcmpProbeSnapshot {
+    pub session_id: u64,
+    pub client_src: String,
+    pub client_dst: String,
+    pub echo_identifier: u16,
+    pub echo_sequence: u16,
+    pub outcome: String,
+    pub observed_ago: String,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct IcmpSessionTracker {
+    inner: Arc<RwLock<VecDeque<IcmpProbeStatus>>>,
+}
+
+impl IcmpSessionTracker {
+    const MAX_EVENTS: usize = 256;
+
+    fn record_probe(&self, session_id: u64, packet: &Ipv4IcmpEchoPacket, outcome: &str) {
+        let mut guard = self
+            .inner
+            .write()
+            .expect("icmp tracker write lock should not be poisoned");
+
+        guard.push_front(IcmpProbeStatus {
+            session_id,
+            src_ip: packet.src_ip,
+            dst_ip: packet.dst_ip,
+            echo_identifier: packet.echo_identifier,
+            echo_sequence: packet.echo_sequence,
+            outcome: outcome.to_owned(),
+            observed_at: SystemTime::now(),
+        });
+
+        while guard.len() > Self::MAX_EVENTS {
+            let _ = guard.pop_back();
+        }
+    }
+
+    pub fn clear_session(&self, session_id: u64) {
+        self.inner
+            .write()
+            .expect("icmp tracker write lock should not be poisoned")
+            .retain(|entry| entry.session_id != session_id);
+    }
+
+    pub fn snapshot(&self) -> Vec<IcmpProbeSnapshot> {
+        let now = SystemTime::now();
+        self.inner
+            .read()
+            .expect("icmp tracker read lock should not be poisoned")
+            .iter()
+            .map(|entry| IcmpProbeSnapshot {
+                session_id: entry.session_id,
+                client_src: format!("{}", entry.src_ip),
+                client_dst: format!("{}", entry.dst_ip),
+                echo_identifier: entry.echo_identifier,
+                echo_sequence: entry.echo_sequence,
+                outcome: entry.outcome.clone(),
+                observed_ago: format_elapsed(now, entry.observed_at),
+            })
+            .collect()
     }
 }
 
@@ -404,6 +584,9 @@ pub async fn forward_frame(
     upstream_tcp_target: Option<&str>,
     tcp_flows: &TcpFlowTable,
     udp_sessions: &UdpSessionManager,
+    tcp_tracker: &TcpSessionTracker,
+    icmp_tracker: &IcmpSessionTracker,
+    session_id: u64,
 ) -> anyhow::Result<Option<SessionFrame>> {
     // ── UDP ───────────────────────────────────────────────────────────────────
     if let Some(udp_packet) = parse_ipv4_udp_packet(&frame.payload) {
@@ -442,6 +625,7 @@ pub async fn forward_frame(
         .await?;
 
         let Some(reply_icmp_segment) = reply else {
+            icmp_tracker.record_probe(session_id, &icmp_packet, "timeout");
             debug!(
                 src_ip = %icmp_packet.src_ip,
                 dst_ip = %icmp_packet.dst_ip,
@@ -466,6 +650,7 @@ pub async fn forward_frame(
             response_packet_size = response_packet.len(),
             "ICMP echo response packet built for client"
         );
+        icmp_tracker.record_probe(session_id, &icmp_packet, "reply");
         return Ok(Some(SessionFrame {
             header: frame.header,
             payload: response_packet.into(),
@@ -474,7 +659,7 @@ pub async fn forward_frame(
 
     // ── TCP (VPN packet-level NAT/proxy) ──────────────────────────────────────
     if let Some(tcp_pkt) = parse_ipv4_tcp_packet(&frame.payload) {
-        return handle_tcp_frame(frame, tcp_pkt, tcp_flows).await;
+        return handle_tcp_frame(frame, tcp_pkt, tcp_flows, tcp_tracker, session_id).await;
     }
 
     // ── Raw upstream TCP byte-pipe (legacy fallback) ──────────────────────────
@@ -525,6 +710,8 @@ async fn handle_tcp_frame(
     frame: SessionFrame,
     pkt: Ipv4TcpPacket,
     flows: &TcpFlowTable,
+    tcp_tracker: &TcpSessionTracker,
+    session_id: u64,
 ) -> anyhow::Result<Option<SessionFrame>> {
     // Fixed ISN for simplicity; a production implementation would use a random value.
     const SERVER_ISN: u32 = 0x1234_5678;
@@ -549,6 +736,7 @@ async fn handle_tcp_frame(
                 server_seq: SERVER_ISN.wrapping_add(1),
             },
         );
+        tcp_tracker.register_flow(session_id, key);
         let syn_ack = build_ipv4_tcp_packet(
             pkt.dst_ip,
             pkt.src_ip,
@@ -569,6 +757,7 @@ async fn handle_tcp_frame(
     // ── FIN: tear down flow, send FIN-ACK ────────────────────────────────────
     if pkt.flags & TCP_FIN != 0 {
         let entry = flows.flows.lock().await.remove(&key);
+        tcp_tracker.remove_flow(session_id, key);
         let server_seq = entry.map_or(SERVER_ISN.wrapping_add(1), |e| e.server_seq);
         debug!(
             src_ip = %pkt.src_ip, src_port = pkt.src_port,
@@ -627,8 +816,12 @@ async fn handle_tcp_frame(
 
         if n == 0 {
             // Upstream closed connection; no data to return.
+            flows.flows.lock().await.remove(&key);
+            tcp_tracker.remove_flow(session_id, key);
             return Ok(None);
         }
+
+        tcp_tracker.touch_flow(session_id, key);
 
         // Advance the server's tracked sequence number.
         let server_seq = {
@@ -1084,7 +1277,10 @@ fn tcp_checksum_ipv4(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, tcp_segment: &[u8]) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{forward_frame, TcpFlowTable, UdpSessionManager, UdpSessionTracker};
+    use super::{
+        forward_frame, IcmpSessionTracker, TcpFlowTable, TcpSessionTracker, UdpSessionManager,
+        UdpSessionTracker,
+    };
     use bonded_core::session::{SessionFrame, SessionHeader};
     use bytes::Bytes;
     use std::net::Ipv4Addr;
@@ -1115,10 +1311,18 @@ mod tests {
         };
 
         let (udp_manager, _rx, _tracker) = build_udp_manager();
-        let result = forward_frame(frame.clone(), None, &TcpFlowTable::default(), &udp_manager)
-            .await
-            .expect("forwarding should succeed")
-            .expect("non-udp frame should be returned");
+        let result = forward_frame(
+            frame.clone(),
+            None,
+            &TcpFlowTable::default(),
+            &udp_manager,
+            &TcpSessionTracker::default(),
+            &IcmpSessionTracker::default(),
+            1,
+        )
+        .await
+        .expect("forwarding should succeed")
+        .expect("non-udp frame should be returned");
         assert_eq!(result, frame);
     }
 
@@ -1157,6 +1361,9 @@ mod tests {
             Some(&addr.to_string()),
             &TcpFlowTable::default(),
             &udp_manager,
+            &TcpSessionTracker::default(),
+            &IcmpSessionTracker::default(),
+            1,
         )
         .await
         .expect("forwarding should succeed")
@@ -1206,9 +1413,17 @@ mod tests {
         };
 
         let (udp_manager, mut rx, tracker) = build_udp_manager();
-        let response = forward_frame(frame, None, &TcpFlowTable::default(), &udp_manager)
-            .await
-            .expect("forwarding should succeed");
+        let response = forward_frame(
+            frame,
+            None,
+            &TcpFlowTable::default(),
+            &udp_manager,
+            &TcpSessionTracker::default(),
+            &IcmpSessionTracker::default(),
+            1,
+        )
+        .await
+        .expect("forwarding should succeed");
         assert!(
             response.is_none(),
             "udp forwarding is async and should not return inline frame"

@@ -19,7 +19,10 @@ use bonded_core::config::{load_server_config, ServerConfig, DEFAULT_SERVER_CONFI
 use bonded_core::session::{SessionFrame, SessionHeader, FLAG_PING, FLAG_PONG};
 use bonded_core::transport::{NaiveTcpTransport, Transport};
 use clap::Parser;
-use frame_forwarder::{forward_frame, TcpFlowTable, UdpSessionManager, UdpSessionTracker};
+use frame_forwarder::{
+    forward_frame, IcmpSessionTracker, TcpFlowTable, TcpSessionTracker, UdpSessionManager,
+    UdpSessionTracker,
+};
 use health::run_health_server;
 use invite_tokens::ensure_startup_invite;
 use pairing_qr::emit_pairing_qr;
@@ -88,12 +91,23 @@ async fn main() -> anyhow::Result<()> {
 
     let sessions = SessionRegistry::default();
     let udp_tracker = UdpSessionTracker::default();
+    let tcp_tracker = TcpSessionTracker::default();
+    let icmp_tracker = IcmpSessionTracker::default();
 
     let status_bind = cfg.server.status_bind.clone();
     let status_sessions = sessions.clone();
     let status_udp_tracker = udp_tracker.clone();
+    let status_tcp_tracker = tcp_tracker.clone();
+    let status_icmp_tracker = icmp_tracker.clone();
     tokio::spawn(async move {
-        if let Err(err) = run_status_server(&status_bind, status_sessions, status_udp_tracker).await
+        if let Err(err) = run_status_server(
+            &status_bind,
+            status_sessions,
+            status_udp_tracker,
+            status_tcp_tracker,
+            status_icmp_tracker,
+        )
+        .await
         {
             error!(bind = %status_bind, error = %err, "status listener terminated");
         }
@@ -105,6 +119,8 @@ async fn main() -> anyhow::Result<()> {
     let websocket_invites = cfg.server.invite_tokens_file.clone();
     let websocket_sessions = sessions.clone();
     let websocket_udp_tracker = udp_tracker.clone();
+    let websocket_tcp_tracker = tcp_tracker.clone();
+    let websocket_icmp_tracker = icmp_tracker.clone();
     let websocket_keys = authorized_keys.clone();
     let websocket_tls_acceptor = load_websocket_tls_acceptor(
         &cfg.server.websocket_tls_cert_file,
@@ -118,6 +134,8 @@ async fn main() -> anyhow::Result<()> {
             websocket_keys,
             websocket_sessions,
             websocket_udp_tracker,
+            websocket_tcp_tracker,
+            websocket_icmp_tracker,
             websocket_tls_acceptor,
         )
         .await
@@ -133,6 +151,8 @@ async fn main() -> anyhow::Result<()> {
         authorized_keys,
         sessions,
         udp_tracker,
+        tcp_tracker,
+        icmp_tracker,
     )
     .await
 }
@@ -178,6 +198,8 @@ async fn run_websocket_server(
     authorized_keys: AuthorizedKeysStore,
     sessions: SessionRegistry,
     udp_tracker: UdpSessionTracker,
+    tcp_tracker: TcpSessionTracker,
+    icmp_tracker: IcmpSessionTracker,
     tls_acceptor: Option<TlsAcceptor>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(bind).await?;
@@ -195,6 +217,8 @@ async fn run_websocket_server(
         let authorized_keys = authorized_keys.clone();
         let sessions = sessions.clone();
         let udp_tracker = udp_tracker.clone();
+        let tcp_tracker = tcp_tracker.clone();
+        let icmp_tracker = icmp_tracker.clone();
         let upstream_tcp_target = upstream_tcp_target.to_owned();
         let invite_tokens_file = invite_tokens_file.to_owned();
         let tls_acceptor = tls_acceptor.clone();
@@ -247,7 +271,7 @@ async fn run_websocket_server(
                     let tcp_flows = TcpFlowTable::default();
                     let (udp_tx, mut udp_rx) = mpsc::unbounded_channel();
                     let udp_sessions =
-                        UdpSessionManager::new(handle.session_id, udp_tx, udp_tracker);
+                        UdpSessionManager::new(handle.session_id, udp_tx, udp_tracker.clone());
 
                     loop {
                         tokio::select! {
@@ -317,6 +341,9 @@ async fn run_websocket_server(
                                             },
                                             &tcp_flows,
                                             &udp_sessions,
+                                            &tcp_tracker,
+                                            &icmp_tracker,
+                                            handle.session_id,
                                         )
                                         .await
                                         {
@@ -364,6 +391,9 @@ async fn run_websocket_server(
                     }
 
                     sessions.unregister_client(&public_key);
+                    udp_tracker.clear_session(handle.session_id);
+                    tcp_tracker.clear_session(handle.session_id);
+                    icmp_tracker.clear_session(handle.session_id);
                 }
                 Err(err) => {
                     warn!(peer = %peer, error = %err, "websocket client authentication failed");
@@ -424,6 +454,8 @@ async fn run_server(
     authorized_keys: AuthorizedKeysStore,
     sessions: SessionRegistry,
     udp_tracker: UdpSessionTracker,
+    tcp_tracker: TcpSessionTracker,
+    icmp_tracker: IcmpSessionTracker,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(bind).await?;
     info!(bind = %bind, "naive tcp listener bound");
@@ -440,6 +472,8 @@ async fn run_server(
         let authorized_keys = authorized_keys.clone();
         let sessions = sessions.clone();
         let udp_tracker = udp_tracker.clone();
+        let tcp_tracker = tcp_tracker.clone();
+        let icmp_tracker = icmp_tracker.clone();
         let upstream_tcp_target = upstream_tcp_target.to_owned();
         let invite_tokens_file = invite_tokens_file.to_owned();
         tokio::spawn(async move {
@@ -469,7 +503,7 @@ async fn run_server(
                     let tcp_flows = TcpFlowTable::default();
                     let (udp_tx, mut udp_rx) = mpsc::unbounded_channel();
                     let udp_sessions =
-                        UdpSessionManager::new(handle.session_id, udp_tx, udp_tracker);
+                        UdpSessionManager::new(handle.session_id, udp_tx, udp_tracker.clone());
                     loop {
                         tokio::select! {
                             maybe_udp_frame = udp_rx.recv() => {
@@ -538,6 +572,9 @@ async fn run_server(
                                             },
                                             &tcp_flows,
                                             &udp_sessions,
+                                            &tcp_tracker,
+                                            &icmp_tracker,
+                                            handle.session_id,
                                         )
                                         .await
                                         {
@@ -585,6 +622,9 @@ async fn run_server(
                     }
 
                     sessions.unregister_client(&public_key);
+                    udp_tracker.clear_session(handle.session_id);
+                    tcp_tracker.clear_session(handle.session_id);
+                    icmp_tracker.clear_session(handle.session_id);
                 }
                 Err(err) => {
                     warn!(peer = %peer, error = %err, "client authentication failed");
