@@ -114,14 +114,16 @@ fn render_status_page(
         .iter()
         .map(|entry| {
             format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 escape_html(&entry.session_id.to_string()),
                 escape_html(&entry.client_src),
                 escape_html(&entry.client_dst),
                 escape_html(&entry.bound_socket),
                 escape_html(&entry.created_ago),
                 escape_html(&entry.last_client_ago),
-                escape_html(entry.last_remote_ago.as_deref().unwrap_or("never"))
+                escape_html(entry.last_remote_ago.as_deref().unwrap_or("never")),
+                escape_html(&entry.client_to_remote_packets.to_string()),
+                escape_html(&entry.remote_to_client_packets.to_string())
             )
         })
         .collect::<Vec<_>>()
@@ -131,12 +133,14 @@ fn render_status_page(
         .iter()
         .map(|entry| {
             format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 escape_html(&entry.session_id.to_string()),
                 escape_html(&entry.client_src),
                 escape_html(&entry.client_dst),
                 escape_html(&entry.created_ago),
-                escape_html(&entry.last_activity_ago)
+                escape_html(&entry.last_activity_ago),
+                escape_html(&entry.client_to_remote_packets.to_string()),
+                escape_html(&entry.remote_to_client_packets.to_string())
             )
         })
         .collect::<Vec<_>>()
@@ -190,14 +194,14 @@ small {{ color: #6b7280; }}
 <div class="card">
 <h2 id="udp-title">Active UDP Flows ({})</h2>
 <table>
-<thead><tr><th>Session ID</th><th>Client Source</th><th>Remote Target</th><th>Server UDP Socket</th><th>Created</th><th>Last Client Packet</th><th>Last Remote Packet</th></tr></thead>
+<thead><tr><th>Session ID</th><th>Client Source</th><th>Remote Target</th><th>Server UDP Socket</th><th>Created</th><th>Last Client Packet</th><th>Last Remote Packet</th><th>Client->Remote Packets</th><th>Remote->Client Packets</th></tr></thead>
 <tbody id="udp-body">{}</tbody>
 </table>
 </div>
 <div class="card">
 <h2 id="tcp-title">Active TCP Flows ({})</h2>
 <table>
-<thead><tr><th>Session ID</th><th>Client Source</th><th>Remote Target</th><th>Created</th><th>Last Activity</th></tr></thead>
+<thead><tr><th>Session ID</th><th>Client Source</th><th>Remote Target</th><th>Created</th><th>Last Activity</th><th>Client->Remote Packets</th><th>Remote->Client Packets</th></tr></thead>
 <tbody id="tcp-body">{}</tbody>
 </table>
 </div>
@@ -239,15 +243,15 @@ function render(data) {{
     );
     setRows(
         "udp-body",
-        data.udp_flows.map((entry) => `<tr><td>${{escapeHtml(entry.session_id)}}</td><td>${{escapeHtml(entry.client_src)}}</td><td>${{escapeHtml(entry.client_dst)}}</td><td>${{escapeHtml(entry.bound_socket)}}</td><td>${{escapeHtml(entry.created_ago)}}</td><td>${{escapeHtml(entry.last_client_ago)}}</td><td>${{escapeHtml(entry.last_remote_ago ?? "never")}}</td></tr>`),
+        data.udp_flows.map((entry) => `<tr><td>${{escapeHtml(entry.session_id)}}</td><td>${{escapeHtml(entry.client_src)}}</td><td>${{escapeHtml(entry.client_dst)}}</td><td>${{escapeHtml(entry.bound_socket)}}</td><td>${{escapeHtml(entry.created_ago)}}</td><td>${{escapeHtml(entry.last_client_ago)}}</td><td>${{escapeHtml(entry.last_remote_ago ?? "never")}}</td><td>${{escapeHtml(entry.client_to_remote_packets)}}</td><td>${{escapeHtml(entry.remote_to_client_packets)}}</td></tr>`),
         "No active UDP flows.",
-        7
+        9
     );
     setRows(
         "tcp-body",
-        data.tcp_flows.map((entry) => `<tr><td>${{escapeHtml(entry.session_id)}}</td><td>${{escapeHtml(entry.client_src)}}</td><td>${{escapeHtml(entry.client_dst)}}</td><td>${{escapeHtml(entry.created_ago)}}</td><td>${{escapeHtml(entry.last_activity_ago)}}</td></tr>`),
+        data.tcp_flows.map((entry) => `<tr><td>${{escapeHtml(entry.session_id)}}</td><td>${{escapeHtml(entry.client_src)}}</td><td>${{escapeHtml(entry.client_dst)}}</td><td>${{escapeHtml(entry.created_ago)}}</td><td>${{escapeHtml(entry.last_activity_ago)}}</td><td>${{escapeHtml(entry.client_to_remote_packets)}}</td><td>${{escapeHtml(entry.remote_to_client_packets)}}</td></tr>`),
         "No active TCP flows.",
-        5
+        7
     );
     setRows(
         "icmp-body",
@@ -282,13 +286,13 @@ setInterval(refresh, 2000);
         },
         udp_flows.len(),
         if udp_rows.is_empty() {
-            "<tr><td colspan=\"7\">No active UDP flows.</td></tr>".to_owned()
+            "<tr><td colspan=\"9\">No active UDP flows.</td></tr>".to_owned()
         } else {
             udp_rows
         },
         tcp_flows.len(),
         if tcp_rows.is_empty() {
-            "<tr><td colspan=\"5\">No active TCP flows.</td></tr>".to_owned()
+            "<tr><td colspan=\"7\">No active TCP flows.</td></tr>".to_owned()
         } else {
             tcp_rows
         },
@@ -330,6 +334,8 @@ fn render_status_json(
                 "created_ago": entry.created_ago,
                 "last_client_ago": entry.last_client_ago,
                 "last_remote_ago": entry.last_remote_ago,
+                "client_to_remote_packets": entry.client_to_remote_packets,
+                "remote_to_client_packets": entry.remote_to_client_packets,
             })
         })
         .collect::<Vec<_>>();
@@ -343,6 +349,8 @@ fn render_status_json(
                 "client_dst": entry.client_dst,
                 "created_ago": entry.created_ago,
                 "last_activity_ago": entry.last_activity_ago,
+                "client_to_remote_packets": entry.client_to_remote_packets,
+                "remote_to_client_packets": entry.remote_to_client_packets,
             })
         })
         .collect::<Vec<_>>();

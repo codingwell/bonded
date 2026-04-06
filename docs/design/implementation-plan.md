@@ -1,7 +1,7 @@
 # Implementation Plan — Server, Linux Client, Android Client
 
 **Status:** In Progress
-**Last Updated:** 2026-04-06 (session 24)
+**Last Updated:** 2026-04-06 (session 25)
 
 This is a living document. Update the status column and notes as work progresses.
 
@@ -267,7 +267,7 @@ Build the server binary on top of `bonded-core`.
 | 2.14 | Rust-only localhost E2E HTTP diagnostic harness | completed | Added ignored/manual `bonded-server` integration test that boots `run_server` on localhost, resolves `example.com`, drives synthetic IPv4 TCP handshake + HTTP GET over packet relay, and asserts a valid HTTP status line in returned payload |
 | 2.15 | Rust-only localhost E2E SMTP diagnostic harness | completed | Added ignored/manual `bonded-server` integration test that boots `run_server` on localhost, resolves `smtp.gmail.com:587`, drives synthetic IPv4 TCP handshake, sends SMTP `EHLO` and `QUIT`, and asserts SMTP reply codes in returned payload |
 | 2.16 | UDP flow sessions with idle timeout and async return path | completed | Replaced one-shot UDP forwarding with per-session flow table keyed by 4-tuple; each flow now uses a persistent connected ephemeral UDP socket, stays alive for 4 minutes since last client packet, and forwards all upstream UDP packets back to the client asynchronously while active |
-| 2.17 | Status webpage endpoint for live connection state | completed | Added dedicated status listener (`status_bind`, env override `BONDED_STATUS_BIND`) with a live HTML dashboard and `/api/status` JSON endpoint; the page now polls REST data every 2s instead of full-page refreshes, while showing authenticated sessions, active UDP/TCP flows, and recent ICMP probe outcomes |
+| 2.17 | Status webpage endpoint for live connection state | completed | Added dedicated status listener (`status_bind`, env override `BONDED_STATUS_BIND`) with a live HTML dashboard and `/api/status` JSON endpoint; the page polls REST data every 2s instead of full-page refreshes and now shows per-flow packet counts in both directions for active UDP/TCP connections alongside authenticated sessions and recent ICMP probe outcomes |
 
 Acceptance gate:
 

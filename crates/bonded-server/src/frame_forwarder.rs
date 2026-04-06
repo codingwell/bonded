@@ -52,6 +52,8 @@ struct UdpFlowStatus {
     created_at: SystemTime,
     last_client_packet_at: SystemTime,
     last_remote_packet_at: Option<SystemTime>,
+    client_to_remote_packets: u64,
+    remote_to_client_packets: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +65,8 @@ pub struct UdpFlowSnapshot {
     pub created_ago: String,
     pub last_client_ago: String,
     pub last_remote_ago: Option<String>,
+    pub client_to_remote_packets: u64,
+    pub remote_to_client_packets: u64,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -85,6 +89,8 @@ impl UdpSessionTracker {
                     created_at: now,
                     last_client_packet_at: now,
                     last_remote_packet_at: None,
+                    client_to_remote_packets: 0,
+                    remote_to_client_packets: 0,
                 },
             );
     }
@@ -97,6 +103,7 @@ impl UdpSessionTracker {
             .get_mut(&(session_id, key.clone()))
         {
             entry.last_client_packet_at = SystemTime::now();
+            entry.client_to_remote_packets = entry.client_to_remote_packets.saturating_add(1);
         }
     }
 
@@ -108,6 +115,7 @@ impl UdpSessionTracker {
             .get_mut(&(session_id, key.clone()))
         {
             entry.last_remote_packet_at = Some(SystemTime::now());
+            entry.remote_to_client_packets = entry.remote_to_client_packets.saturating_add(1);
         }
     }
 
@@ -142,6 +150,8 @@ impl UdpSessionTracker {
                 last_remote_ago: entry
                     .last_remote_packet_at
                     .map(|value| format_elapsed(now, value)),
+                client_to_remote_packets: entry.client_to_remote_packets,
+                remote_to_client_packets: entry.remote_to_client_packets,
             })
             .collect();
 
@@ -164,6 +174,8 @@ struct TcpFlowStatus {
     dst_port: u16,
     created_at: SystemTime,
     last_activity_at: SystemTime,
+    client_to_remote_packets: u64,
+    remote_to_client_packets: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -173,6 +185,8 @@ pub struct TcpFlowSnapshot {
     pub client_dst: String,
     pub created_ago: String,
     pub last_activity_ago: String,
+    pub client_to_remote_packets: u64,
+    pub remote_to_client_packets: u64,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -196,11 +210,13 @@ impl TcpSessionTracker {
                     dst_port: key.3,
                     created_at: now,
                     last_activity_at: now,
+                    client_to_remote_packets: 0,
+                    remote_to_client_packets: 0,
                 },
             );
     }
 
-    fn touch_flow(&self, session_id: u64, key: (Ipv4Addr, u16, Ipv4Addr, u16)) {
+    fn record_client_packet(&self, session_id: u64, key: (Ipv4Addr, u16, Ipv4Addr, u16)) {
         if let Some(entry) = self
             .inner
             .write()
@@ -208,6 +224,19 @@ impl TcpSessionTracker {
             .get_mut(&(session_id, key))
         {
             entry.last_activity_at = SystemTime::now();
+            entry.client_to_remote_packets = entry.client_to_remote_packets.saturating_add(1);
+        }
+    }
+
+    fn record_remote_packet(&self, session_id: u64, key: (Ipv4Addr, u16, Ipv4Addr, u16)) {
+        if let Some(entry) = self
+            .inner
+            .write()
+            .expect("tcp tracker write lock should not be poisoned")
+            .get_mut(&(session_id, key))
+        {
+            entry.last_activity_at = SystemTime::now();
+            entry.remote_to_client_packets = entry.remote_to_client_packets.saturating_add(1);
         }
     }
 
@@ -238,6 +267,8 @@ impl TcpSessionTracker {
                 client_dst: format!("{}:{}", entry.dst_ip, entry.dst_port),
                 created_ago: format_elapsed(now, entry.created_at),
                 last_activity_ago: format_elapsed(now, entry.last_activity_at),
+                client_to_remote_packets: entry.client_to_remote_packets,
+                remote_to_client_packets: entry.remote_to_client_packets,
             })
             .collect();
 
@@ -737,6 +768,8 @@ async fn handle_tcp_frame(
             },
         );
         tcp_tracker.register_flow(session_id, key);
+        tcp_tracker.record_client_packet(session_id, key);
+        tcp_tracker.record_remote_packet(session_id, key);
         let syn_ack = build_ipv4_tcp_packet(
             pkt.dst_ip,
             pkt.src_ip,
@@ -756,6 +789,8 @@ async fn handle_tcp_frame(
 
     // ── FIN: tear down flow, send FIN-ACK ────────────────────────────────────
     if pkt.flags & TCP_FIN != 0 {
+        tcp_tracker.record_client_packet(session_id, key);
+        tcp_tracker.record_remote_packet(session_id, key);
         let entry = flows.flows.lock().await.remove(&key);
         tcp_tracker.remove_flow(session_id, key);
         let server_seq = entry.map_or(SERVER_ISN.wrapping_add(1), |e| e.server_seq);
@@ -782,6 +817,7 @@ async fn handle_tcp_frame(
 
     // ── PSH: forward payload to upstream, read response ───────────────────────
     if pkt.flags & TCP_PSH != 0 && !pkt.payload.is_empty() {
+        tcp_tracker.record_client_packet(session_id, key);
         // Grab a clone of the stream Arc without holding the table lock during I/O.
         let stream_arc = flows.flows.lock().await.get(&key).map(|e| e.stream.clone());
 
@@ -821,7 +857,7 @@ async fn handle_tcp_frame(
             return Ok(None);
         }
 
-        tcp_tracker.touch_flow(session_id, key);
+        tcp_tracker.record_remote_packet(session_id, key);
 
         // Advance the server's tracked sequence number.
         let server_seq = {
@@ -863,6 +899,7 @@ async fn handle_tcp_frame(
         flags = pkt.flags,
         "TCP ACK (no data): no response"
     );
+    tcp_tracker.record_client_packet(session_id, key);
     Ok(None)
 }
 
