@@ -1,7 +1,7 @@
 # Implementation Plan — Server, Linux Client, Android Client
 
 **Status:** In Progress
-**Last Updated:** 2026-04-06 (session 21)
+**Last Updated:** 2026-04-06 (session 22)
 
 This is a living document. Update the status column and notes as work progresses.
 
@@ -252,7 +252,7 @@ Build the server binary on top of `bonded-core`.
 
 | # | Task | Status | Notes |
 |---|------|--------|-------|
-| 2.1 | Server config loading (env vars + config file) | completed | Server loads TOML via `BONDED_CONFIG`/`--config`, falls back to defaults on read failure, and applies env overrides for bind/public/health/log/protocol/key paths |
+| 2.1 | Server config loading (env vars + config file) | completed | Server loads TOML via `BONDED_CONFIG`/`--config`, falls back to defaults on read failure, applies env overrides for bind/public/health/log/protocol/key paths, and now deserializes partial `server.toml` files by filling missing options from defaults |
 | 2.2 | Authorized keys file — load, watch for changes, reload | completed | Added server authorized key store loading from TOML plus `notify` watcher callbacks; hardened watcher to ignore non-mutating access events and debounce rapid bursts to avoid self-triggered tight reload loops; server startup pre-creates missing state files/directories so operators only need to provide `server.toml` |
 | 2.3 | Accept NaiveTCP connections, perform auth handshake | completed | Added NaiveTCP listener accept loop and line-delimited JSON challenge-signature handshake with authorized-key enforcement |
 | 2.4 | Server-side session management (multiple concurrent clients) | completed | Added concurrent session registry keyed by authenticated client key with unique server session IDs and per-connection frame receive loop lifecycle |

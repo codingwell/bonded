@@ -51,6 +51,7 @@ pub enum ConfigError {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
+    #[serde(default)]
     pub server: ServerSection,
 }
 
@@ -63,6 +64,7 @@ impl Default for ServerConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ServerSection {
     pub bind: String,
     pub websocket_bind: String,
@@ -169,5 +171,33 @@ mod tests {
         assert_eq!(cfg.server.status_bind, "0.0.0.0:8082");
         assert!(cfg.server.websocket_tls_cert_file.is_empty());
         assert!(cfg.server.websocket_tls_key_file.is_empty());
+    }
+
+    #[test]
+    fn server_config_parses_with_missing_options_using_defaults() {
+        let cfg: ServerConfig = toml::from_str(
+            r#"
+[server]
+bind = "127.0.0.1:9000"
+"#,
+        )
+        .expect("partial server config should parse");
+
+        assert_eq!(cfg.server.bind, "127.0.0.1:9000");
+        assert_eq!(cfg.server.websocket_bind, "0.0.0.0:8443");
+        assert_eq!(cfg.server.status_bind, "0.0.0.0:8082");
+        assert_eq!(cfg.server.health_bind, "0.0.0.0:8081");
+        assert_eq!(cfg.server.log_level, "info");
+        assert_eq!(cfg.server.supported_protocols, vec!["naive_tcp"]);
+    }
+
+    #[test]
+    fn server_config_parses_without_server_section_using_defaults() {
+        let cfg: ServerConfig = toml::from_str("").expect("empty config should parse");
+        let defaults = ServerConfig::default();
+        assert_eq!(cfg.server.bind, defaults.server.bind);
+        assert_eq!(cfg.server.websocket_bind, defaults.server.websocket_bind);
+        assert_eq!(cfg.server.status_bind, defaults.server.status_bind);
+        assert_eq!(cfg.server.health_bind, defaults.server.health_bind);
     }
 }
