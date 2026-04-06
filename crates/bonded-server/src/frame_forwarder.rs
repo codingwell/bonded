@@ -834,8 +834,9 @@ async fn handle_tcp_frame(
             stream.write_all(&pkt.payload).await?;
             stream.flush().await?;
 
-            let mut buf = vec![0u8; 65535];
-            let n = match timeout(Duration::from_millis(1200), stream.read(&mut buf)).await {
+            let mut chunk = vec![0u8; 65535];
+            // Wait up to 1200ms for the first byte of upstream response.
+            let first_n = match timeout(Duration::from_millis(1200), stream.read(&mut chunk)).await {
                 Ok(Ok(n)) => n,
                 Ok(Err(err)) => return Err(err.into()),
                 Err(_) => {
@@ -846,8 +847,35 @@ async fn handle_tcp_frame(
                     return Ok(None);
                 }
             };
-            buf.truncate(n);
-            (n, buf)
+
+            let mut response = Vec::with_capacity(first_n + 4096);
+            response.extend_from_slice(&chunk[..first_n]);
+
+            // Drain additional segments that arrive in close succession.
+            // Critical for TLS: the server's handshake flight (ServerHello +
+            // Certificate + CertificateVerify + Finished) often arrives split
+            // across multiple TCP segments. A single read() returns as soon as
+            // any bytes are in the kernel buffer, so without this loop only the
+            // first segment is forwarded, leaving the rest stranded. The TLS
+            // client then stalls waiting for bytes that never arrive, because we
+            // only read upstream when an inbound PSH triggers it.
+            loop {
+                match timeout(Duration::from_millis(10), stream.read(&mut chunk)).await {
+                    Ok(Ok(0)) => break, // upstream closed
+                    Ok(Ok(n)) => {
+                        response.extend_from_slice(&chunk[..n]);
+                        // Stay within IPv4 max payload limit.
+                        if response.len() >= 65495 {
+                            break;
+                        }
+                    }
+                    Ok(Err(err)) => return Err(err.into()),
+                    Err(_) => break, // no more data within 10 ms -- drain complete
+                }
+            }
+
+            let n = response.len();
+            (n, response)
         };
 
         if n == 0 {
