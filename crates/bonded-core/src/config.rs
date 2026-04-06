@@ -75,7 +75,6 @@ pub struct ServerSection {
     pub health_bind: String,
     pub upstream_tcp_target: String,
     pub log_level: String,
-    pub supported_protocols: Vec<String>,
     pub authorized_keys_file: String,
     pub invite_tokens_file: String,
 }
@@ -92,7 +91,6 @@ impl Default for ServerSection {
             health_bind: "0.0.0.0:8081".to_owned(),
             upstream_tcp_target: String::new(),
             log_level: "info".to_owned(),
-            supported_protocols: vec!["naive_tcp".to_owned()],
             authorized_keys_file: DEFAULT_AUTHORIZED_KEYS_PATH.to_owned(),
             invite_tokens_file: DEFAULT_INVITE_TOKENS_PATH.to_owned(),
         }
@@ -165,7 +163,6 @@ mod tests {
     #[test]
     fn default_server_config_has_naive_tcp_protocol() {
         let cfg = ServerConfig::default();
-        assert_eq!(cfg.server.supported_protocols, vec!["naive_tcp"]);
         assert!(cfg.server.upstream_tcp_target.is_empty());
         assert_eq!(cfg.server.websocket_bind, "0.0.0.0:8443");
         assert_eq!(cfg.server.status_bind, "0.0.0.0:8082");
@@ -188,7 +185,6 @@ bind = "127.0.0.1:9000"
         assert_eq!(cfg.server.status_bind, "0.0.0.0:8082");
         assert_eq!(cfg.server.health_bind, "0.0.0.0:8081");
         assert_eq!(cfg.server.log_level, "info");
-        assert_eq!(cfg.server.supported_protocols, vec!["naive_tcp"]);
     }
 
     #[test]

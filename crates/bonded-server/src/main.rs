@@ -673,17 +673,6 @@ where
     if let Some(invite_tokens_file) = read_env("BONDED_INVITE_TOKENS_FILE") {
         cfg.server.invite_tokens_file = invite_tokens_file;
     }
-    if let Some(protocols) = read_env("BONDED_SUPPORTED_PROTOCOLS") {
-        let parsed: Vec<String> = protocols
-            .split(',')
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-            .map(ToOwned::to_owned)
-            .collect();
-        if !parsed.is_empty() {
-            cfg.server.supported_protocols = parsed;
-        }
-    }
 }
 
 fn init_tracing_from_level(level: &str) {
@@ -729,7 +718,6 @@ mod tests {
             ("BONDED_LOG_LEVEL", "debug"),
             ("BONDED_AUTHORIZED_KEYS_FILE", "/tmp/auth.toml"),
             ("BONDED_INVITE_TOKENS_FILE", "/tmp/tokens.toml"),
-            ("BONDED_SUPPORTED_PROTOCOLS", "naive_tcp,wss,quic"),
         ];
 
         apply_env_overrides(&mut cfg, |key| {
@@ -749,10 +737,6 @@ mod tests {
         assert_eq!(cfg.server.log_level, "debug");
         assert_eq!(cfg.server.authorized_keys_file, "/tmp/auth.toml");
         assert_eq!(cfg.server.invite_tokens_file, "/tmp/tokens.toml");
-        assert_eq!(
-            cfg.server.supported_protocols,
-            vec!["naive_tcp", "wss", "quic"]
-        );
     }
 
     #[test]

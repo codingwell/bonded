@@ -64,7 +64,6 @@ bind = "0.0.0.0:8080"
 public_address = "bonded.example.com:8080"
 health_bind = "0.0.0.0:8081"
 log_level = "info"
-supported_protocols = ["naive_tcp"]
 authorized_keys_file = "/var/lib/bonded/authorized_keys.toml"
 invite_tokens_file = "/var/lib/bonded/invite_tokens.toml"
 
@@ -85,7 +84,6 @@ upstream_tcp_target = ""
 | `public_address` | *(empty)* | Public address shown in the QR code for clients — **must be set** |
 | `health_bind` | `0.0.0.0:8081` | Health-check HTTP listener |
 | `log_level` | `info` | Tracing level (`trace`, `debug`, `info`, `warn`, `error`) |
-| `supported_protocols` | `["naive_tcp"]` | Protocols advertised to clients |
 | `authorized_keys_file` | `/var/lib/bonded/authorized_keys.toml` | Authorized device keys file |
 | `invite_tokens_file` | `/var/lib/bonded/invite_tokens.toml` | Invite tokens file |
 | `websocket_bind` | `0.0.0.0:8443` | WebSocket listener address |
@@ -103,7 +101,6 @@ Every field can be overridden via `BONDED_` prefixed environment variables:
 | `BONDED_PUBLIC_ADDRESS` | `public_address` |
 | `BONDED_HEALTH_BIND` | `health_bind` |
 | `BONDED_LOG_LEVEL` | `log_level` |
-| `BONDED_SUPPORTED_PROTOCOLS` | `supported_protocols` (comma-separated) |
 | `BONDED_AUTHORIZED_KEYS_FILE` | `authorized_keys_file` |
 | `BONDED_INVITE_TOKENS_FILE` | `invite_tokens_file` |
 | `BONDED_WEBSOCKET_BIND` | `websocket_bind` |
