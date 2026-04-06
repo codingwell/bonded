@@ -1,7 +1,7 @@
 # Implementation Plan — Server, Linux Client, Android Client
 
 **Status:** In Progress
-**Last Updated:** 2026-04-03 (session 19)
+**Last Updated:** 2026-04-06 (session 20)
 
 This is a living document. Update the status column and notes as work progresses.
 
@@ -58,6 +58,7 @@ Recommended server config shape:
 ```toml
 [server]
 bind = "0.0.0.0:8080"
+status_bind = "0.0.0.0:8082"
 public_address = "bonded.example.com:8080"
 health_bind = "0.0.0.0:8081"
 log_level = "info"
@@ -266,6 +267,8 @@ Build the server binary on top of `bonded-core`.
 | 2.13 | Rust-only localhost E2E DNS diagnostic harness | completed | Added ignored/manual `bonded-server` integration test that boots `run_server` on localhost, connects using `bonded-client::establish_naive_tcp_session`, injects synthetic IPv4 UDP DNS query packet to `8.8.8.8:53`, and asserts/prints response-path diagnostics |
 | 2.14 | Rust-only localhost E2E HTTP diagnostic harness | completed | Added ignored/manual `bonded-server` integration test that boots `run_server` on localhost, resolves `example.com`, drives synthetic IPv4 TCP handshake + HTTP GET over packet relay, and asserts a valid HTTP status line in returned payload |
 | 2.15 | Rust-only localhost E2E SMTP diagnostic harness | completed | Added ignored/manual `bonded-server` integration test that boots `run_server` on localhost, resolves `smtp.gmail.com:587`, drives synthetic IPv4 TCP handshake, sends SMTP `EHLO` and `QUIT`, and asserts SMTP reply codes in returned payload |
+| 2.16 | UDP flow sessions with idle timeout and async return path | completed | Replaced one-shot UDP forwarding with per-session flow table keyed by 4-tuple; each flow now uses a persistent connected ephemeral UDP socket, stays alive for 4 minutes since last client packet, and forwards all upstream UDP packets back to the client asynchronously while active |
+| 2.17 | Status webpage endpoint for live connection state | completed | Added dedicated status listener (`status_bind`, env override `BONDED_STATUS_BIND`) that serves a live HTML page showing authenticated sessions and active UDP flows (source/target tuple, bound socket, and activity timestamps) |
 
 Acceptance gate:
 
@@ -436,6 +439,8 @@ Decisions made during implementation that aren't in the requirements docs.
 | Android launcher icon generation is managed via `flutter_launcher_icons` using workspace-root `icon.png` | 2026-04-03 | Keeps launcher assets reproducible across densities and Android adaptive-icon resources instead of hand-editing mipmap files |
 | Rust-only DNS tunnel diagnostics use an ignored localhost integration test in `bonded-server` that runs real server+client crates and injects synthetic UDP DNS probes | 2026-04-03 | Enables reproducible E2E debugging of server/client forwarding behavior without Android app/device dependencies |
 | Server frame forwarder now handles IPv4 ICMP echo request/reply in addition to UDP | 2026-04-03 | Uses Linux-compatible IPv4 ICMP datagram sockets through `socket2`, matches echo identifier/sequence, and synthesizes IPv4 ICMP reply packets with recomputed checksums for client return path |
+| UDP forwarding now uses per-client-session long-lived flow sockets with 4-minute idle expiry | 2026-04-06 | Each UDP 4-tuple creates/reuses a connected ephemeral socket; server pushes all remote datagrams back to client asynchronously until no client packet is seen for 4 minutes |
+| Server exposes a lightweight status HTML endpoint on a dedicated bind (`status_bind`) | 2026-04-06 | Page auto-refreshes and reports authenticated sessions plus active UDP flow table to aid runtime diagnostics during tunnel bring-up |
 
 ---
 

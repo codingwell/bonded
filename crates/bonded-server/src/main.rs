@@ -7,6 +7,7 @@ mod health;
 mod invite_tokens;
 mod pairing_qr;
 mod session_registry;
+mod status;
 
 #[cfg(test)]
 mod server_integration;
@@ -18,17 +19,19 @@ use bonded_core::config::{load_server_config, ServerConfig, DEFAULT_SERVER_CONFI
 use bonded_core::session::{SessionFrame, SessionHeader, FLAG_PING, FLAG_PONG};
 use bonded_core::transport::{NaiveTcpTransport, Transport};
 use clap::Parser;
-use frame_forwarder::{forward_frame, TcpFlowTable};
+use frame_forwarder::{forward_frame, TcpFlowTable, UdpSessionManager, UdpSessionTracker};
 use health::run_health_server;
 use invite_tokens::ensure_startup_invite;
 use pairing_qr::emit_pairing_qr;
 use session_registry::SessionRegistry;
+use status::run_status_server;
 use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, error, info, warn, Level};
+use tracing::{error, info, warn, Level};
 
 #[derive(Debug, Parser)]
 #[command(name = "bonded-server")]
@@ -83,11 +86,25 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    let sessions = SessionRegistry::default();
+    let udp_tracker = UdpSessionTracker::default();
+
+    let status_bind = cfg.server.status_bind.clone();
+    let status_sessions = sessions.clone();
+    let status_udp_tracker = udp_tracker.clone();
+    tokio::spawn(async move {
+        if let Err(err) = run_status_server(&status_bind, status_sessions, status_udp_tracker).await
+        {
+            error!(bind = %status_bind, error = %err, "status listener terminated");
+        }
+    });
+
     info!(bind = %cfg.server.bind, "bonded-server starting");
     let websocket_bind = cfg.server.websocket_bind.clone();
     let websocket_upstream = cfg.server.upstream_tcp_target.clone();
     let websocket_invites = cfg.server.invite_tokens_file.clone();
-    let websocket_sessions = SessionRegistry::default();
+    let websocket_sessions = sessions.clone();
+    let websocket_udp_tracker = udp_tracker.clone();
     let websocket_keys = authorized_keys.clone();
     let websocket_tls_acceptor = load_websocket_tls_acceptor(
         &cfg.server.websocket_tls_cert_file,
@@ -100,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
             &websocket_invites,
             websocket_keys,
             websocket_sessions,
+            websocket_udp_tracker,
             websocket_tls_acceptor,
         )
         .await
@@ -113,7 +131,8 @@ async fn main() -> anyhow::Result<()> {
         &cfg.server.upstream_tcp_target,
         &cfg.server.invite_tokens_file,
         authorized_keys,
-        SessionRegistry::default(),
+        sessions,
+        udp_tracker,
     )
     .await
 }
@@ -158,6 +177,7 @@ async fn run_websocket_server(
     invite_tokens_file: &str,
     authorized_keys: AuthorizedKeysStore,
     sessions: SessionRegistry,
+    udp_tracker: UdpSessionTracker,
     tls_acceptor: Option<TlsAcceptor>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(bind).await?;
@@ -174,6 +194,7 @@ async fn run_websocket_server(
 
         let authorized_keys = authorized_keys.clone();
         let sessions = sessions.clone();
+        let udp_tracker = udp_tracker.clone();
         let upstream_tcp_target = upstream_tcp_target.to_owned();
         let invite_tokens_file = invite_tokens_file.to_owned();
         let tls_acceptor = tls_acceptor.clone();
@@ -224,114 +245,120 @@ async fn run_websocket_server(
                         "starting websocket frame receive loop"
                     );
                     let tcp_flows = TcpFlowTable::default();
+                    let (udp_tx, mut udp_rx) = mpsc::unbounded_channel();
+                    let udp_sessions =
+                        UdpSessionManager::new(handle.session_id, udp_tx, udp_tracker);
 
                     loop {
-                        debug!(
-                            peer = %peer,
-                            session_id = handle.session_id,
-                            "waiting for websocket frame from client"
-                        );
-                        match transport.recv().await {
-                            Ok(frame) => {
-                                info!(
-                                    peer = %peer,
-                                    session_id = handle.session_id,
-                                    connection_id = frame.header.connection_id,
-                                    frame_size = frame.payload.len(),
-                                    sequence = frame.header.sequence,
-                                    flags = frame.header.flags,
-                                    "websocket frame received from client"
-                                );
-
-                                // Respond to heartbeat pings without forwarding them.
-                                if frame.header.flags & FLAG_PING != 0 {
-                                    info!(
-                                        peer = %peer,
-                                        session_id = handle.session_id,
-                                        sequence = frame.header.sequence,
-                                        "websocket heartbeat ping received, sending pong"
-                                    );
-                                    let pong = SessionFrame {
-                                        header: SessionHeader {
-                                            connection_id: frame.header.connection_id,
-                                            sequence: frame.header.sequence,
-                                            flags: FLAG_PONG,
-                                        },
-                                        payload: frame.payload,
-                                    };
-                                    if let Err(err) = transport.send(pong).await {
-                                        warn!(
-                                            peer = %peer,
-                                            session_id = handle.session_id,
-                                            error = %err,
-                                            "failed to send websocket heartbeat pong"
-                                        );
-                                        break;
-                                    }
-                                    continue;
-                                }
-
-                                let response = match forward_frame(
-                                    frame,
-                                    if upstream_tcp_target.is_empty() {
-                                        None
-                                    } else {
-                                        Some(upstream_tcp_target.as_str())
-                                    },
-                                    &tcp_flows,
-                                )
-                                .await
-                                {
-                                    Ok(value) => value,
-                                    Err(err) => {
-                                        warn!(
-                                            peer = %peer,
-                                            public_key = %public_key,
-                                            session_id = handle.session_id,
-                                            error = %err,
-                                            "failed to forward websocket session frame"
-                                        );
-                                        continue;
-                                    }
+                        tokio::select! {
+                            maybe_udp_frame = udp_rx.recv() => {
+                                let Some(udp_frame) = maybe_udp_frame else {
+                                    break;
                                 };
 
-                                let Some(response) = response else {
-                                    info!(
-                                        peer = %peer,
-                                        session_id = handle.session_id,
-                                        "websocket frame forwarding returned no response (timeout or no upstream)"
-                                    );
-                                    continue;
-                                };
-
-                                info!(
-                                    peer = %peer,
-                                    session_id = handle.session_id,
-                                    connection_id = response.header.connection_id,
-                                    response_size = response.payload.len(),
-                                    "websocket response frame sending to client"
-                                );
-
-                                if let Err(err) = transport.send(response).await {
+                                if let Err(err) = transport.send(udp_frame).await {
                                     warn!(
                                         peer = %peer,
                                         public_key = %public_key,
                                         session_id = handle.session_id,
                                         error = %err,
-                                        "failed to return websocket forwarded frame"
+                                        "failed to send websocket async UDP response"
                                     );
                                     break;
                                 }
                             }
-                            Err(err) => {
-                                info!(
-                                    peer = %peer,
-                                    public_key = %public_key,
-                                    session_id = handle.session_id,
-                                    error = ?err,
-                                    "websocket client session ended - recv error"
-                                );
-                                break;
+                            recv_result = transport.recv() => {
+                                match recv_result {
+                                    Ok(frame) => {
+                                        info!(
+                                            peer = %peer,
+                                            session_id = handle.session_id,
+                                            connection_id = frame.header.connection_id,
+                                            frame_size = frame.payload.len(),
+                                            sequence = frame.header.sequence,
+                                            flags = frame.header.flags,
+                                            "websocket frame received from client"
+                                        );
+
+                                        // Respond to heartbeat pings without forwarding them.
+                                        if frame.header.flags & FLAG_PING != 0 {
+                                            info!(
+                                                peer = %peer,
+                                                session_id = handle.session_id,
+                                                sequence = frame.header.sequence,
+                                                "websocket heartbeat ping received, sending pong"
+                                            );
+                                            let pong = SessionFrame {
+                                                header: SessionHeader {
+                                                    connection_id: frame.header.connection_id,
+                                                    sequence: frame.header.sequence,
+                                                    flags: FLAG_PONG,
+                                                },
+                                                payload: frame.payload,
+                                            };
+                                            if let Err(err) = transport.send(pong).await {
+                                                warn!(
+                                                    peer = %peer,
+                                                    session_id = handle.session_id,
+                                                    error = %err,
+                                                    "failed to send websocket heartbeat pong"
+                                                );
+                                                break;
+                                            }
+                                            continue;
+                                        }
+
+                                        let response = match forward_frame(
+                                            frame,
+                                            if upstream_tcp_target.is_empty() {
+                                                None
+                                            } else {
+                                                Some(upstream_tcp_target.as_str())
+                                            },
+                                            &tcp_flows,
+                                            &udp_sessions,
+                                        )
+                                        .await
+                                        {
+                                            Ok(value) => value,
+                                            Err(err) => {
+                                                warn!(
+                                                    peer = %peer,
+                                                    public_key = %public_key,
+                                                    session_id = handle.session_id,
+                                                    error = %err,
+                                                    "failed to forward websocket session frame"
+                                                );
+                                                continue;
+                                            }
+                                        };
+
+                                        let Some(response) = response else {
+                                            continue;
+                                        };
+
+                                        if let Err(err) = transport.send(response).await {
+                                            warn!(
+                                                peer = %peer,
+                                                public_key = %public_key,
+                                                session_id = handle.session_id,
+                                                error = %err,
+                                                "failed to return websocket forwarded frame"
+                                            );
+                                            break;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        info!(
+                                            peer = %peer,
+                                            public_key = %public_key,
+                                            session_id = handle.session_id,
+                                            error = ?err,
+                                            "websocket client session ended - recv error"
+                                        );
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
@@ -396,6 +423,7 @@ async fn run_server(
     invite_tokens_file: &str,
     authorized_keys: AuthorizedKeysStore,
     sessions: SessionRegistry,
+    udp_tracker: UdpSessionTracker,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(bind).await?;
     info!(bind = %bind, "naive tcp listener bound");
@@ -411,6 +439,7 @@ async fn run_server(
 
         let authorized_keys = authorized_keys.clone();
         let sessions = sessions.clone();
+        let udp_tracker = udp_tracker.clone();
         let upstream_tcp_target = upstream_tcp_target.to_owned();
         let invite_tokens_file = invite_tokens_file.to_owned();
         tokio::spawn(async move {
@@ -438,113 +467,119 @@ async fn run_server(
                         "starting frame receive loop"
                     );
                     let tcp_flows = TcpFlowTable::default();
+                    let (udp_tx, mut udp_rx) = mpsc::unbounded_channel();
+                    let udp_sessions =
+                        UdpSessionManager::new(handle.session_id, udp_tx, udp_tracker);
                     loop {
-                        debug!(
-                            peer = %peer,
-                            session_id = handle.session_id,
-                            "waiting for frame from client"
-                        );
-                        match transport.recv().await {
-                            Ok(frame) => {
-                                info!(
-                                    peer = %peer,
-                                    session_id = handle.session_id,
-                                    connection_id = frame.header.connection_id,
-                                    frame_size = frame.payload.len(),
-                                    sequence = frame.header.sequence,
-                                    flags = frame.header.flags,
-                                    "frame received from client"
-                                );
-
-                                // Respond to heartbeat pings without forwarding them.
-                                if frame.header.flags & FLAG_PING != 0 {
-                                    info!(
-                                        peer = %peer,
-                                        session_id = handle.session_id,
-                                        sequence = frame.header.sequence,
-                                        "heartbeat ping received, sending pong"
-                                    );
-                                    let pong = SessionFrame {
-                                        header: SessionHeader {
-                                            connection_id: frame.header.connection_id,
-                                            sequence: frame.header.sequence,
-                                            flags: FLAG_PONG,
-                                        },
-                                        payload: frame.payload,
-                                    };
-                                    if let Err(err) = transport.send(pong).await {
-                                        warn!(
-                                            peer = %peer,
-                                            session_id = handle.session_id,
-                                            error = %err,
-                                            "failed to send heartbeat pong"
-                                        );
-                                        break;
-                                    }
-                                    continue;
-                                }
-
-                                let response = match forward_frame(
-                                    frame,
-                                    if upstream_tcp_target.is_empty() {
-                                        None
-                                    } else {
-                                        Some(upstream_tcp_target.as_str())
-                                    },
-                                    &tcp_flows,
-                                )
-                                .await
-                                {
-                                    Ok(value) => value,
-                                    Err(err) => {
-                                        warn!(
-                                            peer = %peer,
-                                            public_key = %public_key,
-                                            session_id = handle.session_id,
-                                            error = %err,
-                                            "failed to forward session frame"
-                                        );
-                                        continue;
-                                    }
+                        tokio::select! {
+                            maybe_udp_frame = udp_rx.recv() => {
+                                let Some(udp_frame) = maybe_udp_frame else {
+                                    break;
                                 };
 
-                                let Some(response) = response else {
-                                    info!(
-                                        peer = %peer,
-                                        session_id = handle.session_id,
-                                        "frame forwarding returned no response (timeout or no upstream)"
-                                    );
-                                    continue;
-                                };
-
-                                info!(
-                                    peer = %peer,
-                                    session_id = handle.session_id,
-                                    connection_id = response.header.connection_id,
-                                    response_size = response.payload.len(),
-                                    "response frame sending to client"
-                                );
-
-                                if let Err(err) = transport.send(response).await {
+                                if let Err(err) = transport.send(udp_frame).await {
                                     warn!(
                                         peer = %peer,
                                         public_key = %public_key,
                                         session_id = handle.session_id,
                                         error = %err,
-                                        "failed to return forwarded frame"
+                                        "failed to send async UDP response"
                                     );
                                     break;
                                 }
                             }
-                            Err(err) => {
-                                info!(
-                                    peer = %peer,
-                                    public_key = %public_key,
-                                    session_id = handle.session_id,
-                                    error = ?err,
-                                    "client session ended - recv error"
-                                );
-                                break;
+                            recv_result = transport.recv() => {
+                                match recv_result {
+                                    Ok(frame) => {
+                                        info!(
+                                            peer = %peer,
+                                            session_id = handle.session_id,
+                                            connection_id = frame.header.connection_id,
+                                            frame_size = frame.payload.len(),
+                                            sequence = frame.header.sequence,
+                                            flags = frame.header.flags,
+                                            "frame received from client"
+                                        );
+
+                                        // Respond to heartbeat pings without forwarding them.
+                                        if frame.header.flags & FLAG_PING != 0 {
+                                            info!(
+                                                peer = %peer,
+                                                session_id = handle.session_id,
+                                                sequence = frame.header.sequence,
+                                                "heartbeat ping received, sending pong"
+                                            );
+                                            let pong = SessionFrame {
+                                                header: SessionHeader {
+                                                    connection_id: frame.header.connection_id,
+                                                    sequence: frame.header.sequence,
+                                                    flags: FLAG_PONG,
+                                                },
+                                                payload: frame.payload,
+                                            };
+                                            if let Err(err) = transport.send(pong).await {
+                                                warn!(
+                                                    peer = %peer,
+                                                    session_id = handle.session_id,
+                                                    error = %err,
+                                                    "failed to send heartbeat pong"
+                                                );
+                                                break;
+                                            }
+                                            continue;
+                                        }
+
+                                        let response = match forward_frame(
+                                            frame,
+                                            if upstream_tcp_target.is_empty() {
+                                                None
+                                            } else {
+                                                Some(upstream_tcp_target.as_str())
+                                            },
+                                            &tcp_flows,
+                                            &udp_sessions,
+                                        )
+                                        .await
+                                        {
+                                            Ok(value) => value,
+                                            Err(err) => {
+                                                warn!(
+                                                    peer = %peer,
+                                                    public_key = %public_key,
+                                                    session_id = handle.session_id,
+                                                    error = %err,
+                                                    "failed to forward session frame"
+                                                );
+                                                continue;
+                                            }
+                                        };
+
+                                        let Some(response) = response else {
+                                            continue;
+                                        };
+
+                                        if let Err(err) = transport.send(response).await {
+                                            warn!(
+                                                peer = %peer,
+                                                public_key = %public_key,
+                                                session_id = handle.session_id,
+                                                error = %err,
+                                                "failed to return forwarded frame"
+                                            );
+                                            break;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        info!(
+                                            peer = %peer,
+                                            public_key = %public_key,
+                                            session_id = handle.session_id,
+                                            error = ?err,
+                                            "client session ended - recv error"
+                                        );
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
@@ -568,6 +603,9 @@ where
     }
     if let Some(websocket_bind) = read_env("BONDED_WEBSOCKET_BIND") {
         cfg.server.websocket_bind = websocket_bind;
+    }
+    if let Some(status_bind) = read_env("BONDED_STATUS_BIND") {
+        cfg.server.status_bind = status_bind;
     }
     if let Some(websocket_tls_cert_file) = read_env("BONDED_WEBSOCKET_TLS_CERT_FILE") {
         cfg.server.websocket_tls_cert_file = websocket_tls_cert_file;
@@ -642,6 +680,7 @@ mod tests {
         let env = [
             ("BONDED_BIND", "127.0.0.1:9000"),
             ("BONDED_WEBSOCKET_BIND", "127.0.0.1:9443"),
+            ("BONDED_STATUS_BIND", "127.0.0.1:9002"),
             ("BONDED_WEBSOCKET_TLS_CERT_FILE", "/tmp/wss.crt"),
             ("BONDED_WEBSOCKET_TLS_KEY_FILE", "/tmp/wss.key"),
             ("BONDED_PUBLIC_ADDRESS", "bonded.example.com:9000"),
@@ -661,6 +700,7 @@ mod tests {
 
         assert_eq!(cfg.server.bind, "127.0.0.1:9000");
         assert_eq!(cfg.server.websocket_bind, "127.0.0.1:9443");
+        assert_eq!(cfg.server.status_bind, "127.0.0.1:9002");
         assert_eq!(cfg.server.websocket_tls_cert_file, "/tmp/wss.crt");
         assert_eq!(cfg.server.websocket_tls_key_file, "/tmp/wss.key");
         assert_eq!(cfg.server.public_address, "bonded.example.com:9000");

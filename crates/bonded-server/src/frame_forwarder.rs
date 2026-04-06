@@ -1,12 +1,13 @@
-use bonded_core::session::SessionFrame;
+use bonded_core::session::{SessionFrame, SessionHeader};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::time::SystemTime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::Mutex;
-use tokio::time::{timeout, Duration};
+use tokio::sync::{mpsc, Mutex};
+use tokio::time::{timeout, Duration, Instant};
 use tracing::debug;
 
 // ── UDP ───────────────────────────────────────────────────────────────────────
@@ -19,6 +20,332 @@ struct Ipv4UdpPacket {
     dst_port: u16,
     payload: Vec<u8>,
     identification: u16,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct UdpFlowKey {
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+}
+
+#[derive(Debug)]
+struct UdpFlowState {
+    connection_id: u32,
+    next_sequence: u64,
+    identification: u16,
+    last_client_packet_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct UdpFlowHandle {
+    socket: Arc<UdpSocket>,
+    state: Arc<Mutex<UdpFlowState>>,
+}
+
+#[derive(Debug, Clone)]
+struct UdpFlowStatus {
+    session_id: u64,
+    key: UdpFlowKey,
+    bound_socket: String,
+    created_at: SystemTime,
+    last_client_packet_at: SystemTime,
+    last_remote_packet_at: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UdpFlowSnapshot {
+    pub session_id: u64,
+    pub client_src: String,
+    pub client_dst: String,
+    pub bound_socket: String,
+    pub created_ago: String,
+    pub last_client_ago: String,
+    pub last_remote_ago: Option<String>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct UdpSessionTracker {
+    inner: Arc<RwLock<HashMap<(u64, UdpFlowKey), UdpFlowStatus>>>,
+}
+
+impl UdpSessionTracker {
+    fn register_flow(&self, session_id: u64, key: UdpFlowKey, bound_socket: String) {
+        let now = SystemTime::now();
+        self.inner
+            .write()
+            .expect("udp tracker write lock should not be poisoned")
+            .insert(
+                (session_id, key.clone()),
+                UdpFlowStatus {
+                    session_id,
+                    key,
+                    bound_socket,
+                    created_at: now,
+                    last_client_packet_at: now,
+                    last_remote_packet_at: None,
+                },
+            );
+    }
+
+    fn touch_client(&self, session_id: u64, key: &UdpFlowKey) {
+        if let Some(entry) = self
+            .inner
+            .write()
+            .expect("udp tracker write lock should not be poisoned")
+            .get_mut(&(session_id, key.clone()))
+        {
+            entry.last_client_packet_at = SystemTime::now();
+        }
+    }
+
+    fn touch_remote(&self, session_id: u64, key: &UdpFlowKey) {
+        if let Some(entry) = self
+            .inner
+            .write()
+            .expect("udp tracker write lock should not be poisoned")
+            .get_mut(&(session_id, key.clone()))
+        {
+            entry.last_remote_packet_at = Some(SystemTime::now());
+        }
+    }
+
+    fn remove_flow(&self, session_id: u64, key: &UdpFlowKey) {
+        self.inner
+            .write()
+            .expect("udp tracker write lock should not be poisoned")
+            .remove(&(session_id, key.clone()));
+    }
+
+    pub fn snapshot(&self) -> Vec<UdpFlowSnapshot> {
+        let now = SystemTime::now();
+        let mut rows: Vec<UdpFlowSnapshot> = self
+            .inner
+            .read()
+            .expect("udp tracker read lock should not be poisoned")
+            .values()
+            .map(|entry| UdpFlowSnapshot {
+                session_id: entry.session_id,
+                client_src: format!("{}:{}", entry.key.src_ip, entry.key.src_port),
+                client_dst: format!("{}:{}", entry.key.dst_ip, entry.key.dst_port),
+                bound_socket: entry.bound_socket.clone(),
+                created_ago: format_elapsed(now, entry.created_at),
+                last_client_ago: format_elapsed(now, entry.last_client_packet_at),
+                last_remote_ago: entry
+                    .last_remote_packet_at
+                    .map(|value| format_elapsed(now, value)),
+            })
+            .collect();
+
+        rows.sort_by(|left, right| {
+            left.session_id
+                .cmp(&right.session_id)
+                .then_with(|| left.client_src.cmp(&right.client_src))
+                .then_with(|| left.client_dst.cmp(&right.client_dst))
+        });
+        rows
+    }
+}
+
+#[derive(Clone)]
+pub struct UdpSessionManager {
+    session_id: u64,
+    sessions: Arc<Mutex<HashMap<UdpFlowKey, UdpFlowHandle>>>,
+    outbound_tx: mpsc::UnboundedSender<SessionFrame>,
+    tracker: UdpSessionTracker,
+}
+
+impl UdpSessionManager {
+    pub(crate) fn new(
+        session_id: u64,
+        outbound_tx: mpsc::UnboundedSender<SessionFrame>,
+        tracker: UdpSessionTracker,
+    ) -> Self {
+        Self {
+            session_id,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            outbound_tx,
+            tracker,
+        }
+    }
+
+    async fn forward_client_udp_packet(
+        &self,
+        frame_header: SessionHeader,
+        udp_packet: Ipv4UdpPacket,
+    ) -> anyhow::Result<()> {
+        let key = UdpFlowKey {
+            src_ip: udp_packet.src_ip,
+            dst_ip: udp_packet.dst_ip,
+            src_port: udp_packet.src_port,
+            dst_port: udp_packet.dst_port,
+        };
+
+        let handle = self
+            .ensure_udp_flow(&key, &udp_packet, frame_header)
+            .await?;
+
+        {
+            let mut state = handle.state.lock().await;
+            state.identification = udp_packet.identification;
+            state.last_client_packet_at = Instant::now();
+            state.connection_id = frame_header.connection_id;
+            if frame_header.sequence > state.next_sequence {
+                state.next_sequence = frame_header.sequence;
+            }
+        }
+        self.tracker.touch_client(self.session_id, &key);
+
+        handle.socket.send(&udp_packet.payload).await?;
+        debug!(
+            src_ip = %udp_packet.src_ip,
+            dst_ip = %udp_packet.dst_ip,
+            src_port = udp_packet.src_port,
+            dst_port = udp_packet.dst_port,
+            payload_size = udp_packet.payload.len(),
+            "UDP packet sent to existing flow"
+        );
+
+        Ok(())
+    }
+
+    async fn ensure_udp_flow(
+        &self,
+        key: &UdpFlowKey,
+        udp_packet: &Ipv4UdpPacket,
+        frame_header: SessionHeader,
+    ) -> anyhow::Result<UdpFlowHandle> {
+        if let Some(existing) = self.sessions.lock().await.get(key).cloned() {
+            return Ok(existing);
+        }
+
+        let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+        socket
+            .connect(SocketAddrV4::new(udp_packet.dst_ip, udp_packet.dst_port))
+            .await?;
+        let bound_socket = socket.local_addr()?.to_string();
+
+        let handle = UdpFlowHandle {
+            socket: socket.clone(),
+            state: Arc::new(Mutex::new(UdpFlowState {
+                connection_id: frame_header.connection_id,
+                next_sequence: frame_header.sequence,
+                identification: udp_packet.identification,
+                last_client_packet_at: Instant::now(),
+            })),
+        };
+
+        let sessions = self.sessions.clone();
+        let outbound_tx = self.outbound_tx.clone();
+        let state = handle.state.clone();
+        let key_for_task = key.clone();
+        let tracker = self.tracker.clone();
+        let session_id = self.session_id;
+        tracker.register_flow(session_id, key.clone(), bound_socket);
+
+        tokio::spawn(async move {
+            let mut recv_buf = vec![0_u8; 65535];
+
+            loop {
+                let is_idle = {
+                    let guard = state.lock().await;
+                    guard.last_client_packet_at.elapsed() >= Duration::from_secs(240)
+                };
+
+                if is_idle {
+                    debug!(
+                        session_id,
+                        "UDP flow expired after 4 minutes of client inactivity"
+                    );
+                    break;
+                }
+
+                let read_size =
+                    match timeout(Duration::from_secs(1), socket.recv(&mut recv_buf)).await {
+                        Ok(Ok(size)) => size,
+                        Ok(Err(err)) => {
+                            debug!(session_id, error = %err, "UDP flow recv error");
+                            break;
+                        }
+                        Err(_) => continue,
+                    };
+
+                if read_size == 0 {
+                    continue;
+                }
+
+                let response_payload = &recv_buf[..read_size];
+                let (header, identification) = {
+                    let mut guard = state.lock().await;
+                    let header = SessionHeader {
+                        connection_id: guard.connection_id,
+                        sequence: guard.next_sequence,
+                        flags: 0,
+                    };
+                    guard.next_sequence = guard.next_sequence.wrapping_add(1);
+                    (header, guard.identification)
+                };
+
+                let response_packet = match build_ipv4_udp_packet(
+                    key_for_task.dst_ip,
+                    key_for_task.src_ip,
+                    key_for_task.dst_port,
+                    key_for_task.src_port,
+                    identification,
+                    response_payload,
+                ) {
+                    Ok(packet) => packet,
+                    Err(err) => {
+                        debug!(session_id, error = %err, "failed to build UDP response packet");
+                        continue;
+                    }
+                };
+
+                tracker.touch_remote(session_id, &key_for_task);
+                if outbound_tx
+                    .send(SessionFrame {
+                        header,
+                        payload: response_packet.into(),
+                    })
+                    .is_err()
+                {
+                    debug!(
+                        session_id,
+                        "UDP flow stopping because session sender is closed"
+                    );
+                    break;
+                }
+            }
+
+            sessions.lock().await.remove(&key_for_task);
+            tracker.remove_flow(session_id, &key_for_task);
+        });
+
+        let mut sessions = self.sessions.lock().await;
+        let entry = sessions
+            .entry(key.clone())
+            .or_insert_with(|| handle.clone());
+        Ok(entry.clone())
+    }
+}
+
+fn format_elapsed(now: SystemTime, value: SystemTime) -> String {
+    match now.duration_since(value) {
+        Ok(duration) => format_duration(duration),
+        Err(_) => "just now".to_owned(),
+    }
+}
+
+fn format_duration(duration: std::time::Duration) -> String {
+    let total = duration.as_secs();
+    let minutes = total / 60;
+    let seconds = total % 60;
+    if minutes > 0 {
+        format!("{}m {}s ago", minutes, seconds)
+    } else {
+        format!("{}s ago", seconds)
+    }
 }
 
 // ── ICMP ──────────────────────────────────────────────────────────────────────
@@ -76,6 +403,7 @@ pub async fn forward_frame(
     frame: SessionFrame,
     upstream_tcp_target: Option<&str>,
     tcp_flows: &TcpFlowTable,
+    udp_sessions: &UdpSessionManager,
 ) -> anyhow::Result<Option<SessionFrame>> {
     // ── UDP ───────────────────────────────────────────────────────────────────
     if let Some(udp_packet) = parse_ipv4_udp_packet(&frame.payload) {
@@ -88,72 +416,10 @@ pub async fn forward_frame(
             "UDP packet forwarding outbound"
         );
 
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
-        let bound_addr = socket.local_addr()?;
-        debug!(
-            src_ip = %udp_packet.src_ip,
-            dst_ip = %udp_packet.dst_ip,
-            src_port = udp_packet.src_port,
-            dst_port = udp_packet.dst_port,
-            bound_addr = %bound_addr,
-            "UDP socket bound for forwarding"
-        );
-
-        let target = SocketAddrV4::new(udp_packet.dst_ip, udp_packet.dst_port);
-        socket.send_to(&udp_packet.payload, target).await?;
-        debug!(
-            dst_ip = %udp_packet.dst_ip,
-            dst_port = udp_packet.dst_port,
-            payload_size = udp_packet.payload.len(),
-            "UDP packet sent to target"
-        );
-
-        let mut response = vec![0_u8; 65535];
-        let read_size = match timeout(Duration::from_millis(1200), socket.recv(&mut response)).await
-        {
-            Ok(result) => result?,
-            Err(_) => {
-                debug!(
-                    src_ip = %udp_packet.src_ip,
-                    dst_ip = %udp_packet.dst_ip,
-                    src_port = udp_packet.src_port,
-                    dst_port = udp_packet.dst_port,
-                    "UDP response timeout (1200ms) - no response received"
-                );
-                return Ok(None);
-            }
-        };
-
-        response.truncate(read_size);
-        debug!(
-            src_ip = %udp_packet.src_ip,
-            dst_ip = %udp_packet.dst_ip,
-            src_port = udp_packet.src_port,
-            dst_port = udp_packet.dst_port,
-            response_size = read_size,
-            "UDP response received from target"
-        );
-
-        let response_packet = build_ipv4_udp_packet(
-            udp_packet.dst_ip,
-            udp_packet.src_ip,
-            udp_packet.dst_port,
-            udp_packet.src_port,
-            udp_packet.identification,
-            &response,
-        )?;
-        debug!(
-            src_ip = %udp_packet.dst_ip,
-            dst_ip = %udp_packet.src_ip,
-            src_port = udp_packet.dst_port,
-            dst_port = udp_packet.src_port,
-            response_packet_size = response_packet.len(),
-            "UDP response packet built for client"
-        );
-        return Ok(Some(SessionFrame {
-            header: frame.header,
-            payload: response_packet.into(),
-        }));
+        udp_sessions
+            .forward_client_udp_packet(frame.header, udp_packet)
+            .await?;
+        return Ok(None);
     }
 
     // ── ICMP ──────────────────────────────────────────────────────────────────
@@ -818,12 +1084,24 @@ fn tcp_checksum_ipv4(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, tcp_segment: &[u8]) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{forward_frame, TcpFlowTable};
+    use super::{forward_frame, TcpFlowTable, UdpSessionManager, UdpSessionTracker};
     use bonded_core::session::{SessionFrame, SessionHeader};
     use bytes::Bytes;
     use std::net::Ipv4Addr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, UdpSocket};
+    use tokio::sync::mpsc;
+    use tokio::time::{timeout, Duration};
+
+    fn build_udp_manager() -> (
+        UdpSessionManager,
+        mpsc::UnboundedReceiver<SessionFrame>,
+        UdpSessionTracker,
+    ) {
+        let tracker = UdpSessionTracker::default();
+        let (tx, rx) = mpsc::unbounded_channel();
+        (UdpSessionManager::new(1, tx, tracker.clone()), rx, tracker)
+    }
 
     #[tokio::test]
     async fn forwarder_echoes_original_frame_without_upstream() {
@@ -836,7 +1114,8 @@ mod tests {
             payload: Bytes::from_static(b"hello"),
         };
 
-        let result = forward_frame(frame.clone(), None, &TcpFlowTable::default())
+        let (udp_manager, _rx, _tracker) = build_udp_manager();
+        let result = forward_frame(frame.clone(), None, &TcpFlowTable::default(), &udp_manager)
             .await
             .expect("forwarding should succeed")
             .expect("non-udp frame should be returned");
@@ -872,10 +1151,16 @@ mod tests {
             payload: Bytes::from_static(b"hello"),
         };
 
-        let result = forward_frame(frame, Some(&addr.to_string()), &TcpFlowTable::default())
-            .await
-            .expect("forwarding should succeed")
-            .expect("upstream response should be returned");
+        let (udp_manager, _rx, _tracker) = build_udp_manager();
+        let result = forward_frame(
+            frame,
+            Some(&addr.to_string()),
+            &TcpFlowTable::default(),
+            &udp_manager,
+        )
+        .await
+        .expect("forwarding should succeed")
+        .expect("upstream response should be returned");
         assert_eq!(&result.payload[..], b"world");
 
         server_task.await.expect("upstream task should join");
@@ -920,10 +1205,19 @@ mod tests {
             payload: request_payload.into(),
         };
 
-        let response = forward_frame(frame, None, &TcpFlowTable::default())
+        let (udp_manager, mut rx, tracker) = build_udp_manager();
+        let response = forward_frame(frame, None, &TcpFlowTable::default(), &udp_manager)
             .await
-            .expect("forwarding should succeed")
-            .expect("udp relay should return response frame");
+            .expect("forwarding should succeed");
+        assert!(
+            response.is_none(),
+            "udp forwarding is async and should not return inline frame"
+        );
+
+        let response = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("udp response should arrive before timeout")
+            .expect("udp response channel should remain open");
 
         let response_payload = response.payload.to_vec();
         let parsed = super::parse_ipv4_udp_packet(&response_payload)
@@ -931,6 +1225,11 @@ mod tests {
         assert_eq!(parsed.src_ip, Ipv4Addr::LOCALHOST);
         assert_eq!(parsed.dst_ip, Ipv4Addr::new(10, 8, 0, 2));
         assert_eq!(&parsed.payload[..], b"dns-response");
+        assert_eq!(
+            tracker.snapshot().len(),
+            1,
+            "udp flow should remain active after response"
+        );
 
         udp_task.await.expect("udp task should join");
     }

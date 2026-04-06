@@ -327,6 +327,7 @@ async fn localhost_server_and_rust_client_can_probe_public_dns_udp() {
             &invite_for_server,
             store,
             crate::session_registry::SessionRegistry::default(),
+            crate::frame_forwarder::UdpSessionTracker::default(),
         )
         .await
     });
@@ -524,6 +525,7 @@ async fn localhost_server_and_rust_client_can_fetch_example_com_http_over_tcp_pa
             &invite_for_server,
             store,
             crate::session_registry::SessionRegistry::default(),
+            crate::frame_forwarder::UdpSessionTracker::default(),
         )
         .await
     });
@@ -745,6 +747,7 @@ async fn localhost_server_and_rust_client_can_run_smtp_commands_over_tcp_packets
             &invite_for_server,
             store,
             crate::session_registry::SessionRegistry::default(),
+            crate::frame_forwarder::UdpSessionTracker::default(),
         )
         .await
     });
@@ -1228,6 +1231,7 @@ async fn localhost_server_and_rust_client_can_relay_udp_echo() {
             &invite_for_server,
             store,
             crate::session_registry::SessionRegistry::default(),
+            crate::frame_forwarder::UdpSessionTracker::default(),
         )
         .await
     });
@@ -1335,6 +1339,7 @@ async fn localhost_server_and_rust_client_can_relay_icmp_echo_to_localhost() {
             &invite_for_server,
             store,
             crate::session_registry::SessionRegistry::default(),
+            crate::frame_forwarder::UdpSessionTracker::default(),
         )
         .await
     });
@@ -1630,6 +1635,7 @@ async fn localhost_server_and_rust_client_can_relay_tcp_as_ipv4_packets() {
             &invite_for_server,
             store,
             crate::session_registry::SessionRegistry::default(),
+            crate::frame_forwarder::UdpSessionTracker::default(),
         )
         .await
     });

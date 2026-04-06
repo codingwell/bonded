@@ -6,6 +6,12 @@ pub struct SessionHandle {
     pub session_id: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSnapshot {
+    pub client_key: String,
+    pub session_id: u64,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct SessionRegistry {
     inner: Arc<RwLock<SessionRegistryInner>>,
@@ -49,6 +55,22 @@ impl SessionRegistry {
             .expect("session registry read lock should not be poisoned")
             .sessions_by_client
             .len()
+    }
+
+    pub fn snapshot(&self) -> Vec<SessionSnapshot> {
+        let guard = self
+            .inner
+            .read()
+            .expect("session registry read lock should not be poisoned");
+
+        guard
+            .sessions_by_client
+            .iter()
+            .map(|(client_key, handle)| SessionSnapshot {
+                client_key: client_key.clone(),
+                session_id: handle.session_id,
+            })
+            .collect()
     }
 }
 
