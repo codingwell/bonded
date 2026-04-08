@@ -436,7 +436,9 @@ async fn run_websocket_server(
                                         );
 
                                         // Respond to heartbeat pings without forwarding them.
-                                        if frame.header.flags & FLAG_PING != 0 {
+                                        // Only treat ping-bit frames as control heartbeats when
+                                        // they carry no payload; otherwise keep forwarding.
+                                        if frame.header.flags & FLAG_PING != 0 && frame.payload.is_empty() {
                                             info!(
                                                 peer = %peer,
                                                 session_id = handle.session_id,
@@ -461,6 +463,17 @@ async fn run_websocket_server(
                                                 break;
                                             }
                                             continue;
+                                        }
+
+                                        if frame.header.flags & FLAG_PING != 0 {
+                                            warn!(
+                                                peer = %peer,
+                                                session_id = handle.session_id,
+                                                sequence = frame.header.sequence,
+                                                flags = frame.header.flags,
+                                                payload_len = frame.payload.len(),
+                                                "websocket frame has ping flag with payload; forwarding as data"
+                                            );
                                         }
 
                                         let is_icmp_echo = is_ipv4_icmp_echo_frame(&frame.payload);
@@ -726,7 +739,9 @@ async fn run_server(
                                         );
 
                                         // Respond to heartbeat pings without forwarding them.
-                                        if frame.header.flags & FLAG_PING != 0 {
+                                        // Only treat ping-bit frames as control heartbeats when
+                                        // they carry no payload; otherwise keep forwarding.
+                                        if frame.header.flags & FLAG_PING != 0 && frame.payload.is_empty() {
                                             info!(
                                                 peer = %peer,
                                                 session_id = handle.session_id,
@@ -751,6 +766,17 @@ async fn run_server(
                                                 break;
                                             }
                                             continue;
+                                        }
+
+                                        if frame.header.flags & FLAG_PING != 0 {
+                                            warn!(
+                                                peer = %peer,
+                                                session_id = handle.session_id,
+                                                sequence = frame.header.sequence,
+                                                flags = frame.header.flags,
+                                                payload_len = frame.payload.len(),
+                                                "frame has ping flag with payload; forwarding as data"
+                                            );
                                         }
 
                                         let is_icmp_echo = is_ipv4_icmp_echo_frame(&frame.payload);

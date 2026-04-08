@@ -1,7 +1,7 @@
 # Implementation Plan — Server, Linux Client, Android Client
 
 **Status:** In Progress
-**Last Updated:** 2026-04-08 (session 26)
+**Last Updated:** 2026-04-08 (session 27)
 
 This is a living document. Update the status column and notes as work progresses.
 
@@ -254,7 +254,7 @@ Build the server binary on top of `bonded-core`.
 | 2.1 | Server config loading (env vars + config file) | completed | Server loads TOML via `BONDED_CONFIG`/`--config`, falls back to defaults on read failure, applies env overrides for bind/public/health/log/key paths, and now deserializes partial `server.toml` files by filling missing options from defaults |
 | 2.2 | Authorized keys file — load, watch for changes, reload | completed | Added server authorized key store loading from TOML plus `notify` watcher callbacks; hardened watcher to ignore non-mutating access events and debounce rapid bursts to avoid self-triggered tight reload loops; server startup pre-creates missing state files/directories so operators only need to provide `server.toml` |
 | 2.3 | Accept NaiveTCP connections, perform auth handshake | completed | Added NaiveTCP listener accept loop and line-delimited JSON challenge-signature handshake with authorized-key enforcement |
-| 2.4 | Server-side session management (multiple concurrent clients) | completed | Added concurrent session registry keyed by authenticated client key with unique server session IDs and per-connection frame receive loop lifecycle; improved per-session runtime by offloading frame forwarding into sharded worker queues so slow flow forwarding no longer blocks the transport receive loop |
+| 2.4 | Server-side session management (multiple concurrent clients) | completed | Added concurrent session registry keyed by authenticated client key with unique server session IDs and per-connection frame receive loop lifecycle; improved per-session runtime by offloading frame forwarding into sharded worker queues so slow flow forwarding no longer blocks the transport receive loop; heartbeat handling now only consumes empty-payload `FLAG_PING` frames so data frames with incidental ping-bit are forwarded instead of dropped |
 | 2.5 | IP packet forwarding — read from session, write to internet (TUN or raw socket) | completed | Added user-space internet egress for IPv4+UDP and IPv4 ICMP echo frames: UDP payloads are relayed via `UdpSocket`; ICMP echo requests are relayed via IPv4 ICMP datagram sockets (`socket2`) with echo-id/sequence matching; retains optional upstream TCP relay fallback for non-IP payloads; ICMP echo traffic now uses a dedicated bounded per-session worker queue (128 frames) so ping bursts are isolated from TCP/UDP forwarding |
 | 2.6 | Return traffic — read from internet, write back to correct client session | completed | Added checksum-correct IPv4 response synthesis for UDP and ICMP echo reply traffic, and wired `forward_frame` to return `None` on per-protocol timeout/no-response so tunneled packets are not spuriously echoed |
 | 2.7 | Invite token creation (on admin request / startup) | completed | Added startup invite-token bootstrap that reuses existing usable token or creates/persists a new single-use token |
@@ -445,6 +445,7 @@ Decisions made during implementation that aren't in the requirements docs.
 | Server exposes a lightweight status HTML endpoint on a dedicated bind (`status_bind`) | 2026-04-06 | Page auto-refreshes and reports authenticated sessions plus active UDP/TCP flow tables and recent ICMP outcomes to aid runtime diagnostics during tunnel bring-up |
 | Per-session frame forwarding now runs through sharded async workers and a response queue (16 shards by connection ID) | 2026-04-08 | Reduces head-of-line blocking where one slow forward (for example upstream TCP timeout) could stall unrelated flows in the same session; preserves serialized transport writes in the main session loop |
 | Per-session ICMP echo traffic is isolated onto a dedicated bounded worker queue | 2026-04-08 | IPv4 ICMP echo requests bypass the generic forwarding shards and use one dedicated per-session worker with a 128-frame queue; prevents ping storms from monopolizing normal forwarding workers and causing unrelated flow timeouts |
+| Server heartbeat filter only treats empty-payload ping-flag frames as control messages | 2026-04-08 | Prevents accidental data-plane stalls where non-empty frames carrying `FLAG_PING` were consumed as heartbeats and never reached TCP/UDP/ICMP forwarding or status trackers |
 
 ---
 
