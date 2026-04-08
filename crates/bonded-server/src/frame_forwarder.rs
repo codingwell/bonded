@@ -6,7 +6,7 @@ use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::{timeout, Duration, Instant};
 use tracing::debug;
 
@@ -622,7 +622,7 @@ struct TcpFlowEntry {
 /// Per-client-session TCP NAT flow table.  One instance is created per
 /// authenticated VPN session before the frame-receive loop starts, and dropped
 /// when the session ends.
-/// 
+///
 /// Uses 256 shards to distribute lock contention across multiple mutexes,
 /// enabling concurrent access from multiple forwarding workers.
 #[derive(Clone)]
@@ -664,12 +664,20 @@ impl TcpFlowTable {
 
     async fn get_stream(&self, key: &FlowKey) -> Option<Arc<Mutex<TcpStream>>> {
         let shard_idx = self.shard_for_key(key);
-        self.shards[shard_idx].lock().await.get(key).map(|e| e.stream.clone())
+        self.shards[shard_idx]
+            .lock()
+            .await
+            .get(key)
+            .map(|e| e.stream.clone())
     }
 
     async fn get_server_seq(&self, key: &FlowKey) -> Option<u32> {
         let shard_idx = self.shard_for_key(key);
-        self.shards[shard_idx].lock().await.get(key).map(|e| e.server_seq)
+        self.shards[shard_idx]
+            .lock()
+            .await
+            .get(key)
+            .map(|e| e.server_seq)
     }
 
     async fn update_server_seq(&self, key: &FlowKey, new_seq: u32) -> bool {
@@ -704,7 +712,7 @@ pub async fn forward_frame(
     tcp_flows: &TcpFlowTable,
     udp_sessions: &UdpSessionManager,
     tcp_tracker: &TcpSessionTracker,
-    icmp_tracker: &IcmpSessionTracker,
+    _icmp_tracker: &IcmpSessionTracker,
     session_id: u64,
 ) -> anyhow::Result<Option<SessionFrame>> {
     // ── UDP ───────────────────────────────────────────────────────────────────
@@ -725,55 +733,11 @@ pub async fn forward_frame(
     }
 
     // ── ICMP ──────────────────────────────────────────────────────────────────
-    if let Some(icmp_packet) = parse_ipv4_icmp_echo_packet(&frame.payload) {
-        debug!(
-            src_ip = %icmp_packet.src_ip,
-            dst_ip = %icmp_packet.dst_ip,
-            echo_identifier = icmp_packet.echo_identifier,
-            echo_sequence = icmp_packet.echo_sequence,
-            payload_size = icmp_packet.icmp_segment.len().saturating_sub(8),
-            "ICMP echo packet forwarding outbound"
-        );
-
-        let reply = send_icmp_echo_and_wait_reply(
-            icmp_packet.dst_ip,
-            icmp_packet.echo_identifier,
-            icmp_packet.echo_sequence,
-            icmp_packet.icmp_segment.clone(),
-        )
-        .await?;
-
-        let Some(reply_icmp_segment) = reply else {
-            icmp_tracker.record_probe(session_id, &icmp_packet, "timeout");
-            debug!(
-                src_ip = %icmp_packet.src_ip,
-                dst_ip = %icmp_packet.dst_ip,
-                echo_identifier = icmp_packet.echo_identifier,
-                echo_sequence = icmp_packet.echo_sequence,
-                "ICMP echo response timeout (1200ms) - no response received"
-            );
-            return Ok(None);
-        };
-
-        let response_packet = build_ipv4_icmp_packet(
-            icmp_packet.dst_ip,
-            icmp_packet.src_ip,
-            icmp_packet.identification,
-            &reply_icmp_segment,
-        )?;
-        debug!(
-            src_ip = %icmp_packet.dst_ip,
-            dst_ip = %icmp_packet.src_ip,
-            echo_identifier = icmp_packet.echo_identifier,
-            echo_sequence = icmp_packet.echo_sequence,
-            response_packet_size = response_packet.len(),
-            "ICMP echo response packet built for client"
-        );
-        icmp_tracker.record_probe(session_id, &icmp_packet, "reply");
-        return Ok(Some(SessionFrame {
-            header: frame.header,
-            payload: response_packet.into(),
-        }));
+    // ICMP echo frames are routed to forward_icmp_frame() via the dedicated
+    // ICMP worker in the session loop; they should not reach forward_frame().
+    // Drop any that slip through.
+    if parse_ipv4_icmp_echo_packet(&frame.payload).is_some() {
+        return Ok(None);
     }
 
     // ── TCP (VPN packet-level NAT/proxy) ──────────────────────────────────────
@@ -847,14 +811,16 @@ async fn handle_tcp_frame(
             dst_ip = %pkt.dst_ip, dst_port = pkt.dst_port,
             "TCP SYN: upstream connected"
         );
-        flows.insert(
-            key,
-            TcpFlowEntry {
-                stream: Arc::new(Mutex::new(upstream)),
-                // SYN-ACK consumes one sequence number; first data byte is ISN+1.
-                server_seq: SERVER_ISN.wrapping_add(1),
-            },
-        ).await;
+        flows
+            .insert(
+                key,
+                TcpFlowEntry {
+                    stream: Arc::new(Mutex::new(upstream)),
+                    // SYN-ACK consumes one sequence number; first data byte is ISN+1.
+                    server_seq: SERVER_ISN.wrapping_add(1),
+                },
+            )
+            .await;
         tcp_tracker.register_flow(session_id, key);
         tcp_tracker.record_client_packet(session_id, key);
         tcp_tracker.record_remote_packet(session_id, key);
@@ -1021,65 +987,153 @@ async fn handle_tcp_frame(
 
 // ── ICMP helper ───────────────────────────────────────────────────────────────
 
-async fn send_icmp_echo_and_wait_reply(
-    dst_ip: Ipv4Addr,
-    echo_identifier: u16,
-    echo_sequence: u16,
-    request_icmp_segment: Vec<u8>,
-) -> anyhow::Result<Option<Vec<u8>>> {
-    tokio::task::spawn_blocking(move || {
-        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4))?;
-        let timeout = std::time::Duration::from_millis(1200);
-        socket.set_read_timeout(Some(timeout))?;
-        socket.set_write_timeout(Some(timeout))?;
+/// Shared async ICMP socket for a session.  One instance is created per
+/// authenticated session; all concurrent ICMP echo probes share the same
+/// OS socket and serialize only on the pending-waiter table lock, not on
+/// the actual send/recv I/O.
+///
+/// The kernel rewrites the ICMP echo identifier on DGRAM sockets to a
+/// per-socket ephemeral value.  Replies are therefore matched by
+/// (src_ip, echo_sequence) rather than by identifier; the original
+/// caller-supplied identifier is restored before returning.
+#[derive(Clone)]
+pub struct AsyncIcmpSocket {
+    socket: Arc<tokio::net::UdpSocket>,
+    // key = (reply_src_ip, echo_sequence)
+    pending: Arc<Mutex<HashMap<(Ipv4Addr, u16), oneshot::Sender<Vec<u8>>>>>,
+}
 
-        let target = SocketAddrV4::new(dst_ip, 0);
-        socket.connect(&target.into())?;
-        socket.send(&request_icmp_segment)?;
+impl AsyncIcmpSocket {
+    /// Create the shared socket and start the background receive loop.
+    pub fn new() -> anyhow::Result<Self> {
+        let raw = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4))?;
+        raw.set_nonblocking(true)?;
+        let std_sock: std::net::UdpSocket = raw.into();
+        let socket = Arc::new(tokio::net::UdpSocket::from_std(std_sock)?);
+        let pending: Arc<Mutex<HashMap<(Ipv4Addr, u16), oneshot::Sender<Vec<u8>>>>> =
+            Arc::default();
 
-        loop {
-            let mut raw_response = [std::mem::MaybeUninit::<u8>::uninit(); 4096];
-            let read_size = match socket.recv(&mut raw_response) {
-                Ok(size) => size,
-                Err(err)
-                    if err.kind() == std::io::ErrorKind::TimedOut
-                        || err.kind() == std::io::ErrorKind::WouldBlock =>
-                {
-                    return Ok(None);
+        let socket_rx = socket.clone();
+        let pending_rx = pending.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            loop {
+                let (n, src_addr) = match socket_rx.recv_from(&mut buf).await {
+                    Ok(x) => x,
+                    Err(_) => break,
+                };
+                if n < 8 {
+                    continue;
                 }
-                Err(err) => return Err(err.into()),
-            };
-
-            if read_size < 8 {
-                continue;
+                // Only handle ICMP echo reply (type=0, code=0).
+                if buf[0] != 0 || buf[1] != 0 {
+                    continue;
+                }
+                let echo_sequence = u16::from_be_bytes([buf[6], buf[7]]);
+                let src_ip = match src_addr {
+                    std::net::SocketAddr::V4(a) => *a.ip(),
+                    _ => continue,
+                };
+                if let Some(tx) = pending_rx.lock().await.remove(&(src_ip, echo_sequence)) {
+                    let _ = tx.send(buf[..n].to_vec());
+                }
             }
+        });
 
-            let response: Vec<u8> = raw_response[..read_size]
-                .iter()
-                .map(|byte| {
-                    // Bytes reported by recv() are fully initialized by the OS.
-                    unsafe { byte.assume_init() }
-                })
-                .collect();
-            let reply_type = response[0];
-            let reply_code = response[1];
-            // SOCK_DGRAM ICMP sockets cause the Linux kernel to rewrite the echo
-            // identifier with the socket'"'"'s own ephemeral identifier.  Only check
-            // the sequence number to match the reply; restore the caller-supplied
-            // identifier afterwards so that the VPN client sees a coherent packet.
-            let reply_sequence = u16::from_be_bytes([response[6], response[7]]);
-            if reply_type == 0 && reply_code == 0 && reply_sequence == echo_sequence {
-                let mut fixed = response;
-                fixed[4..6].copy_from_slice(&echo_identifier.to_be_bytes());
-                // Recompute the ICMP checksum after patching the identifier field.
-                fixed[2..4].copy_from_slice(&[0, 0]);
-                let new_cksum = checksum_ones_complement(&fixed);
-                fixed[2..4].copy_from_slice(&new_cksum.to_be_bytes());
-                return Ok(Some(fixed));
+        Ok(Self { socket, pending })
+    }
+
+    /// Send an ICMP echo request and asynchronously wait for the reply.
+    /// Returns `None` on timeout (1200 ms).
+    pub async fn send_and_wait(
+        &self,
+        dst_ip: Ipv4Addr,
+        echo_identifier: u16,
+        echo_sequence: u16,
+        icmp_segment: &[u8],
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let (tx, rx) = oneshot::channel();
+        self.pending
+            .lock()
+            .await
+            .insert((dst_ip, echo_sequence), tx);
+
+        let target = std::net::SocketAddrV4::new(dst_ip, 0);
+        if let Err(err) = self.socket.send_to(icmp_segment, target).await {
+            self.pending.lock().await.remove(&(dst_ip, echo_sequence));
+            return Err(err.into());
+        }
+
+        match timeout(Duration::from_millis(1200), rx).await {
+            Ok(Ok(mut reply)) => {
+                // Restore caller-supplied echo identifier and recompute checksum.
+                if reply.len() >= 8 {
+                    reply[4..6].copy_from_slice(&echo_identifier.to_be_bytes());
+                    reply[2..4].copy_from_slice(&[0, 0]);
+                    let cksum = checksum_ones_complement(&reply);
+                    reply[2..4].copy_from_slice(&cksum.to_be_bytes());
+                }
+                Ok(Some(reply))
+            }
+            _ => {
+                // Timed out or sender dropped — clean up the pending entry.
+                self.pending.lock().await.remove(&(dst_ip, echo_sequence));
+                Ok(None)
             }
         }
-    })
-    .await?
+    }
+}
+
+/// Forward a single ICMP echo frame using the session-shared async socket.
+/// This is called from a per-frame tokio task so many pings run concurrently.
+pub async fn forward_icmp_frame(
+    frame: SessionFrame,
+    icmp_socket: &AsyncIcmpSocket,
+    icmp_tracker: &IcmpSessionTracker,
+    session_id: u64,
+) -> anyhow::Result<Option<SessionFrame>> {
+    let Some(icmp_packet) = parse_ipv4_icmp_echo_packet(&frame.payload) else {
+        return Ok(None);
+    };
+
+    debug!(
+        src_ip = %icmp_packet.src_ip,
+        dst_ip = %icmp_packet.dst_ip,
+        echo_identifier = icmp_packet.echo_identifier,
+        echo_sequence = icmp_packet.echo_sequence,
+        "ICMP echo async forwarding outbound"
+    );
+
+    let reply = icmp_socket
+        .send_and_wait(
+            icmp_packet.dst_ip,
+            icmp_packet.echo_identifier,
+            icmp_packet.echo_sequence,
+            &icmp_packet.icmp_segment,
+        )
+        .await?;
+
+    let Some(reply_icmp_segment) = reply else {
+        icmp_tracker.record_probe(session_id, &icmp_packet, "timeout");
+        debug!(
+            dst_ip = %icmp_packet.dst_ip,
+            echo_sequence = icmp_packet.echo_sequence,
+            "ICMP echo timeout"
+        );
+        return Ok(None);
+    };
+
+    let response_packet = build_ipv4_icmp_packet(
+        icmp_packet.dst_ip,
+        icmp_packet.src_ip,
+        icmp_packet.identification,
+        &reply_icmp_segment,
+    )?;
+    icmp_tracker.record_probe(session_id, &icmp_packet, "reply");
+    Ok(Some(SessionFrame {
+        header: frame.header,
+        payload: response_packet.into(),
+    }))
 }
 
 // ── Packet parsers ────────────────────────────────────────────────────────────

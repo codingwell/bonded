@@ -28,9 +28,15 @@ mod concurrency_tests {
 
         let occupied_shards = shard_loads.iter().filter(|&&load| load > 0).count();
         let max_load = *shard_loads.iter().max().unwrap();
-        
-        println!("Shard distribution for 50 connections: {} occupied shards, max load {} per shard", occupied_shards, max_load);
-        assert!(max_load <= 1, "Each connection should map to unique or near-unique shard");
+
+        println!(
+            "Shard distribution for 50 connections: {} occupied shards, max load {} per shard",
+            occupied_shards, max_load
+        );
+        assert!(
+            max_load <= 1,
+            "Each connection should map to unique or near-unique shard"
+        );
     }
 
     #[test]
@@ -62,8 +68,14 @@ mod concurrency_tests {
             }
         }
 
-        println!("Batch drained {} responses in one pass (no select cycles)", drained_count);
-        assert_eq!(drained_count, 256, "All responses should drain before select blocks");
+        println!(
+            "Batch drained {} responses in one pass (no select cycles)",
+            drained_count
+        );
+        assert_eq!(
+            drained_count, 256,
+            "All responses should drain before select blocks"
+        );
     }
 }
 
@@ -75,8 +87,8 @@ use bonded_core::session::{SessionFrame, SessionHeader, FLAG_PING, FLAG_PONG};
 use bonded_core::transport::{NaiveTcpTransport, Transport};
 use clap::Parser;
 use frame_forwarder::{
-    forward_frame, IcmpSessionTracker, TcpFlowTable, TcpSessionTracker, UdpSessionManager,
-    UdpSessionTracker,
+    forward_frame, forward_icmp_frame, AsyncIcmpSocket, IcmpSessionTracker, TcpFlowTable,
+    TcpSessionTracker, UdpSessionManager, UdpSessionTracker,
 };
 use health::run_health_server;
 use invite_tokens::ensure_startup_invite;
@@ -332,14 +344,14 @@ async fn run_websocket_server(
                         UdpSessionManager::new(handle.session_id, udp_tx, udp_tracker.clone());
                     let (forward_shards, icmp_forward_tx, mut forward_responses) =
                         spawn_forward_workers(
-                        handle.session_id,
-                        upstream_tcp_target.clone(),
-                        tcp_flows.clone(),
-                        udp_sessions.clone(),
-                        tcp_tracker.clone(),
-                        icmp_tracker.clone(),
-                        "websocket",
-                    );
+                            handle.session_id,
+                            upstream_tcp_target.clone(),
+                            tcp_flows.clone(),
+                            udp_sessions.clone(),
+                            tcp_tracker.clone(),
+                            icmp_tracker.clone(),
+                            "websocket",
+                        );
 
                     loop {
                         // Batch-drain forward responses before blocking on select.
@@ -623,14 +635,14 @@ async fn run_server(
                         UdpSessionManager::new(handle.session_id, udp_tx, udp_tracker.clone());
                     let (forward_shards, icmp_forward_tx, mut forward_responses) =
                         spawn_forward_workers(
-                        handle.session_id,
-                        upstream_tcp_target.clone(),
-                        tcp_flows.clone(),
-                        udp_sessions.clone(),
-                        tcp_tracker.clone(),
-                        icmp_tracker.clone(),
-                        "naive-tcp",
-                    );
+                            handle.session_id,
+                            upstream_tcp_target.clone(),
+                            tcp_flows.clone(),
+                            udp_sessions.clone(),
+                            tcp_tracker.clone(),
+                            icmp_tracker.clone(),
+                            "naive-tcp",
+                        );
                     loop {
                         // Batch-drain forward responses before blocking on select.
                         // This prevents select from blocking when multiple responses are queued.
@@ -890,51 +902,50 @@ fn spawn_forward_workers(
     }
 
     let (icmp_tx, mut icmp_rx) = mpsc::channel::<SessionFrame>(MAX_ICMP_FRAMES_PER_SESSION);
-    let response_tx = response_tx.clone();
-    let tcp_flows = tcp_flows.clone();
-    let udp_sessions = udp_sessions.clone();
-    let tcp_tracker = tcp_tracker.clone();
-    let icmp_tracker = icmp_tracker.clone();
-    let upstream = upstream.clone();
+    let response_tx_icmp = response_tx.clone();
+    let icmp_tracker_icmp = icmp_tracker.clone();
+    // Create one shared async ICMP socket for this session.  Each probe is
+    // dispatched as its own tokio task so all in-flight pings run concurrently
+    // without any blocking threads.
+    let icmp_socket = match AsyncIcmpSocket::new() {
+        Ok(s) => s,
+        Err(err) => {
+            warn!(
+                session_id,
+                transport = transport_label,
+                error = %err,
+                "failed to create async ICMP socket; ICMP forwarding disabled for this session"
+            );
+            // Return a dummy channel that is immediately closed.
+            let (dead_tx, _) = mpsc::channel(1);
+            return (shard_senders, dead_tx, response_rx);
+        }
+    };
     tokio::spawn(async move {
         while let Some(frame) = icmp_rx.recv().await {
-            let response = match forward_frame(
-                frame,
-                upstream.as_deref(),
-                &tcp_flows,
-                &udp_sessions,
-                &tcp_tracker,
-                &icmp_tracker,
-                session_id,
-            )
-            .await
-            {
-                Ok(value) => value,
-                Err(err) => {
-                    warn!(
-                        session_id,
-                        transport = transport_label,
-                        lane = "icmp",
-                        error = %err,
-                        "failed to forward ICMP session frame"
-                    );
-                    continue;
+            // Spawn a task per probe so all pings fly concurrently.
+            let icmp_socket = icmp_socket.clone();
+            let response_tx = response_tx_icmp.clone();
+            let icmp_tracker = icmp_tracker_icmp.clone();
+            tokio::spawn(async move {
+                match forward_icmp_frame(frame, &icmp_socket, &icmp_tracker, session_id).await {
+                    Ok(Some(response)) => {
+                        if response_tx.send(response).is_err() {
+                            // Session gone; nothing to do.
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        warn!(
+                            session_id,
+                            transport = transport_label,
+                            lane = "icmp",
+                            error = %err,
+                            "failed to forward ICMP session frame"
+                        );
+                    }
                 }
-            };
-
-            let Some(response) = response else {
-                continue;
-            };
-
-            if response_tx.send(response).is_err() {
-                warn!(
-                    session_id,
-                    transport = transport_label,
-                    lane = "icmp",
-                    "forward response receiver dropped"
-                );
-                break;
-            }
+            });
         }
     });
 
