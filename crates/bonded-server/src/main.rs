@@ -37,6 +37,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, warn, Level};
 
 const FORWARD_WORKER_SHARDS: usize = 16;
+const MAX_ICMP_FRAMES_PER_SESSION: usize = 128;
 
 #[derive(Debug, Parser)]
 #[command(name = "bonded-server")]
@@ -274,7 +275,8 @@ async fn run_websocket_server(
                     let (udp_tx, mut udp_rx) = mpsc::unbounded_channel();
                     let udp_sessions =
                         UdpSessionManager::new(handle.session_id, udp_tx, udp_tracker.clone());
-                    let (forward_shards, mut forward_responses) = spawn_forward_workers(
+                    let (forward_shards, icmp_forward_tx, mut forward_responses) =
+                        spawn_forward_workers(
                         handle.session_id,
                         upstream_tcp_target.clone(),
                         tcp_flows.clone(),
@@ -365,6 +367,32 @@ async fn run_websocket_server(
                                             continue;
                                         }
 
+                                        let is_icmp_echo = is_ipv4_icmp_echo_frame(&frame.payload);
+                                        if is_icmp_echo {
+                                            match icmp_forward_tx.try_send(frame) {
+                                                Ok(()) => continue,
+                                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                                    warn!(
+                                                        peer = %peer,
+                                                        public_key = %public_key,
+                                                        session_id = handle.session_id,
+                                                        max_pending_icmp = MAX_ICMP_FRAMES_PER_SESSION,
+                                                        "dropping ICMP echo frame because dedicated ICMP queue is full"
+                                                    );
+                                                    continue;
+                                                }
+                                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                                    warn!(
+                                                        peer = %peer,
+                                                        public_key = %public_key,
+                                                        session_id = handle.session_id,
+                                                        "dedicated ICMP queue closed"
+                                                    );
+                                                    break;
+                                                }
+                                            }
+                                        }
+
                                         let shard_idx = shard_index_for_connection(frame.header.connection_id);
                                         if let Err(err) = forward_shards[shard_idx].send(frame) {
                                             warn!(
@@ -393,6 +421,7 @@ async fn run_websocket_server(
                         }
                     }
                     drop(forward_shards);
+                    drop(icmp_forward_tx);
 
                     sessions.unregister_client(&public_key);
                     udp_tracker.clear_session(handle.session_id);
@@ -508,7 +537,8 @@ async fn run_server(
                     let (udp_tx, mut udp_rx) = mpsc::unbounded_channel();
                     let udp_sessions =
                         UdpSessionManager::new(handle.session_id, udp_tx, udp_tracker.clone());
-                    let (forward_shards, mut forward_responses) = spawn_forward_workers(
+                    let (forward_shards, icmp_forward_tx, mut forward_responses) =
+                        spawn_forward_workers(
                         handle.session_id,
                         upstream_tcp_target.clone(),
                         tcp_flows.clone(),
@@ -598,6 +628,32 @@ async fn run_server(
                                             continue;
                                         }
 
+                                        let is_icmp_echo = is_ipv4_icmp_echo_frame(&frame.payload);
+                                        if is_icmp_echo {
+                                            match icmp_forward_tx.try_send(frame) {
+                                                Ok(()) => continue,
+                                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                                    warn!(
+                                                        peer = %peer,
+                                                        public_key = %public_key,
+                                                        session_id = handle.session_id,
+                                                        max_pending_icmp = MAX_ICMP_FRAMES_PER_SESSION,
+                                                        "dropping ICMP echo frame because dedicated ICMP queue is full"
+                                                    );
+                                                    continue;
+                                                }
+                                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                                    warn!(
+                                                        peer = %peer,
+                                                        public_key = %public_key,
+                                                        session_id = handle.session_id,
+                                                        "dedicated ICMP queue closed"
+                                                    );
+                                                    break;
+                                                }
+                                            }
+                                        }
+
                                         let shard_idx = shard_index_for_connection(frame.header.connection_id);
                                         if let Err(err) = forward_shards[shard_idx].send(frame) {
                                             warn!(
@@ -626,6 +682,7 @@ async fn run_server(
                         }
                     }
                     drop(forward_shards);
+                    drop(icmp_forward_tx);
 
                     sessions.unregister_client(&public_key);
                     udp_tracker.clear_session(handle.session_id);
@@ -654,6 +711,7 @@ fn spawn_forward_workers(
     transport_label: &'static str,
 ) -> (
     Vec<mpsc::UnboundedSender<SessionFrame>>,
+    mpsc::Sender<SessionFrame>,
     mpsc::UnboundedReceiver<SessionFrame>,
 ) {
     let (response_tx, response_rx) = mpsc::unbounded_channel();
@@ -718,7 +776,85 @@ fn spawn_forward_workers(
         });
     }
 
-    (shard_senders, response_rx)
+    let (icmp_tx, mut icmp_rx) = mpsc::channel::<SessionFrame>(MAX_ICMP_FRAMES_PER_SESSION);
+    let response_tx = response_tx.clone();
+    let tcp_flows = tcp_flows.clone();
+    let udp_sessions = udp_sessions.clone();
+    let tcp_tracker = tcp_tracker.clone();
+    let icmp_tracker = icmp_tracker.clone();
+    let upstream = upstream.clone();
+    tokio::spawn(async move {
+        while let Some(frame) = icmp_rx.recv().await {
+            let response = match forward_frame(
+                frame,
+                upstream.as_deref(),
+                &tcp_flows,
+                &udp_sessions,
+                &tcp_tracker,
+                &icmp_tracker,
+                session_id,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    warn!(
+                        session_id,
+                        transport = transport_label,
+                        lane = "icmp",
+                        error = %err,
+                        "failed to forward ICMP session frame"
+                    );
+                    continue;
+                }
+            };
+
+            let Some(response) = response else {
+                continue;
+            };
+
+            if response_tx.send(response).is_err() {
+                warn!(
+                    session_id,
+                    transport = transport_label,
+                    lane = "icmp",
+                    "forward response receiver dropped"
+                );
+                break;
+            }
+        }
+    });
+
+    (shard_senders, icmp_tx, response_rx)
+}
+
+fn is_ipv4_icmp_echo_frame(packet: &[u8]) -> bool {
+    if packet.len() < 28 {
+        return false;
+    }
+
+    let version = packet[0] >> 4;
+    let ihl = (packet[0] & 0x0f) as usize;
+    if version != 4 || ihl < 5 {
+        return false;
+    }
+
+    let header_len = ihl * 4;
+    if packet.len() < header_len + 8 {
+        return false;
+    }
+
+    let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+    if total_len < header_len + 8 || total_len > packet.len() {
+        return false;
+    }
+
+    if packet[9] != 1 {
+        return false;
+    }
+
+    let icmp_start = header_len;
+    packet[icmp_start] == 8 && packet[icmp_start + 1] == 0
 }
 
 fn apply_env_overrides<F>(cfg: &mut ServerConfig, mut read_env: F)
@@ -777,7 +913,7 @@ fn init_tracing_from_level(level: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_env_overrides, ensure_server_state_files};
+    use super::{apply_env_overrides, ensure_server_state_files, is_ipv4_icmp_echo_frame};
     use bonded_core::config::ServerConfig;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -865,5 +1001,33 @@ mod tests {
         let _ = fs::remove_file(authorized);
         let _ = fs::remove_file(invites);
         let _ = fs::remove_dir(root);
+    }
+
+    #[test]
+    fn detects_ipv4_icmp_echo_frames() {
+        let packet = vec![
+            0x45, 0x00, 0x00, 0x1c, // IPv4 header start + total length
+            0x12, 0x34, 0x40, 0x00, // id + flags/fragment
+            64, 1, 0, 0, // ttl + proto=icmp + checksum placeholder
+            10, 8, 0, 2, // src ip
+            1, 1, 1, 1, // dst ip
+            8, 0, 0, 0, // ICMP echo request type/code/checksum
+            0xab, 0xcd, 0x00, 0x01, // echo id + sequence
+        ];
+
+        assert!(is_ipv4_icmp_echo_frame(&packet));
+    }
+
+    #[test]
+    fn rejects_non_icmp_echo_frames() {
+        let tcp_packet = vec![
+            0x45, 0x00, 0x00, 0x14, // IPv4 header total length only
+            0x12, 0x34, 0x40, 0x00, // id + flags/fragment
+            64, 6, 0, 0, // ttl + proto=tcp + checksum placeholder
+            10, 8, 0, 2, // src ip
+            1, 1, 1, 1, // dst ip
+        ];
+
+        assert!(!is_ipv4_icmp_echo_frame(&tcp_packet));
     }
 }
