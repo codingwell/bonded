@@ -36,6 +36,8 @@ use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, warn, Level};
 
+const FORWARD_WORKER_SHARDS: usize = 16;
+
 #[derive(Debug, Parser)]
 #[command(name = "bonded-server")]
 struct Args {
@@ -272,6 +274,15 @@ async fn run_websocket_server(
                     let (udp_tx, mut udp_rx) = mpsc::unbounded_channel();
                     let udp_sessions =
                         UdpSessionManager::new(handle.session_id, udp_tx, udp_tracker.clone());
+                    let (forward_shards, mut forward_responses) = spawn_forward_workers(
+                        handle.session_id,
+                        upstream_tcp_target.clone(),
+                        tcp_flows.clone(),
+                        udp_sessions.clone(),
+                        tcp_tracker.clone(),
+                        icmp_tracker.clone(),
+                        "websocket",
+                    );
 
                     loop {
                         tokio::select! {
@@ -287,6 +298,28 @@ async fn run_websocket_server(
                                         session_id = handle.session_id,
                                         error = %err,
                                         "failed to send websocket async UDP response"
+                                    );
+                                    break;
+                                }
+                            }
+                            maybe_forwarded_frame = forward_responses.recv() => {
+                                let Some(forwarded_frame) = maybe_forwarded_frame else {
+                                    warn!(
+                                        peer = %peer,
+                                        public_key = %public_key,
+                                        session_id = handle.session_id,
+                                        "websocket forward response queue closed"
+                                    );
+                                    break;
+                                };
+
+                                if let Err(err) = transport.send(forwarded_frame).await {
+                                    warn!(
+                                        peer = %peer,
+                                        public_key = %public_key,
+                                        session_id = handle.session_id,
+                                        error = %err,
+                                        "failed to return websocket forwarded frame"
                                     );
                                     break;
                                 }
@@ -332,45 +365,15 @@ async fn run_websocket_server(
                                             continue;
                                         }
 
-                                        let response = match forward_frame(
-                                            frame,
-                                            if upstream_tcp_target.is_empty() {
-                                                None
-                                            } else {
-                                                Some(upstream_tcp_target.as_str())
-                                            },
-                                            &tcp_flows,
-                                            &udp_sessions,
-                                            &tcp_tracker,
-                                            &icmp_tracker,
-                                            handle.session_id,
-                                        )
-                                        .await
-                                        {
-                                            Ok(value) => value,
-                                            Err(err) => {
-                                                warn!(
-                                                    peer = %peer,
-                                                    public_key = %public_key,
-                                                    session_id = handle.session_id,
-                                                    error = %err,
-                                                    "failed to forward websocket session frame"
-                                                );
-                                                continue;
-                                            }
-                                        };
-
-                                        let Some(response) = response else {
-                                            continue;
-                                        };
-
-                                        if let Err(err) = transport.send(response).await {
+                                        let shard_idx = shard_index_for_connection(frame.header.connection_id);
+                                        if let Err(err) = forward_shards[shard_idx].send(frame) {
                                             warn!(
                                                 peer = %peer,
                                                 public_key = %public_key,
                                                 session_id = handle.session_id,
-                                                error = %err,
-                                                "failed to return websocket forwarded frame"
+                                                error = ?err,
+                                                shard_idx,
+                                                "failed to enqueue websocket frame for forwarding"
                                             );
                                             break;
                                         }
@@ -389,6 +392,7 @@ async fn run_websocket_server(
                             }
                         }
                     }
+                    drop(forward_shards);
 
                     sessions.unregister_client(&public_key);
                     udp_tracker.clear_session(handle.session_id);
@@ -504,6 +508,15 @@ async fn run_server(
                     let (udp_tx, mut udp_rx) = mpsc::unbounded_channel();
                     let udp_sessions =
                         UdpSessionManager::new(handle.session_id, udp_tx, udp_tracker.clone());
+                    let (forward_shards, mut forward_responses) = spawn_forward_workers(
+                        handle.session_id,
+                        upstream_tcp_target.clone(),
+                        tcp_flows.clone(),
+                        udp_sessions.clone(),
+                        tcp_tracker.clone(),
+                        icmp_tracker.clone(),
+                        "naive-tcp",
+                    );
                     loop {
                         tokio::select! {
                             maybe_udp_frame = udp_rx.recv() => {
@@ -518,6 +531,28 @@ async fn run_server(
                                         session_id = handle.session_id,
                                         error = %err,
                                         "failed to send async UDP response"
+                                    );
+                                    break;
+                                }
+                            }
+                            maybe_forwarded_frame = forward_responses.recv() => {
+                                let Some(forwarded_frame) = maybe_forwarded_frame else {
+                                    warn!(
+                                        peer = %peer,
+                                        public_key = %public_key,
+                                        session_id = handle.session_id,
+                                        "forward response queue closed"
+                                    );
+                                    break;
+                                };
+
+                                if let Err(err) = transport.send(forwarded_frame).await {
+                                    warn!(
+                                        peer = %peer,
+                                        public_key = %public_key,
+                                        session_id = handle.session_id,
+                                        error = %err,
+                                        "failed to return forwarded frame"
                                     );
                                     break;
                                 }
@@ -563,45 +598,15 @@ async fn run_server(
                                             continue;
                                         }
 
-                                        let response = match forward_frame(
-                                            frame,
-                                            if upstream_tcp_target.is_empty() {
-                                                None
-                                            } else {
-                                                Some(upstream_tcp_target.as_str())
-                                            },
-                                            &tcp_flows,
-                                            &udp_sessions,
-                                            &tcp_tracker,
-                                            &icmp_tracker,
-                                            handle.session_id,
-                                        )
-                                        .await
-                                        {
-                                            Ok(value) => value,
-                                            Err(err) => {
-                                                warn!(
-                                                    peer = %peer,
-                                                    public_key = %public_key,
-                                                    session_id = handle.session_id,
-                                                    error = %err,
-                                                    "failed to forward session frame"
-                                                );
-                                                continue;
-                                            }
-                                        };
-
-                                        let Some(response) = response else {
-                                            continue;
-                                        };
-
-                                        if let Err(err) = transport.send(response).await {
+                                        let shard_idx = shard_index_for_connection(frame.header.connection_id);
+                                        if let Err(err) = forward_shards[shard_idx].send(frame) {
                                             warn!(
                                                 peer = %peer,
                                                 public_key = %public_key,
                                                 session_id = handle.session_id,
-                                                error = %err,
-                                                "failed to return forwarded frame"
+                                                error = ?err,
+                                                shard_idx,
+                                                "failed to enqueue frame for forwarding"
                                             );
                                             break;
                                         }
@@ -620,6 +625,7 @@ async fn run_server(
                             }
                         }
                     }
+                    drop(forward_shards);
 
                     sessions.unregister_client(&public_key);
                     udp_tracker.clear_session(handle.session_id);
@@ -632,6 +638,87 @@ async fn run_server(
             }
         });
     }
+}
+
+fn shard_index_for_connection(connection_id: u32) -> usize {
+    (connection_id as usize) % FORWARD_WORKER_SHARDS
+}
+
+fn spawn_forward_workers(
+    session_id: u64,
+    upstream_tcp_target: String,
+    tcp_flows: TcpFlowTable,
+    udp_sessions: UdpSessionManager,
+    tcp_tracker: TcpSessionTracker,
+    icmp_tracker: IcmpSessionTracker,
+    transport_label: &'static str,
+) -> (
+    Vec<mpsc::UnboundedSender<SessionFrame>>,
+    mpsc::UnboundedReceiver<SessionFrame>,
+) {
+    let (response_tx, response_rx) = mpsc::unbounded_channel();
+    let upstream = if upstream_tcp_target.trim().is_empty() {
+        None
+    } else {
+        Some(upstream_tcp_target)
+    };
+
+    let mut shard_senders = Vec::with_capacity(FORWARD_WORKER_SHARDS);
+    for shard_idx in 0..FORWARD_WORKER_SHARDS {
+        let (tx, mut rx) = mpsc::unbounded_channel::<SessionFrame>();
+        shard_senders.push(tx);
+
+        let response_tx = response_tx.clone();
+        let tcp_flows = tcp_flows.clone();
+        let udp_sessions = udp_sessions.clone();
+        let tcp_tracker = tcp_tracker.clone();
+        let icmp_tracker = icmp_tracker.clone();
+        let upstream = upstream.clone();
+
+        tokio::spawn(async move {
+            while let Some(frame) = rx.recv().await {
+                let response = match forward_frame(
+                    frame,
+                    upstream.as_deref(),
+                    &tcp_flows,
+                    &udp_sessions,
+                    &tcp_tracker,
+                    &icmp_tracker,
+                    session_id,
+                )
+                .await
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        warn!(
+                            session_id,
+                            shard_idx,
+                            transport = transport_label,
+                            error = %err,
+                            "failed to forward session frame"
+                        );
+                        continue;
+                    }
+                };
+
+                let Some(response) = response else {
+                    continue;
+                };
+
+                if response_tx.send(response).is_err() {
+                    warn!(
+                        session_id,
+                        shard_idx,
+                        transport = transport_label,
+                        "forward response receiver dropped"
+                    );
+                    break;
+                }
+            }
+        });
+    }
+
+    (shard_senders, response_rx)
 }
 
 fn apply_env_overrides<F>(cfg: &mut ServerConfig, mut read_env: F)
