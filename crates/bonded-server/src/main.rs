@@ -287,6 +287,35 @@ async fn run_websocket_server(
                     );
 
                     loop {
+                        // Batch-drain forward responses before blocking on select.
+                        // This prevents select from blocking when multiple responses are queued.
+                        loop {
+                            match forward_responses.try_recv() {
+                                Ok(forwarded_frame) => {
+                                    if let Err(err) = transport.send(forwarded_frame).await {
+                                        warn!(
+                                            peer = %peer,
+                                            public_key = %public_key,
+                                            session_id = handle.session_id,
+                                            error = %err,
+                                            "failed to return websocket forwarded frame"
+                                        );
+                                        break;
+                                    }
+                                }
+                                Err(mpsc::error::TryRecvError::Empty) => break,
+                                Err(mpsc::error::TryRecvError::Disconnected) => {
+                                    warn!(
+                                        peer = %peer,
+                                        public_key = %public_key,
+                                        session_id = handle.session_id,
+                                        "websocket forward response queue closed"
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+
                         tokio::select! {
                             maybe_udp_frame = udp_rx.recv() => {
                                 let Some(udp_frame) = maybe_udp_frame else {
@@ -548,6 +577,35 @@ async fn run_server(
                         "naive-tcp",
                     );
                     loop {
+                        // Batch-drain forward responses before blocking on select.
+                        // This prevents select from blocking when multiple responses are queued.
+                        loop {
+                            match forward_responses.try_recv() {
+                                Ok(forwarded_frame) => {
+                                    if let Err(err) = transport.send(forwarded_frame).await {
+                                        warn!(
+                                            peer = %peer,
+                                            public_key = %public_key,
+                                            session_id = handle.session_id,
+                                            error = %err,
+                                            "failed to return forwarded frame"
+                                        );
+                                        break;
+                                    }
+                                }
+                                Err(mpsc::error::TryRecvError::Empty) => break,
+                                Err(mpsc::error::TryRecvError::Disconnected) => {
+                                    warn!(
+                                        peer = %peer,
+                                        public_key = %public_key,
+                                        session_id = handle.session_id,
+                                        "forward response queue closed"
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+
                         tokio::select! {
                             maybe_udp_frame = udp_rx.recv() => {
                                 let Some(udp_frame) = maybe_udp_frame else {
