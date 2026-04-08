@@ -455,10 +455,7 @@ async fn bind_aware_path_honors_websocket_first_preference() {
         .send(frame)
         .await
         .expect("websocket send should succeed");
-    let echoed = paths[0]
-        .recv()
-        .await
-        .expect("websocket echo should arrive");
+    let echoed = paths[0].recv().await.expect("websocket echo should arrive");
     assert_eq!(&echoed.payload[..], b"websocket-first");
 
     ws_task.await.expect("ws task should join");

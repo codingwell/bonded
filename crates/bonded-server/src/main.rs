@@ -36,7 +36,7 @@ use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, warn, Level};
 
-const FORWARD_WORKER_SHARDS: usize = 16;
+const FORWARD_WORKER_SHARDS: usize = 256;
 const MAX_ICMP_FRAMES_PER_SESSION: usize = 128;
 
 #[derive(Debug, Parser)]

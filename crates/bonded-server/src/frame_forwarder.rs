@@ -362,7 +362,9 @@ impl IcmpSessionTracker {
 #[derive(Clone)]
 pub struct UdpSessionManager {
     session_id: u64,
-    sessions: Arc<Mutex<HashMap<UdpFlowKey, UdpFlowHandle>>>,
+    /// 16 shards of UDP flow sessions to distribute lock contention.
+    /// Each shard i manages flows where `hash(flow_key) % 16 == i`.
+    shards: Arc<Vec<Arc<Mutex<HashMap<UdpFlowKey, UdpFlowHandle>>>>>,
     outbound_tx: mpsc::UnboundedSender<SessionFrame>,
     tracker: UdpSessionTracker,
 }
@@ -373,12 +375,45 @@ impl UdpSessionManager {
         outbound_tx: mpsc::UnboundedSender<SessionFrame>,
         tracker: UdpSessionTracker,
     ) -> Self {
+        let mut shards = Vec::with_capacity(16);
+        for _ in 0..16 {
+            shards.push(Arc::new(Mutex::new(HashMap::new())));
+        }
         Self {
             session_id,
-            sessions: Arc::new(Mutex::new(HashMap::new())),
+            shards: Arc::new(shards),
             outbound_tx,
             tracker,
         }
+    }
+
+    fn shard_for_key(&self, key: &UdpFlowKey) -> usize {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        (hasher.finish() as usize) % 16
+    }
+
+    async fn get(&self, key: &UdpFlowKey) -> Option<UdpFlowHandle> {
+        let shard_idx = self.shard_for_key(key);
+        self.shards[shard_idx].lock().await.get(key).cloned()
+    }
+
+    async fn insert(&self, key: UdpFlowKey, handle: UdpFlowHandle) {
+        let shard_idx = self.shard_for_key(&key);
+        self.shards[shard_idx].lock().await.insert(key, handle);
+    }
+
+    async fn remove(&self, key: &UdpFlowKey) {
+        let shard_idx = self.shard_for_key(key);
+        self.shards[shard_idx].lock().await.remove(key);
+    }
+
+    async fn get_or_insert(&self, key: UdpFlowKey, default: UdpFlowHandle) -> UdpFlowHandle {
+        let shard_idx = self.shard_for_key(&key);
+        let mut shard = self.shards[shard_idx].lock().await;
+        shard.entry(key).or_insert_with(|| default.clone()).clone()
     }
 
     async fn forward_client_udp_packet(
@@ -427,7 +462,7 @@ impl UdpSessionManager {
         udp_packet: &Ipv4UdpPacket,
         frame_header: SessionHeader,
     ) -> anyhow::Result<UdpFlowHandle> {
-        if let Some(existing) = self.sessions.lock().await.get(key).cloned() {
+        if let Some(existing) = self.get(key).await {
             return Ok(existing);
         }
 
@@ -447,7 +482,7 @@ impl UdpSessionManager {
             })),
         };
 
-        let sessions = self.sessions.clone();
+        let manager = self.clone();
         let outbound_tx = self.outbound_tx.clone();
         let state = handle.state.clone();
         let key_for_task = key.clone();
@@ -529,15 +564,12 @@ impl UdpSessionManager {
                 }
             }
 
-            sessions.lock().await.remove(&key_for_task);
+            manager.remove(&key_for_task).await;
             tracker.remove_flow(session_id, &key_for_task);
         });
 
-        let mut sessions = self.sessions.lock().await;
-        let entry = sessions
-            .entry(key.clone())
-            .or_insert_with(|| handle.clone());
-        Ok(entry.clone())
+        let entry = self.get_or_insert(key.clone(), handle.clone()).await;
+        Ok(entry)
     }
 }
 
@@ -590,9 +622,65 @@ struct TcpFlowEntry {
 /// Per-client-session TCP NAT flow table.  One instance is created per
 /// authenticated VPN session before the frame-receive loop starts, and dropped
 /// when the session ends.
-#[derive(Clone, Default)]
+/// 
+/// Uses 256 shards to distribute lock contention across multiple mutexes,
+/// enabling concurrent access from multiple forwarding workers.
+#[derive(Clone)]
 pub struct TcpFlowTable {
-    flows: Arc<Mutex<HashMap<FlowKey, TcpFlowEntry>>>,
+    shards: Arc<Vec<Arc<Mutex<HashMap<FlowKey, TcpFlowEntry>>>>>,
+}
+
+impl Default for TcpFlowTable {
+    fn default() -> Self {
+        let mut shards = Vec::with_capacity(256);
+        for _ in 0..256 {
+            shards.push(Arc::new(Mutex::new(HashMap::new())));
+        }
+        Self {
+            shards: Arc::new(shards),
+        }
+    }
+}
+
+impl TcpFlowTable {
+    fn shard_for_key(&self, key: &FlowKey) -> usize {
+        // Hash the 4-tuple to determine shard
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        (hasher.finish() as usize) % 256
+    }
+
+    async fn insert(&self, key: FlowKey, entry: TcpFlowEntry) {
+        let shard_idx = self.shard_for_key(&key);
+        self.shards[shard_idx].lock().await.insert(key, entry);
+    }
+
+    async fn remove(&self, key: &FlowKey) -> Option<TcpFlowEntry> {
+        let shard_idx = self.shard_for_key(key);
+        self.shards[shard_idx].lock().await.remove(key)
+    }
+
+    async fn get_stream(&self, key: &FlowKey) -> Option<Arc<Mutex<TcpStream>>> {
+        let shard_idx = self.shard_for_key(key);
+        self.shards[shard_idx].lock().await.get(key).map(|e| e.stream.clone())
+    }
+
+    async fn get_server_seq(&self, key: &FlowKey) -> Option<u32> {
+        let shard_idx = self.shard_for_key(key);
+        self.shards[shard_idx].lock().await.get(key).map(|e| e.server_seq)
+    }
+
+    async fn update_server_seq(&self, key: &FlowKey, new_seq: u32) -> bool {
+        let shard_idx = self.shard_for_key(key);
+        if let Some(entry) = self.shards[shard_idx].lock().await.get_mut(key) {
+            entry.server_seq = new_seq;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -759,14 +847,14 @@ async fn handle_tcp_frame(
             dst_ip = %pkt.dst_ip, dst_port = pkt.dst_port,
             "TCP SYN: upstream connected"
         );
-        flows.flows.lock().await.insert(
+        flows.insert(
             key,
             TcpFlowEntry {
                 stream: Arc::new(Mutex::new(upstream)),
                 // SYN-ACK consumes one sequence number; first data byte is ISN+1.
                 server_seq: SERVER_ISN.wrapping_add(1),
             },
-        );
+        ).await;
         tcp_tracker.register_flow(session_id, key);
         tcp_tracker.record_client_packet(session_id, key);
         tcp_tracker.record_remote_packet(session_id, key);
@@ -791,7 +879,7 @@ async fn handle_tcp_frame(
     if pkt.flags & TCP_FIN != 0 {
         tcp_tracker.record_client_packet(session_id, key);
         tcp_tracker.record_remote_packet(session_id, key);
-        let entry = flows.flows.lock().await.remove(&key);
+        let entry = flows.remove(&key).await;
         tcp_tracker.remove_flow(session_id, key);
         let server_seq = entry.map_or(SERVER_ISN.wrapping_add(1), |e| e.server_seq);
         debug!(
@@ -819,7 +907,7 @@ async fn handle_tcp_frame(
     if pkt.flags & TCP_PSH != 0 && !pkt.payload.is_empty() {
         tcp_tracker.record_client_packet(session_id, key);
         // Grab a clone of the stream Arc without holding the table lock during I/O.
-        let stream_arc = flows.flows.lock().await.get(&key).map(|e| e.stream.clone());
+        let stream_arc = flows.get_stream(&key).await;
 
         let Some(stream_arc) = stream_arc else {
             debug!(
@@ -836,7 +924,8 @@ async fn handle_tcp_frame(
 
             let mut chunk = vec![0u8; 65535];
             // Wait up to 1200ms for the first byte of upstream response.
-            let first_n = match timeout(Duration::from_millis(1200), stream.read(&mut chunk)).await {
+            let first_n = match timeout(Duration::from_millis(1200), stream.read(&mut chunk)).await
+            {
                 Ok(Ok(n)) => n,
                 Ok(Err(err)) => return Err(err.into()),
                 Err(_) => {
@@ -880,7 +969,7 @@ async fn handle_tcp_frame(
 
         if n == 0 {
             // Upstream closed connection; no data to return.
-            flows.flows.lock().await.remove(&key);
+            flows.remove(&key).await;
             tcp_tracker.remove_flow(session_id, key);
             return Ok(None);
         }
@@ -889,11 +978,10 @@ async fn handle_tcp_frame(
 
         // Advance the server's tracked sequence number.
         let server_seq = {
-            let mut table = flows.flows.lock().await;
-            if let Some(entry) = table.get_mut(&key) {
-                let seq = entry.server_seq;
-                entry.server_seq = seq.wrapping_add(n as u32);
-                seq
+            if let Some(current_seq) = flows.get_server_seq(&key).await {
+                let new_seq = current_seq.wrapping_add(n as u32);
+                flows.update_server_seq(&key, new_seq).await;
+                current_seq
             } else {
                 SERVER_ISN.wrapping_add(1)
             }
