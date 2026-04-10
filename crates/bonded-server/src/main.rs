@@ -5,9 +5,11 @@ mod authorized_keys;
 mod frame_forwarder;
 mod health;
 mod invite_tokens;
+mod network_runtime;
 mod pairing_qr;
 mod session_registry;
 mod status;
+mod tun_bridge;
 
 #[cfg(test)]
 mod server_integration;
@@ -92,6 +94,7 @@ use frame_forwarder::{
 };
 use health::run_health_server;
 use invite_tokens::ensure_startup_invite;
+use network_runtime::NetworkRuntime;
 use pairing_qr::emit_pairing_qr;
 use session_registry::SessionRegistry;
 use status::run_status_server;
@@ -99,9 +102,11 @@ use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::signal;
 use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, warn, Level};
+use tun_bridge::TunBridge;
 
 const FORWARD_WORKER_SHARDS: usize = 256;
 const MAX_ICMP_FRAMES_PER_SESSION: usize = 128;
@@ -131,6 +136,21 @@ async fn main() -> anyhow::Result<()> {
     apply_env_overrides(&mut cfg, |key| std::env::var(key).ok());
     init_tracing_from_level(&cfg.server.log_level);
     ensure_server_state_files(&cfg)?;
+    let mut network_runtime = NetworkRuntime::setup(&cfg.server)?;
+    let tun_bridge = if network_runtime.is_tun_mode() {
+        let device = network_runtime.take_tun_device().ok_or_else(|| {
+            anyhow::anyhow!("forwarding_mode=tun active but no TUN device was created")
+        })?;
+        info!(
+            tun_name = %cfg.server.tun_name,
+            tun_cidr = %cfg.server.tun_cidr,
+            tun_mtu = cfg.server.tun_mtu,
+            "TUN forwarding mode enabled"
+        );
+        Some(TunBridge::new(device))
+    } else {
+        None
+    };
 
     let authorized_keys = AuthorizedKeysStore::load(&cfg.server.authorized_keys_file)?;
     info!(
@@ -196,35 +216,50 @@ async fn main() -> anyhow::Result<()> {
         &cfg.server.websocket_tls_cert_file,
         &cfg.server.websocket_tls_key_file,
     )?;
-    tokio::spawn(async move {
-        if let Err(err) = run_websocket_server(
-            &websocket_bind,
-            &websocket_upstream,
-            &websocket_invites,
-            websocket_keys,
-            websocket_sessions,
-            websocket_udp_tracker,
-            websocket_tcp_tracker,
-            websocket_icmp_tracker,
-            websocket_tls_acceptor,
-        )
-        .await
-        {
-            error!(bind = %websocket_bind, error = %err, "websocket listener terminated");
-        }
-    });
+    if tun_bridge.is_none() {
+        tokio::spawn(async move {
+            if let Err(err) = run_websocket_server(
+                &websocket_bind,
+                &websocket_upstream,
+                &websocket_invites,
+                websocket_keys,
+                websocket_sessions,
+                websocket_udp_tracker,
+                websocket_tcp_tracker,
+                websocket_icmp_tracker,
+                websocket_tls_acceptor,
+            )
+            .await
+            {
+                error!(bind = %websocket_bind, error = %err, "websocket listener terminated");
+            }
+        });
+    } else {
+        warn!("forwarding_mode=tun currently supports naive-tcp transport only; websocket listener not started");
+    }
 
-    run_server(
-        &cfg.server.bind,
-        &cfg.server.upstream_tcp_target,
-        &cfg.server.invite_tokens_file,
-        authorized_keys,
-        sessions,
-        udp_tracker,
-        tcp_tracker,
-        icmp_tracker,
-    )
-    .await
+    tokio::select! {
+        result = run_server(
+            &cfg.server.bind,
+            &cfg.server.upstream_tcp_target,
+            &cfg.server.invite_tokens_file,
+            authorized_keys,
+            sessions,
+            udp_tracker,
+            tcp_tracker,
+            icmp_tracker,
+            tun_bridge,
+        ) => result,
+        signal_result = signal::ctrl_c() => {
+            match signal_result {
+                Ok(()) => {
+                    info!("shutdown signal received, cleaning up network runtime");
+                    Ok(())
+                }
+                Err(err) => Err(err.into()),
+            }
+        }
+    }
 }
 
 fn ensure_server_state_files(cfg: &ServerConfig) -> anyhow::Result<()> {
@@ -598,6 +633,7 @@ async fn run_server(
     udp_tracker: UdpSessionTracker,
     tcp_tracker: TcpSessionTracker,
     icmp_tracker: IcmpSessionTracker,
+    tun_bridge: Option<TunBridge>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(bind).await?;
     info!(bind = %bind, "naive tcp listener bound");
@@ -616,6 +652,7 @@ async fn run_server(
         let udp_tracker = udp_tracker.clone();
         let tcp_tracker = tcp_tracker.clone();
         let icmp_tracker = icmp_tracker.clone();
+        let tun_bridge = tun_bridge.clone();
         let upstream_tcp_target = upstream_tcp_target.to_owned();
         let invite_tokens_file = invite_tokens_file.to_owned();
         tokio::spawn(async move {
@@ -642,12 +679,23 @@ async fn run_server(
                         session_id = handle.session_id,
                         "starting frame receive loop"
                     );
+                    let use_tun_bridge = tun_bridge.is_some();
                     let tcp_flows = TcpFlowTable::default();
                     let (udp_tx, mut udp_rx) = mpsc::unbounded_channel();
                     let udp_sessions =
                         UdpSessionManager::new(handle.session_id, udp_tx, udp_tracker.clone());
-                    let (forward_shards, icmp_forward_tx, mut forward_responses) =
-                        spawn_forward_workers(
+                    let (
+                        forward_shards,
+                        icmp_forward_tx,
+                        mut forward_responses,
+                        _forward_keepalive_tx,
+                    ) = if use_tun_bridge {
+                        let (icmp_tx, _icmp_rx) = mpsc::channel(1);
+                        let (keepalive_tx, keepalive_rx) =
+                            mpsc::unbounded_channel::<SessionFrame>();
+                        (Vec::new(), icmp_tx, keepalive_rx, Some(keepalive_tx))
+                    } else {
+                        let (shards, icmp_tx, responses) = spawn_forward_workers(
                             handle.session_id,
                             upstream_tcp_target.clone(),
                             tcp_flows.clone(),
@@ -656,37 +704,62 @@ async fn run_server(
                             icmp_tracker.clone(),
                             "naive-tcp",
                         );
+                        (shards, icmp_tx, responses, None)
+                    };
+
+                    let (tun_tx, mut tun_rx) = mpsc::unbounded_channel::<SessionFrame>();
+                    if let Some(bridge) = &tun_bridge {
+                        bridge.register_session(handle.session_id, tun_tx).await;
+                    }
                     loop {
                         // Batch-drain forward responses before blocking on select.
                         // This prevents select from blocking when multiple responses are queued.
-                        loop {
-                            match forward_responses.try_recv() {
-                                Ok(forwarded_frame) => {
-                                    if let Err(err) = transport.send(forwarded_frame).await {
+                        if !use_tun_bridge {
+                            loop {
+                                match forward_responses.try_recv() {
+                                    Ok(forwarded_frame) => {
+                                        if let Err(err) = transport.send(forwarded_frame).await {
+                                            warn!(
+                                                peer = %peer,
+                                                public_key = %public_key,
+                                                session_id = handle.session_id,
+                                                error = %err,
+                                                "failed to return forwarded frame"
+                                            );
+                                            break;
+                                        }
+                                    }
+                                    Err(mpsc::error::TryRecvError::Empty) => break,
+                                    Err(mpsc::error::TryRecvError::Disconnected) => {
                                         warn!(
                                             peer = %peer,
                                             public_key = %public_key,
                                             session_id = handle.session_id,
-                                            error = %err,
-                                            "failed to return forwarded frame"
+                                            "forward response queue closed"
                                         );
-                                        break;
+                                        return;
                                     }
-                                }
-                                Err(mpsc::error::TryRecvError::Empty) => break,
-                                Err(mpsc::error::TryRecvError::Disconnected) => {
-                                    warn!(
-                                        peer = %peer,
-                                        public_key = %public_key,
-                                        session_id = handle.session_id,
-                                        "forward response queue closed"
-                                    );
-                                    return;
                                 }
                             }
                         }
 
                         tokio::select! {
+                            maybe_tun_frame = tun_rx.recv() => {
+                                let Some(tun_frame) = maybe_tun_frame else {
+                                    break;
+                                };
+
+                                if let Err(err) = transport.send(tun_frame).await {
+                                    warn!(
+                                        peer = %peer,
+                                        public_key = %public_key,
+                                        session_id = handle.session_id,
+                                        error = %err,
+                                        "failed to send TUN return packet to client"
+                                    );
+                                    break;
+                                }
+                            }
                             maybe_udp_frame = udp_rx.recv() => {
                                 let Some(udp_frame) = maybe_udp_frame else {
                                     break;
@@ -704,6 +777,9 @@ async fn run_server(
                                 }
                             }
                             maybe_forwarded_frame = forward_responses.recv() => {
+                                if use_tun_bridge {
+                                    continue;
+                                }
                                 let Some(forwarded_frame) = maybe_forwarded_frame else {
                                     warn!(
                                         peer = %peer,
@@ -779,6 +855,20 @@ async fn run_server(
                                             );
                                         }
 
+                                        if let Some(bridge) = &tun_bridge {
+                                            if let Err(err) = bridge.submit_client_frame(handle.session_id, frame) {
+                                                warn!(
+                                                    peer = %peer,
+                                                    public_key = %public_key,
+                                                    session_id = handle.session_id,
+                                                    error = %err,
+                                                    "failed to enqueue frame into TUN bridge"
+                                                );
+                                                break;
+                                            }
+                                            continue;
+                                        }
+
                                         let is_icmp_echo = is_ipv4_icmp_echo_frame(&frame.payload);
                                         if is_icmp_echo {
                                             match icmp_forward_tx.try_send(frame) {
@@ -831,6 +921,9 @@ async fn run_server(
                                 }
                             }
                         }
+                    }
+                    if let Some(bridge) = &tun_bridge {
+                        bridge.unregister_session(handle.session_id).await;
                     }
                     drop(forward_shards);
                     drop(icmp_forward_tx);
@@ -1020,6 +1113,23 @@ where
     if let Some(status_bind) = read_env("BONDED_STATUS_BIND") {
         cfg.server.status_bind = status_bind;
     }
+    if let Some(forwarding_mode) = read_env("BONDED_FORWARDING_MODE") {
+        cfg.server.forwarding_mode = forwarding_mode;
+    }
+    if let Some(tun_name) = read_env("BONDED_TUN_NAME") {
+        cfg.server.tun_name = tun_name;
+    }
+    if let Some(tun_cidr) = read_env("BONDED_TUN_CIDR") {
+        cfg.server.tun_cidr = tun_cidr;
+    }
+    if let Some(tun_mtu) = read_env("BONDED_TUN_MTU") {
+        if let Ok(value) = tun_mtu.parse::<u16>() {
+            cfg.server.tun_mtu = value;
+        }
+    }
+    if let Some(tun_egress_interface) = read_env("BONDED_TUN_EGRESS_INTERFACE") {
+        cfg.server.tun_egress_interface = tun_egress_interface;
+    }
     if let Some(websocket_tls_cert_file) = read_env("BONDED_WEBSOCKET_TLS_CERT_FILE") {
         cfg.server.websocket_tls_cert_file = websocket_tls_cert_file;
     }
@@ -1083,6 +1193,11 @@ mod tests {
             ("BONDED_BIND", "127.0.0.1:9000"),
             ("BONDED_WEBSOCKET_BIND", "127.0.0.1:9443"),
             ("BONDED_STATUS_BIND", "127.0.0.1:9002"),
+            ("BONDED_FORWARDING_MODE", "tun"),
+            ("BONDED_TUN_NAME", "bondedtest0"),
+            ("BONDED_TUN_CIDR", "100.65.0.1/24"),
+            ("BONDED_TUN_MTU", "1380"),
+            ("BONDED_TUN_EGRESS_INTERFACE", "eth0"),
             ("BONDED_WEBSOCKET_TLS_CERT_FILE", "/tmp/wss.crt"),
             ("BONDED_WEBSOCKET_TLS_KEY_FILE", "/tmp/wss.key"),
             ("BONDED_PUBLIC_ADDRESS", "bonded.example.com:9000"),
@@ -1102,6 +1217,11 @@ mod tests {
         assert_eq!(cfg.server.bind, "127.0.0.1:9000");
         assert_eq!(cfg.server.websocket_bind, "127.0.0.1:9443");
         assert_eq!(cfg.server.status_bind, "127.0.0.1:9002");
+        assert_eq!(cfg.server.forwarding_mode, "tun");
+        assert_eq!(cfg.server.tun_name, "bondedtest0");
+        assert_eq!(cfg.server.tun_cidr, "100.65.0.1/24");
+        assert_eq!(cfg.server.tun_mtu, 1380);
+        assert_eq!(cfg.server.tun_egress_interface, "eth0");
         assert_eq!(cfg.server.websocket_tls_cert_file, "/tmp/wss.crt");
         assert_eq!(cfg.server.websocket_tls_key_file, "/tmp/wss.key");
         assert_eq!(cfg.server.public_address, "bonded.example.com:9000");

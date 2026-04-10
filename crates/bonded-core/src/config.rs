@@ -69,6 +69,11 @@ pub struct ServerSection {
     pub bind: String,
     pub websocket_bind: String,
     pub status_bind: String,
+    pub forwarding_mode: String,
+    pub tun_name: String,
+    pub tun_cidr: String,
+    pub tun_mtu: u16,
+    pub tun_egress_interface: String,
     pub websocket_tls_cert_file: String,
     pub websocket_tls_key_file: String,
     pub public_address: String,
@@ -85,6 +90,11 @@ impl Default for ServerSection {
             bind: "0.0.0.0:8080".to_owned(),
             websocket_bind: "0.0.0.0:8443".to_owned(),
             status_bind: "0.0.0.0:8082".to_owned(),
+            forwarding_mode: "proxy".to_owned(),
+            tun_name: "bonded0".to_owned(),
+            tun_cidr: "100.64.0.1/24".to_owned(),
+            tun_mtu: 1400,
+            tun_egress_interface: String::new(),
             websocket_tls_cert_file: String::new(),
             websocket_tls_key_file: String::new(),
             public_address: String::new(),
@@ -166,6 +176,11 @@ mod tests {
         assert!(cfg.server.upstream_tcp_target.is_empty());
         assert_eq!(cfg.server.websocket_bind, "0.0.0.0:8443");
         assert_eq!(cfg.server.status_bind, "0.0.0.0:8082");
+        assert_eq!(cfg.server.forwarding_mode, "proxy");
+        assert_eq!(cfg.server.tun_name, "bonded0");
+        assert_eq!(cfg.server.tun_cidr, "100.64.0.1/24");
+        assert_eq!(cfg.server.tun_mtu, 1400);
+        assert!(cfg.server.tun_egress_interface.is_empty());
         assert!(cfg.server.websocket_tls_cert_file.is_empty());
         assert!(cfg.server.websocket_tls_key_file.is_empty());
     }
@@ -183,6 +198,11 @@ bind = "127.0.0.1:9000"
         assert_eq!(cfg.server.bind, "127.0.0.1:9000");
         assert_eq!(cfg.server.websocket_bind, "0.0.0.0:8443");
         assert_eq!(cfg.server.status_bind, "0.0.0.0:8082");
+        assert_eq!(cfg.server.forwarding_mode, "proxy");
+        assert_eq!(cfg.server.tun_name, "bonded0");
+        assert_eq!(cfg.server.tun_cidr, "100.64.0.1/24");
+        assert_eq!(cfg.server.tun_mtu, 1400);
+        assert!(cfg.server.tun_egress_interface.is_empty());
         assert_eq!(cfg.server.health_bind, "0.0.0.0:8081");
         assert_eq!(cfg.server.log_level, "info");
     }
