@@ -6,9 +6,7 @@ members = [
     "crates/bonded-cli",
     "crates/bonded-ffi",
 ]
-exclude = [
-    "server",
-]
+exclude = ["server"]
 resolver = "2"
 
 [workspace.package]
@@ -39,4 +37,4 @@ tokio-util = "0.7"
 toml = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
-tun = { version = "0.7", features = ["async"] }
+tun = { version = "0.8.6", features = ["async"] }
