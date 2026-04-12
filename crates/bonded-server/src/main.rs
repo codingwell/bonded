@@ -136,7 +136,21 @@ async fn main() -> anyhow::Result<()> {
     apply_env_overrides(&mut cfg, |key| std::env::var(key).ok());
     init_tracing_from_level(&cfg.server.log_level);
     ensure_server_state_files(&cfg)?;
-    let mut network_runtime = NetworkRuntime::setup(&cfg.server)?;
+    let mut network_runtime = match NetworkRuntime::setup(&cfg.server) {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            error!(
+                forwarding_mode = %cfg.server.forwarding_mode,
+                tun_name = %cfg.server.tun_name,
+                tun_cidr = %cfg.server.tun_cidr,
+                tun_mtu = cfg.server.tun_mtu,
+                tun_egress_interface = %cfg.server.tun_egress_interface,
+                error = %err,
+                "failed to initialize network runtime"
+            );
+            return Err(err);
+        }
+    };
     let tun_bridge = if network_runtime.is_tun_mode() {
         let device = network_runtime.take_tun_device().ok_or_else(|| {
             anyhow::anyhow!("forwarding_mode=tun active but no TUN device was created")

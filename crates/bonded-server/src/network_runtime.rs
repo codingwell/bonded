@@ -1,8 +1,10 @@
 use anyhow::{anyhow, Context};
 use bonded_core::config::ServerSection;
 use std::fs;
+use std::path::Path;
 use std::net::Ipv4Addr;
 use std::process::Command;
+use tracing::{debug, info};
 
 pub struct NetworkRuntime {
     tun_name: String,
@@ -33,6 +35,15 @@ impl NetworkRuntime {
             });
         }
 
+        info!(
+            forwarding_mode = %cfg.forwarding_mode,
+            tun_name = %cfg.tun_name,
+            tun_cidr = %cfg.tun_cidr,
+            tun_mtu = cfg.tun_mtu,
+            tun_egress_interface = %cfg.tun_egress_interface,
+            "initializing TUN forwarding runtime"
+        );
+
         if !cfg!(target_os = "linux") {
             anyhow::bail!("forwarding_mode=tun is currently supported only on Linux");
         }
@@ -41,6 +52,9 @@ impl NetworkRuntime {
             anyhow::bail!("/dev/net/tun not found. Run container with --device=/dev/net/tun");
         }
 
+        ensure_tool_available("ifconfig")?;
+        ensure_tool_available("iptables")?;
+
         let (tun_addr, prefix) = parse_cidr(&cfg.tun_cidr)?;
         let netmask = prefix_to_netmask(prefix);
         let subnet = cidr_network(tun_addr, prefix);
@@ -48,7 +62,9 @@ impl NetworkRuntime {
 
         let mut tun_cfg = tun::Configuration::default();
         tun_cfg.tun_name(&cfg.tun_name).up();
-        let tun_device = tun::create_as_async(&tun_cfg).context("failed to create TUN device")?;
+        let tun_device = tun::create_as_async(&tun_cfg)
+            .with_context(|| format!("failed to create TUN device {}", cfg.tun_name))?;
+        debug!(tun_name = %cfg.tun_name, "created TUN device handle");
 
         run_command(
             "ifconfig",
@@ -63,6 +79,13 @@ impl NetworkRuntime {
             ],
         )
         .with_context(|| format!("failed to configure TUN interface {}", cfg.tun_name))?;
+        info!(
+            tun_name = %cfg.tun_name,
+            tun_ip = %tun_addr,
+            tun_prefix = prefix,
+            tun_mtu = cfg.tun_mtu,
+            "configured TUN interface"
+        );
 
         let egress_interface = if cfg.tun_egress_interface.trim().is_empty() {
             detect_default_egress_interface()?.ok_or_else(|| {
@@ -73,6 +96,7 @@ impl NetworkRuntime {
         } else {
             cfg.tun_egress_interface.clone()
         };
+        info!(egress_interface = %egress_interface, "selected TUN egress interface");
 
         let original_ip_forward = fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
             .ok()
@@ -80,6 +104,7 @@ impl NetworkRuntime {
 
         fs::write("/proc/sys/net/ipv4/ip_forward", "1\n")
             .context("failed to enable net.ipv4.ip_forward; ensure NET_ADMIN capability")?;
+        info!("enabled net.ipv4.ip_forward for TUN forwarding");
 
         let mut runtime = Self {
             tun_name: cfg.tun_name.clone(),
@@ -94,6 +119,7 @@ impl NetworkRuntime {
         };
 
         runtime.ensure_iptables_rules(&tun_subnet, &egress_interface)?;
+        info!(tun_subnet = %tun_subnet, "installed iptables rules for TUN forwarding");
         Ok(runtime)
     }
 
@@ -244,6 +270,27 @@ fn run_command(command: &str, args: &[&str]) -> anyhow::Result<()> {
         args.join(" "),
         output.status.code()
     ))
+}
+
+fn ensure_tool_available(tool: &str) -> anyhow::Result<()> {
+    if command_in_path(tool) {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "required command '{tool}' was not found in PATH; install it in the container image"
+    );
+}
+
+fn command_in_path(tool: &str) -> bool {
+    let Some(path_env) = std::env::var_os("PATH") else {
+        return false;
+    };
+
+    std::env::split_paths(&path_env).any(|dir| {
+        let candidate = dir.join(tool);
+        Path::new(&candidate).exists()
+    })
 }
 
 fn ensure_rule(table: &str, spec: &[&str]) -> anyhow::Result<bool> {
