@@ -1,8 +1,8 @@
 use anyhow::{anyhow, Context};
 use bonded_core::config::ServerSection;
 use std::fs;
-use std::path::Path;
 use std::net::Ipv4Addr;
+use std::path::Path;
 use std::process::Command;
 use tracing::{debug, info};
 
