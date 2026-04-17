@@ -1,13 +1,16 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 mod auth_handshake;
 mod authorized_keys;
+#[cfg(test)]
 mod frame_forwarder;
 mod health;
 mod invite_tokens;
 mod network_runtime;
 mod pairing_qr;
 mod session_registry;
+mod smoltcp_forwarder;
 mod status;
 mod tun_bridge;
 
@@ -88,19 +91,16 @@ use bonded_core::config::{load_server_config, ServerConfig, DEFAULT_SERVER_CONFI
 use bonded_core::session::{SessionFrame, SessionHeader, FLAG_PING, FLAG_PONG};
 use bonded_core::transport::{NaiveTcpTransport, Transport};
 use clap::Parser;
-use frame_forwarder::{
-    forward_frame, forward_icmp_frame, AsyncIcmpSocket, IcmpSessionTracker, TcpFlowTable,
-    TcpSessionTracker, UdpSessionManager, UdpSessionTracker,
-};
 use health::run_health_server;
 use invite_tokens::ensure_startup_invite;
 use network_runtime::NetworkRuntime;
 use pairing_qr::emit_pairing_qr;
 use session_registry::SessionRegistry;
+use smoltcp_forwarder::SmoltcpForwarder;
 use status::run_status_server;
 use std::io::BufReader;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::mpsc;
@@ -108,8 +108,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, warn, Level};
 use tun_bridge::TunBridge;
 
-const FORWARD_WORKER_SHARDS: usize = 256;
-const MAX_ICMP_FRAMES_PER_SESSION: usize = 128;
+type ForwarderRegistry = Arc<RwLock<HashMap<u64, Arc<SmoltcpForwarder>>>>;
 
 #[derive(Debug, Parser)]
 #[command(name = "bonded-server")]
@@ -194,24 +193,13 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let sessions = SessionRegistry::default();
-    let udp_tracker = UdpSessionTracker::default();
-    let tcp_tracker = TcpSessionTracker::default();
-    let icmp_tracker = IcmpSessionTracker::default();
+    let forwarders: ForwarderRegistry = Arc::new(RwLock::new(HashMap::new()));
 
     let status_bind = cfg.server.status_bind.clone();
     let status_sessions = sessions.clone();
-    let status_udp_tracker = udp_tracker.clone();
-    let status_tcp_tracker = tcp_tracker.clone();
-    let status_icmp_tracker = icmp_tracker.clone();
+    let status_forwarders = forwarders.clone();
     tokio::spawn(async move {
-        if let Err(err) = run_status_server(
-            &status_bind,
-            status_sessions,
-            status_udp_tracker,
-            status_tcp_tracker,
-            status_icmp_tracker,
-        )
-        .await
+        if let Err(err) = run_status_server(&status_bind, status_sessions, status_forwarders).await
         {
             error!(bind = %status_bind, error = %err, "status listener terminated");
         }
@@ -222,9 +210,7 @@ async fn main() -> anyhow::Result<()> {
     let websocket_upstream = cfg.server.upstream_tcp_target.clone();
     let websocket_invites = cfg.server.invite_tokens_file.clone();
     let websocket_sessions = sessions.clone();
-    let websocket_udp_tracker = udp_tracker.clone();
-    let websocket_tcp_tracker = tcp_tracker.clone();
-    let websocket_icmp_tracker = icmp_tracker.clone();
+    let websocket_forwarders = forwarders.clone();
     let websocket_keys = authorized_keys.clone();
     let websocket_tls_acceptor = load_websocket_tls_acceptor(
         &cfg.server.websocket_tls_cert_file,
@@ -238,9 +224,7 @@ async fn main() -> anyhow::Result<()> {
                 &websocket_invites,
                 websocket_keys,
                 websocket_sessions,
-                websocket_udp_tracker,
-                websocket_tcp_tracker,
-                websocket_icmp_tracker,
+                websocket_forwarders,
                 websocket_tls_acceptor,
             )
             .await
@@ -259,9 +243,7 @@ async fn main() -> anyhow::Result<()> {
             &cfg.server.invite_tokens_file,
             authorized_keys,
             sessions,
-            udp_tracker,
-            tcp_tracker,
-            icmp_tracker,
+            forwarders,
             tun_bridge,
         ) => result,
         signal_result = signal::ctrl_c() => {
@@ -312,13 +294,11 @@ fn ensure_state_file(path: &str, default_contents: &str, description: &str) -> a
 
 async fn run_websocket_server(
     bind: &str,
-    upstream_tcp_target: &str,
+    _upstream_tcp_target: &str,
     invite_tokens_file: &str,
     authorized_keys: AuthorizedKeysStore,
     sessions: SessionRegistry,
-    udp_tracker: UdpSessionTracker,
-    tcp_tracker: TcpSessionTracker,
-    icmp_tracker: IcmpSessionTracker,
+    forwarders: ForwarderRegistry,
     tls_acceptor: Option<TlsAcceptor>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(bind).await?;
@@ -335,10 +315,7 @@ async fn run_websocket_server(
 
         let authorized_keys = authorized_keys.clone();
         let sessions = sessions.clone();
-        let udp_tracker = udp_tracker.clone();
-        let tcp_tracker = tcp_tracker.clone();
-        let icmp_tracker = icmp_tracker.clone();
-        let upstream_tcp_target = upstream_tcp_target.to_owned();
+        let forwarders = forwarders.clone();
         let invite_tokens_file = invite_tokens_file.to_owned();
         let tls_acceptor = tls_acceptor.clone();
         tokio::spawn(async move {
@@ -387,75 +364,22 @@ async fn run_websocket_server(
                         session_id = handle.session_id,
                         "starting websocket frame receive loop"
                     );
-                    let tcp_flows = TcpFlowTable::default();
-                    let (udp_tx, mut udp_rx) = mpsc::unbounded_channel();
-                    let udp_sessions =
-                        UdpSessionManager::new(handle.session_id, udp_tx, udp_tracker.clone());
-                    let (forward_shards, icmp_forward_tx, mut forward_responses) =
-                        spawn_forward_workers(
-                            handle.session_id,
-                            upstream_tcp_target.clone(),
-                            tcp_flows.clone(),
-                            udp_sessions.clone(),
-                            tcp_tracker.clone(),
-                            icmp_tracker.clone(),
-                            "websocket",
-                        );
+                    let (forward_tx, mut forward_rx) = mpsc::unbounded_channel();
+                    let forwarder = Arc::new(SmoltcpForwarder::new(handle.session_id, forward_tx));
+                    forwarders
+                        .write()
+                        .expect("forwarder registry lock should not be poisoned")
+                        .insert(handle.session_id, forwarder.clone());
 
                     loop {
-                        // Batch-drain forward responses before blocking on select.
-                        // This prevents select from blocking when multiple responses are queued.
-                        loop {
-                            match forward_responses.try_recv() {
-                                Ok(forwarded_frame) => {
-                                    if let Err(err) = transport.send(forwarded_frame).await {
-                                        warn!(
-                                            peer = %peer,
-                                            public_key = %public_key,
-                                            session_id = handle.session_id,
-                                            error = %err,
-                                            "failed to return websocket forwarded frame"
-                                        );
-                                        break;
-                                    }
-                                }
-                                Err(mpsc::error::TryRecvError::Empty) => break,
-                                Err(mpsc::error::TryRecvError::Disconnected) => {
-                                    warn!(
-                                        peer = %peer,
-                                        public_key = %public_key,
-                                        session_id = handle.session_id,
-                                        "websocket forward response queue closed"
-                                    );
-                                    return;
-                                }
-                            }
-                        }
-
                         tokio::select! {
-                            maybe_udp_frame = udp_rx.recv() => {
-                                let Some(udp_frame) = maybe_udp_frame else {
-                                    break;
-                                };
-
-                                if let Err(err) = transport.send(udp_frame).await {
-                                    warn!(
-                                        peer = %peer,
-                                        public_key = %public_key,
-                                        session_id = handle.session_id,
-                                        error = %err,
-                                        "failed to send websocket async UDP response"
-                                    );
-                                    break;
-                                }
-                            }
-                            maybe_forwarded_frame = forward_responses.recv() => {
+                            maybe_forwarded_frame = forward_rx.recv() => {
                                 let Some(forwarded_frame) = maybe_forwarded_frame else {
                                     warn!(
                                         peer = %peer,
                                         public_key = %public_key,
                                         session_id = handle.session_id,
-                                        "websocket forward response queue closed"
+                                        "websocket forwarder response queue closed"
                                     );
                                     break;
                                 };
@@ -525,44 +449,7 @@ async fn run_websocket_server(
                                             );
                                         }
 
-                                        let is_icmp_echo = is_ipv4_icmp_echo_frame(&frame.payload);
-                                        if is_icmp_echo {
-                                            match icmp_forward_tx.try_send(frame) {
-                                                Ok(()) => continue,
-                                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                                    warn!(
-                                                        peer = %peer,
-                                                        public_key = %public_key,
-                                                        session_id = handle.session_id,
-                                                        max_pending_icmp = MAX_ICMP_FRAMES_PER_SESSION,
-                                                        "dropping ICMP echo frame because dedicated ICMP queue is full"
-                                                    );
-                                                    continue;
-                                                }
-                                                Err(mpsc::error::TrySendError::Closed(_)) => {
-                                                    warn!(
-                                                        peer = %peer,
-                                                        public_key = %public_key,
-                                                        session_id = handle.session_id,
-                                                        "dedicated ICMP queue closed"
-                                                    );
-                                                    break;
-                                                }
-                                            }
-                                        }
-
-                                        let shard_idx = shard_index_for_connection(frame.header.connection_id);
-                                        if let Err(err) = forward_shards[shard_idx].send(frame) {
-                                            warn!(
-                                                peer = %peer,
-                                                public_key = %public_key,
-                                                session_id = handle.session_id,
-                                                error = ?err,
-                                                shard_idx,
-                                                "failed to enqueue websocket frame for forwarding"
-                                            );
-                                            break;
-                                        }
+                                        forwarder.ingest_packet(frame);
                                     }
                                     Err(err) => {
                                         info!(
@@ -578,13 +465,12 @@ async fn run_websocket_server(
                             }
                         }
                     }
-                    drop(forward_shards);
-                    drop(icmp_forward_tx);
-
+                    forwarder.clear_session();
+                    forwarders
+                        .write()
+                        .expect("forwarder registry lock should not be poisoned")
+                        .remove(&handle.session_id);
                     sessions.unregister_client(&public_key);
-                    udp_tracker.clear_session(handle.session_id);
-                    tcp_tracker.clear_session(handle.session_id);
-                    icmp_tracker.clear_session(handle.session_id);
                 }
                 Err(err) => {
                     warn!(peer = %peer, error = %err, "websocket client authentication failed");
@@ -640,13 +526,11 @@ fn load_private_key(path: &str) -> anyhow::Result<rustls::pki_types::PrivateKeyD
 
 async fn run_server(
     bind: &str,
-    upstream_tcp_target: &str,
+    _upstream_tcp_target: &str,
     invite_tokens_file: &str,
     authorized_keys: AuthorizedKeysStore,
     sessions: SessionRegistry,
-    udp_tracker: UdpSessionTracker,
-    tcp_tracker: TcpSessionTracker,
-    icmp_tracker: IcmpSessionTracker,
+    forwarders: ForwarderRegistry,
     tun_bridge: Option<TunBridge>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(bind).await?;
@@ -663,11 +547,8 @@ async fn run_server(
 
         let authorized_keys = authorized_keys.clone();
         let sessions = sessions.clone();
-        let udp_tracker = udp_tracker.clone();
-        let tcp_tracker = tcp_tracker.clone();
-        let icmp_tracker = icmp_tracker.clone();
+        let forwarders = forwarders.clone();
         let tun_bridge = tun_bridge.clone();
-        let upstream_tcp_target = upstream_tcp_target.to_owned();
         let invite_tokens_file = invite_tokens_file.to_owned();
         tokio::spawn(async move {
             match perform_auth_handshake(
@@ -694,31 +575,16 @@ async fn run_server(
                         "starting frame receive loop"
                     );
                     let use_tun_bridge = tun_bridge.is_some();
-                    let tcp_flows = TcpFlowTable::default();
-                    let (udp_tx, mut udp_rx) = mpsc::unbounded_channel();
-                    let udp_sessions =
-                        UdpSessionManager::new(handle.session_id, udp_tx, udp_tracker.clone());
-                    let (
-                        forward_shards,
-                        icmp_forward_tx,
-                        mut forward_responses,
-                        _forward_keepalive_tx,
-                    ) = if use_tun_bridge {
-                        let (icmp_tx, _icmp_rx) = mpsc::channel(1);
-                        let (keepalive_tx, keepalive_rx) =
-                            mpsc::unbounded_channel::<SessionFrame>();
-                        (Vec::new(), icmp_tx, keepalive_rx, Some(keepalive_tx))
+                    let (forward_tx, mut forward_rx) = mpsc::unbounded_channel();
+                    let forwarder = if use_tun_bridge {
+                        None
                     } else {
-                        let (shards, icmp_tx, responses) = spawn_forward_workers(
-                            handle.session_id,
-                            upstream_tcp_target.clone(),
-                            tcp_flows.clone(),
-                            udp_sessions.clone(),
-                            tcp_tracker.clone(),
-                            icmp_tracker.clone(),
-                            "naive-tcp",
-                        );
-                        (shards, icmp_tx, responses, None)
+                        let value = Arc::new(SmoltcpForwarder::new(handle.session_id, forward_tx));
+                        forwarders
+                            .write()
+                            .expect("forwarder registry lock should not be poisoned")
+                            .insert(handle.session_id, value.clone());
+                        Some(value)
                     };
 
                     let (tun_tx, mut tun_rx) = mpsc::unbounded_channel::<SessionFrame>();
@@ -726,37 +592,6 @@ async fn run_server(
                         bridge.register_session(handle.session_id, tun_tx).await;
                     }
                     loop {
-                        // Batch-drain forward responses before blocking on select.
-                        // This prevents select from blocking when multiple responses are queued.
-                        if !use_tun_bridge {
-                            loop {
-                                match forward_responses.try_recv() {
-                                    Ok(forwarded_frame) => {
-                                        if let Err(err) = transport.send(forwarded_frame).await {
-                                            warn!(
-                                                peer = %peer,
-                                                public_key = %public_key,
-                                                session_id = handle.session_id,
-                                                error = %err,
-                                                "failed to return forwarded frame"
-                                            );
-                                            break;
-                                        }
-                                    }
-                                    Err(mpsc::error::TryRecvError::Empty) => break,
-                                    Err(mpsc::error::TryRecvError::Disconnected) => {
-                                        warn!(
-                                            peer = %peer,
-                                            public_key = %public_key,
-                                            session_id = handle.session_id,
-                                            "forward response queue closed"
-                                        );
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-
                         tokio::select! {
                             maybe_tun_frame = tun_rx.recv() => {
                                 let Some(tun_frame) = maybe_tun_frame else {
@@ -774,23 +609,7 @@ async fn run_server(
                                     break;
                                 }
                             }
-                            maybe_udp_frame = udp_rx.recv() => {
-                                let Some(udp_frame) = maybe_udp_frame else {
-                                    break;
-                                };
-
-                                if let Err(err) = transport.send(udp_frame).await {
-                                    warn!(
-                                        peer = %peer,
-                                        public_key = %public_key,
-                                        session_id = handle.session_id,
-                                        error = %err,
-                                        "failed to send async UDP response"
-                                    );
-                                    break;
-                                }
-                            }
-                            maybe_forwarded_frame = forward_responses.recv() => {
+                            maybe_forwarded_frame = forward_rx.recv() => {
                                 if use_tun_bridge {
                                     continue;
                                 }
@@ -882,44 +701,8 @@ async fn run_server(
                                             }
                                             continue;
                                         }
-
-                                        let is_icmp_echo = is_ipv4_icmp_echo_frame(&frame.payload);
-                                        if is_icmp_echo {
-                                            match icmp_forward_tx.try_send(frame) {
-                                                Ok(()) => continue,
-                                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                                    warn!(
-                                                        peer = %peer,
-                                                        public_key = %public_key,
-                                                        session_id = handle.session_id,
-                                                        max_pending_icmp = MAX_ICMP_FRAMES_PER_SESSION,
-                                                        "dropping ICMP echo frame because dedicated ICMP queue is full"
-                                                    );
-                                                    continue;
-                                                }
-                                                Err(mpsc::error::TrySendError::Closed(_)) => {
-                                                    warn!(
-                                                        peer = %peer,
-                                                        public_key = %public_key,
-                                                        session_id = handle.session_id,
-                                                        "dedicated ICMP queue closed"
-                                                    );
-                                                    break;
-                                                }
-                                            }
-                                        }
-
-                                        let shard_idx = shard_index_for_connection(frame.header.connection_id);
-                                        if let Err(err) = forward_shards[shard_idx].send(frame) {
-                                            warn!(
-                                                peer = %peer,
-                                                public_key = %public_key,
-                                                session_id = handle.session_id,
-                                                error = ?err,
-                                                shard_idx,
-                                                "failed to enqueue frame for forwarding"
-                                            );
-                                            break;
+                                        if let Some(f) = &forwarder {
+                                            f.ingest_packet(frame);
                                         }
                                     }
                                     Err(err) => {
@@ -939,13 +722,14 @@ async fn run_server(
                     if let Some(bridge) = &tun_bridge {
                         bridge.unregister_session(handle.session_id).await;
                     }
-                    drop(forward_shards);
-                    drop(icmp_forward_tx);
-
+                    if let Some(f) = forwarder {
+                        f.clear_session();
+                        forwarders
+                            .write()
+                            .expect("forwarder registry lock should not be poisoned")
+                            .remove(&handle.session_id);
+                    }
                     sessions.unregister_client(&public_key);
-                    udp_tracker.clear_session(handle.session_id);
-                    tcp_tracker.clear_session(handle.session_id);
-                    icmp_tracker.clear_session(handle.session_id);
                 }
                 Err(err) => {
                     warn!(peer = %peer, error = %err, "client authentication failed");
@@ -955,136 +739,7 @@ async fn run_server(
     }
 }
 
-fn shard_index_for_connection(connection_id: u32) -> usize {
-    (connection_id as usize) % FORWARD_WORKER_SHARDS
-}
-
-fn spawn_forward_workers(
-    session_id: u64,
-    upstream_tcp_target: String,
-    tcp_flows: TcpFlowTable,
-    udp_sessions: UdpSessionManager,
-    tcp_tracker: TcpSessionTracker,
-    icmp_tracker: IcmpSessionTracker,
-    transport_label: &'static str,
-) -> (
-    Vec<mpsc::UnboundedSender<SessionFrame>>,
-    mpsc::Sender<SessionFrame>,
-    mpsc::UnboundedReceiver<SessionFrame>,
-) {
-    let (response_tx, response_rx) = mpsc::unbounded_channel();
-    let upstream = if upstream_tcp_target.trim().is_empty() {
-        None
-    } else {
-        Some(upstream_tcp_target)
-    };
-
-    let mut shard_senders = Vec::with_capacity(FORWARD_WORKER_SHARDS);
-    for shard_idx in 0..FORWARD_WORKER_SHARDS {
-        let (tx, mut rx) = mpsc::unbounded_channel::<SessionFrame>();
-        shard_senders.push(tx);
-
-        let response_tx = response_tx.clone();
-        let tcp_flows = tcp_flows.clone();
-        let udp_sessions = udp_sessions.clone();
-        let tcp_tracker = tcp_tracker.clone();
-        let icmp_tracker = icmp_tracker.clone();
-        let upstream = upstream.clone();
-
-        tokio::spawn(async move {
-            while let Some(frame) = rx.recv().await {
-                let response = match forward_frame(
-                    frame,
-                    upstream.as_deref(),
-                    &tcp_flows,
-                    &udp_sessions,
-                    &tcp_tracker,
-                    &icmp_tracker,
-                    session_id,
-                )
-                .await
-                {
-                    Ok(value) => value,
-                    Err(err) => {
-                        warn!(
-                            session_id,
-                            shard_idx,
-                            transport = transport_label,
-                            error = %err,
-                            "failed to forward session frame"
-                        );
-                        continue;
-                    }
-                };
-
-                let Some(response) = response else {
-                    continue;
-                };
-
-                if response_tx.send(response).is_err() {
-                    warn!(
-                        session_id,
-                        shard_idx,
-                        transport = transport_label,
-                        "forward response receiver dropped"
-                    );
-                    break;
-                }
-            }
-        });
-    }
-
-    let (icmp_tx, mut icmp_rx) = mpsc::channel::<SessionFrame>(MAX_ICMP_FRAMES_PER_SESSION);
-    let response_tx_icmp = response_tx.clone();
-    let icmp_tracker_icmp = icmp_tracker.clone();
-    // Create one shared async ICMP socket for this session.  Each probe is
-    // dispatched as its own tokio task so all in-flight pings run concurrently
-    // without any blocking threads.
-    let icmp_socket = match AsyncIcmpSocket::new() {
-        Ok(s) => s,
-        Err(err) => {
-            warn!(
-                session_id,
-                transport = transport_label,
-                error = %err,
-                "failed to create async ICMP socket; ICMP forwarding disabled for this session"
-            );
-            // Return a dummy channel that is immediately closed.
-            let (dead_tx, _) = mpsc::channel(1);
-            return (shard_senders, dead_tx, response_rx);
-        }
-    };
-    tokio::spawn(async move {
-        while let Some(frame) = icmp_rx.recv().await {
-            // Spawn a task per probe so all pings fly concurrently.
-            let icmp_socket = icmp_socket.clone();
-            let response_tx = response_tx_icmp.clone();
-            let icmp_tracker = icmp_tracker_icmp.clone();
-            tokio::spawn(async move {
-                match forward_icmp_frame(frame, &icmp_socket, &icmp_tracker, session_id).await {
-                    Ok(Some(response)) => {
-                        if response_tx.send(response).is_err() {
-                            // Session gone; nothing to do.
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        warn!(
-                            session_id,
-                            transport = transport_label,
-                            lane = "icmp",
-                            error = %err,
-                            "failed to forward ICMP session frame"
-                        );
-                    }
-                }
-            });
-        }
-    });
-
-    (shard_senders, icmp_tx, response_rx)
-}
-
+#[cfg(test)]
 fn is_ipv4_icmp_echo_frame(packet: &[u8]) -> bool {
     if packet.len() < 28 {
         return false;

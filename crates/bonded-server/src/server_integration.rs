@@ -7,9 +7,10 @@ use bonded_core::session::{SessionFrame, SessionHeader};
 use bonded_core::transport::{NaiveTcpTransport, Transport, WebSocketTlsTransport};
 use bytes::Bytes;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -327,9 +328,7 @@ async fn localhost_server_and_rust_client_can_probe_public_dns_udp() {
             &invite_for_server,
             store,
             crate::session_registry::SessionRegistry::default(),
-            crate::frame_forwarder::UdpSessionTracker::default(),
-            crate::frame_forwarder::TcpSessionTracker::default(),
-            crate::frame_forwarder::IcmpSessionTracker::default(),
+            Arc::new(RwLock::new(HashMap::new())),
             None,
         )
         .await
@@ -528,9 +527,7 @@ async fn localhost_server_and_rust_client_can_fetch_example_com_http_over_tcp_pa
             &invite_for_server,
             store,
             crate::session_registry::SessionRegistry::default(),
-            crate::frame_forwarder::UdpSessionTracker::default(),
-            crate::frame_forwarder::TcpSessionTracker::default(),
-            crate::frame_forwarder::IcmpSessionTracker::default(),
+            Arc::new(RwLock::new(HashMap::new())),
             None,
         )
         .await
@@ -753,9 +750,7 @@ async fn localhost_server_and_rust_client_can_run_smtp_commands_over_tcp_packets
             &invite_for_server,
             store,
             crate::session_registry::SessionRegistry::default(),
-            crate::frame_forwarder::UdpSessionTracker::default(),
-            crate::frame_forwarder::TcpSessionTracker::default(),
-            crate::frame_forwarder::IcmpSessionTracker::default(),
+            Arc::new(RwLock::new(HashMap::new())),
             None,
         )
         .await
@@ -1240,9 +1235,7 @@ async fn localhost_server_and_rust_client_can_relay_udp_echo() {
             &invite_for_server,
             store,
             crate::session_registry::SessionRegistry::default(),
-            crate::frame_forwarder::UdpSessionTracker::default(),
-            crate::frame_forwarder::TcpSessionTracker::default(),
-            crate::frame_forwarder::IcmpSessionTracker::default(),
+            Arc::new(RwLock::new(HashMap::new())),
             None,
         )
         .await
@@ -1351,9 +1344,7 @@ async fn localhost_server_and_rust_client_can_relay_icmp_echo_to_localhost() {
             &invite_for_server,
             store,
             crate::session_registry::SessionRegistry::default(),
-            crate::frame_forwarder::UdpSessionTracker::default(),
-            crate::frame_forwarder::TcpSessionTracker::default(),
-            crate::frame_forwarder::IcmpSessionTracker::default(),
+            Arc::new(RwLock::new(HashMap::new())),
             None,
         )
         .await
@@ -1650,9 +1641,7 @@ async fn localhost_server_and_rust_client_can_relay_tcp_as_ipv4_packets() {
             &invite_for_server,
             store,
             crate::session_registry::SessionRegistry::default(),
-            crate::frame_forwarder::UdpSessionTracker::default(),
-            crate::frame_forwarder::TcpSessionTracker::default(),
-            crate::frame_forwarder::IcmpSessionTracker::default(),
+            Arc::new(RwLock::new(HashMap::new())),
             None,
         )
         .await

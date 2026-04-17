@@ -1,9 +1,10 @@
-use crate::frame_forwarder::{
-    IcmpProbeSnapshot, IcmpSessionTracker, TcpFlowSnapshot, TcpSessionTracker, UdpFlowSnapshot,
-    UdpSessionTracker,
-};
 use crate::session_registry::SessionRegistry;
+use crate::smoltcp_forwarder::{
+    IcmpProbeSnapshot, SmoltcpForwarder, TcpFlowSnapshot, UdpFlowSnapshot,
+};
 use serde_json::json;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing::{error, info};
@@ -11,9 +12,7 @@ use tracing::{error, info};
 pub async fn run_status_server(
     bind: &str,
     sessions: SessionRegistry,
-    udp_tracker: UdpSessionTracker,
-    tcp_tracker: TcpSessionTracker,
-    icmp_tracker: IcmpSessionTracker,
+    forwarders: Arc<RwLock<HashMap<u64, Arc<SmoltcpForwarder>>>>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(bind).await?;
     info!(bind = %bind, "status listener bound");
@@ -28,9 +27,7 @@ pub async fn run_status_server(
         };
 
         let sessions = sessions.clone();
-        let udp_tracker = udp_tracker.clone();
-        let tcp_tracker = tcp_tracker.clone();
-        let icmp_tracker = icmp_tracker.clone();
+        let forwarders = forwarders.clone();
 
         tokio::spawn(async move {
             // Drain the request so the kernel can send FIN instead of RST.
@@ -50,9 +47,36 @@ pub async fn run_status_server(
             }
 
             let target = parse_request_target(&request).unwrap_or("/");
-            let udp_flows = udp_tracker.snapshot();
-            let tcp_flows = tcp_tracker.snapshot();
-            let icmp_probes = icmp_tracker.snapshot();
+            let (udp_flows, tcp_flows, icmp_probes) = {
+                let mut udp_flows = Vec::new();
+                let mut tcp_flows = Vec::new();
+                let mut icmp_probes = Vec::new();
+                let guard = forwarders
+                    .read()
+                    .expect("forwarder registry lock should not be poisoned");
+
+                for forwarder in guard.values() {
+                    let snapshot = forwarder.snapshot();
+                    udp_flows.extend(snapshot.udp_flows);
+                    tcp_flows.extend(snapshot.tcp_flows);
+                    icmp_probes.extend(snapshot.icmp_probes);
+                }
+
+                tcp_flows.sort_by(|left, right| {
+                    left.session_id
+                        .cmp(&right.session_id)
+                        .then_with(|| left.client_src.cmp(&right.client_src))
+                        .then_with(|| left.client_dst.cmp(&right.client_dst))
+                });
+                udp_flows.sort_by(|left, right| {
+                    left.session_id
+                        .cmp(&right.session_id)
+                        .then_with(|| left.client_src.cmp(&right.client_src))
+                        .then_with(|| left.client_dst.cmp(&right.client_dst))
+                });
+
+                (udp_flows, tcp_flows, icmp_probes)
+            };
 
             let (status_line, content_type, body) = match target {
                 "/" => (

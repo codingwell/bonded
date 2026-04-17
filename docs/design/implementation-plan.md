@@ -1,7 +1,7 @@
 # Implementation Plan — Server, Linux Client, Android Client
 
 **Status:** In Progress
-**Last Updated:** 2026-04-10 (session 28)
+**Last Updated:** 2026-04-17 (session 29)
 
 This is a living document. Update the status column and notes as work progresses.
 
@@ -448,6 +448,7 @@ Decisions made during implementation that aren't in the requirements docs.
 | Server heartbeat filter only treats empty-payload ping-flag frames as control messages | 2026-04-08 | Prevents accidental data-plane stalls where non-empty frames carrying `FLAG_PING` were consumed as heartbeats and never reached TCP/UDP/ICMP forwarding or status trackers |
 | Server now supports config-gated Linux TUN runtime bootstrap/cleanup inside container namespace | 2026-04-10 | `forwarding_mode=tun` provisions `tun_name`/`tun_cidr`/`tun_mtu`, auto-detects default egress interface (or uses override), enables `ip_forward`, installs iptables MASQUERADE/FORWARD rules, and restores/removes state at shutdown to minimize manual Docker networking setup |
 | TUN bridge routes naive-tcp session frames to Linux TUN and sends return packets back by destination-IP ownership map | 2026-04-10 | `tun_bridge` now tracks session registration and client source-IP ownership, writes client payload packets into TUN, reads return packets from TUN, and emits framed responses with per-session server sequence counters; this makes `forwarding_mode=tun` usable for naive-tcp transport in containerized deployments |
+| Non-TUN forwarding migration started: per-session `SmoltcpForwarder` now owns data-plane forwarding in server/websocket loops, with status API aggregating snapshots from a forwarder registry | 2026-04-17 | Initial vertical slice complete: runtime paths switched from sharded `frame_forwarder` worker queues to one forwarder instance per authenticated session; `smoltcp` handles TCP state-machine ingress while UDP/ICMP continue via direct socket relay in the new module. Remaining follow-up: retire legacy `frame_forwarder` module and reduce transitional warnings once test/coverage parity is complete |
 
 ---
 
