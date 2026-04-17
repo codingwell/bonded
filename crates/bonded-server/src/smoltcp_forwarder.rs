@@ -130,6 +130,9 @@ pub struct SmoltcpForwarder {
     tcp_stats: Arc<std::sync::RwLock<TcpStats>>,
     udp_tracker: UdpSessionTracker,
     icmp_tracker: IcmpSessionTracker,
+    /// Active UDP flows keyed by (src_ip, src_port, dst_ip, dst_port).
+    /// Shared with per-flow Tokio tasks so sockets are reused across packets.
+    udp_flow_map: Arc<TokioMutex<HashMap<UdpFlowKey, UdpFlowHandle>>>,
     /// Outbound channel so UDP/ICMP handlers can send frames directly.
     outbound_tx: mpsc::UnboundedSender<SessionFrame>,
     session_id: u64,
@@ -170,6 +173,7 @@ impl SmoltcpForwarder {
             tcp_stats,
             udp_tracker,
             icmp_tracker,
+            udp_flow_map: Arc::new(TokioMutex::new(HashMap::new())),
             outbound_tx,
             session_id,
         }
@@ -273,6 +277,7 @@ impl SmoltcpForwarder {
             session_id: self.session_id,
             outbound_tx: self.outbound_tx.clone(),
             tracker: self.udp_tracker.clone(),
+            flow_map: self.udp_flow_map.clone(),
         };
         tokio::spawn(async move {
             if let Err(err) = udp_manager.forward_udp_packet(frame.header, udp_pkt).await {
@@ -775,15 +780,10 @@ async fn tcp_bridge_task(
     });
 
     // Pump data from smoltcp → real server.
-    loop {
-        match from_smoltcp.recv().await {
-            Some(bytes) => {
-                if let Err(err) = writer.write_all(&bytes).await {
-                    debug!(session_id, conn_id, error = %err, "TCP bridge: write error");
-                    break;
-                }
-            }
-            None => break,
+    while let Some(bytes) = from_smoltcp.recv().await {
+        if let Err(err) = writer.write_all(&bytes).await {
+            debug!(session_id, conn_id, error = %err, "TCP bridge: write error");
+            break;
         }
     }
 
@@ -811,7 +811,7 @@ fn rewrite_dst_ip_inbound(packet: &[u8]) -> Option<Vec<u8>> {
 
 /// Rewrite `src_ip` in an outbound IPv4 packet back to the original destination
 /// and recompute both the IP header checksum and the transport (TCP/UDP) checksum.
-fn rewrite_src_ip_outbound(pkt: &mut Vec<u8>, original_src: Ipv4Addr) {
+fn rewrite_src_ip_outbound(pkt: &mut [u8], original_src: Ipv4Addr) {
     if pkt.len() < 20 {
         return;
     }
@@ -933,6 +933,7 @@ struct UdpFlowKey {
 
 #[derive(Debug)]
 struct UdpFlowState {
+    connection_id: u32,
     next_sequence: u64,
     identification: u16,
     last_client_at: Instant,
@@ -1047,6 +1048,8 @@ struct UdpSessionManager {
     session_id: u64,
     outbound_tx: mpsc::UnboundedSender<SessionFrame>,
     tracker: UdpSessionTracker,
+    /// Shared per-session flow map so each 4-tuple reuses one OS socket.
+    flow_map: Arc<TokioMutex<HashMap<UdpFlowKey, UdpFlowHandle>>>,
 }
 
 impl UdpSessionManager {
@@ -1067,6 +1070,8 @@ impl UdpSessionManager {
             let mut state = handle.state.lock().await;
             state.identification = pkt.identification;
             state.last_client_at = Instant::now();
+            // Keep the connection_id aligned to the latest request.
+            state.connection_id = frame_header.connection_id;
             if frame_header.sequence > state.next_sequence {
                 state.next_sequence = frame_header.sequence;
             }
@@ -1082,11 +1087,15 @@ impl UdpSessionManager {
         pkt: &Ipv4UdpPacket,
         frame_header: SessionHeader,
     ) -> anyhow::Result<UdpFlowHandle> {
-        // Fast path: check tracker (serves as existence check).
-        // We create one handle per flow and store it via a local per-flow Tokio task.
-        // The task owns the socket and cleans up; we just store the Arc.
-        // For simplicity, we use the tracker as the authoritative flow registry
-        // and create a new socket when it's absent.
+        // Fast path: return existing socket for this 4-tuple.
+        {
+            let map = self.flow_map.lock().await;
+            if let Some(handle) = map.get(key) {
+                return Ok(handle.clone());
+            }
+        }
+
+        // Slow path: create a new connected UDP socket for this flow.
         let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
         socket
             .connect(SocketAddrV4::new(pkt.dst_ip, pkt.dst_port))
@@ -1096,11 +1105,22 @@ impl UdpSessionManager {
         let handle = UdpFlowHandle {
             socket: socket.clone(),
             state: Arc::new(TokioMutex::new(UdpFlowState {
+                connection_id: frame_header.connection_id,
                 next_sequence: frame_header.sequence,
                 identification: pkt.identification,
                 last_client_at: Instant::now(),
             })),
         };
+
+        // Insert, but check again under the lock to avoid duplicate sockets.
+        {
+            let mut map = self.flow_map.lock().await;
+            if let Some(existing) = map.get(key) {
+                // Another task raced us; drop our socket and use theirs.
+                return Ok(existing.clone());
+            }
+            map.insert(key.clone(), handle.clone());
+        }
 
         self.tracker
             .register_flow(self.session_id, key.clone(), bound);
@@ -1108,6 +1128,7 @@ impl UdpSessionManager {
         // Spawn a task to pump responses back to the client.
         let outbound_tx = self.outbound_tx.clone();
         let tracker = self.tracker.clone();
+        let flow_map = self.flow_map.clone();
         let key_task = key.clone();
         let state_task = handle.state.clone();
         let session_id = self.session_id;
@@ -1133,7 +1154,7 @@ impl UdpSessionManager {
                 let (header, identification) = {
                     let mut g = state_task.lock().await;
                     let h = SessionHeader {
-                        connection_id: 0,
+                        connection_id: g.connection_id,
                         sequence: g.next_sequence,
                         flags: 0,
                     };
@@ -1163,6 +1184,7 @@ impl UdpSessionManager {
                     break;
                 }
             }
+            flow_map.lock().await.remove(&key_task);
             tracker.remove_flow(session_id, &key_task);
         });
 

@@ -3,8 +3,6 @@ use std::path::PathBuf;
 
 mod auth_handshake;
 mod authorized_keys;
-#[cfg(test)]
-mod frame_forwarder;
 mod health;
 mod invite_tokens;
 mod network_runtime;
@@ -18,69 +16,27 @@ mod tun_bridge;
 mod server_integration;
 
 #[cfg(test)]
-mod concurrency_tests {
-    use crate::frame_forwarder::TcpFlowTable;
-
-    #[test]
-    fn test_256_shard_distribution_for_50_connections() {
-        const FORWARD_WORKER_SHARDS: usize = 256;
-        let mut shard_loads = vec![0usize; FORWARD_WORKER_SHARDS];
-
-        for connection_id in 0u32..50 {
-            let shard_idx = (connection_id as usize) % FORWARD_WORKER_SHARDS;
-            shard_loads[shard_idx] += 1;
-        }
-
-        let occupied_shards = shard_loads.iter().filter(|&&load| load > 0).count();
-        let max_load = *shard_loads.iter().max().unwrap();
-
-        println!(
-            "Shard distribution for 50 connections: {} occupied shards, max load {} per shard",
-            occupied_shards, max_load
-        );
-        assert!(
-            max_load <= 1,
-            "Each connection should map to unique or near-unique shard"
-        );
-    }
-
-    #[test]
-    fn test_tcp_flow_table_has_256_shards() {
-        let _table = TcpFlowTable::default();
-        println!("TcpFlowTable architecture: 256 independent Mutex shards created");
-        // Verify it doesn't panic on construction
-        // Actual concurrency testing requires load testing
-    }
-
+mod channel_tests {
     #[tokio::test]
-    async fn test_batch_response_drain_prevents_select_latency() {
+    async fn test_channel_batch_drain_completes_before_blocking() {
         use tokio::sync::mpsc;
 
         let (tx, mut rx) = mpsc::unbounded_channel::<u32>();
 
-        // Simulate 256 forwarding workers sending responses
-        for i in 0..256 {
+        for i in 0..256u32 {
             tx.send(i).ok();
         }
 
-        // Batch drain all responses before select blocking
-        let mut drained_count = 0;
+        let mut drained = 0usize;
         loop {
             match rx.try_recv() {
-                Ok(_) => drained_count += 1,
+                Ok(_) => drained += 1,
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => break,
             }
         }
 
-        println!(
-            "Batch drained {} responses in one pass (no select cycles)",
-            drained_count
-        );
-        assert_eq!(
-            drained_count, 256,
-            "All responses should drain before select blocks"
-        );
+        assert_eq!(drained, 256, "all 256 items must drain before blocking");
     }
 }
 

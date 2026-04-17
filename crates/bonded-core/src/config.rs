@@ -49,18 +49,10 @@ pub enum ConfigError {
     Toml(#[from] toml::de::Error),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServerConfig {
     #[serde(default)]
     pub server: ServerSection,
-}
-
-impl Default for ServerConfig {
-    fn default() -> Self {
-        Self {
-            server: ServerSection::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,22 +99,13 @@ impl Default for ServerSection {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClientConfig {
     pub client: ClientSection,
     /// Not serialised – set at runtime on platforms that require socket
     /// protection (e.g. Android VPN services).
     #[serde(skip)]
     pub socket_protect: Option<SocketProtectFn>,
-}
-
-impl Default for ClientConfig {
-    fn default() -> Self {
-        Self {
-            client: ClientSection::default(),
-            socket_protect: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

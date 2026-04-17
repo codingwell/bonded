@@ -190,14 +190,13 @@ impl AuthorizedKeysWatcher {
 }
 
 fn should_reload_for_event_kind(kind: &EventKind) -> bool {
-    match kind {
-        EventKind::Create(_) | EventKind::Remove(_) => true,
-        EventKind::Modify(ModifyKind::Any)
-        | EventKind::Modify(ModifyKind::Data(_))
-        | EventKind::Modify(ModifyKind::Name(_)) => true,
-        EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
-        _ => false,
-    }
+    matches!(
+        kind,
+        EventKind::Create(_)
+            | EventKind::Remove(_)
+            | EventKind::Modify(ModifyKind::Any | ModifyKind::Data(_) | ModifyKind::Name(_))
+            | EventKind::Access(AccessKind::Close(AccessMode::Write))
+    )
 }
 
 #[cfg(test)]
