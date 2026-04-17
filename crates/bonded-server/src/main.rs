@@ -354,16 +354,6 @@ async fn run_websocket_server(
                             recv_result = transport.recv() => {
                                 match recv_result {
                                     Ok(frame) => {
-                                        info!(
-                                            peer = %peer,
-                                            session_id = handle.session_id,
-                                            connection_id = frame.header.connection_id,
-                                            frame_size = frame.payload.len(),
-                                            sequence = frame.header.sequence,
-                                            flags = frame.header.flags,
-                                            "websocket frame received from client"
-                                        );
-
                                         // Respond to heartbeat pings without forwarding them.
                                         // Only treat ping-bit frames as control heartbeats when
                                         // they carry no payload; otherwise keep forwarding.
@@ -593,16 +583,6 @@ async fn run_server(
                             recv_result = transport.recv() => {
                                 match recv_result {
                                     Ok(frame) => {
-                                        info!(
-                                            peer = %peer,
-                                            session_id = handle.session_id,
-                                            connection_id = frame.header.connection_id,
-                                            frame_size = frame.payload.len(),
-                                            sequence = frame.header.sequence,
-                                            flags = frame.header.flags,
-                                            "frame received from client"
-                                        );
-
                                         // Respond to heartbeat pings without forwarding them.
                                         // Only treat ping-bit frames as control heartbeats when
                                         // they carry no payload; otherwise keep forwarding.
