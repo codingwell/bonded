@@ -11,7 +11,6 @@ import java.net.URL
 import java.nio.ByteBuffer
 import java.security.SecureRandom
 import java.util.concurrent.CountDownLatch
-import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -202,7 +201,7 @@ object ProtocolStressTester {
         val statusRef = AtomicReference<Int>()
         val errorRef = AtomicReference<Throwable?>()
         val bodyBytes = AtomicInteger(0)
-        val inlineExecutor = Executor { runnable -> runnable.run() }
+        val callbackExecutor = Executors.newSingleThreadExecutor()
 
         val callback =
                 object : UrlRequest.Callback() {
@@ -247,34 +246,38 @@ object ProtocolStressTester {
                     }
                 }
 
-        val request =
-                engine.newUrlRequestBuilder(urlString, callback, inlineExecutor)
-                        .setHttpMethod("GET")
-                        .addHeader("User-Agent", "BondedStress/1.0")
-                        .addHeader("Accept", "*/*")
-                        .build()
+        try {
+            val request =
+                    engine.newUrlRequestBuilder(urlString, callback, callbackExecutor)
+                            .setHttpMethod("GET")
+                            .addHeader("User-Agent", "BondedStress/1.0")
+                            .addHeader("Accept", "*/*")
+                            .build()
 
-        val startMs = System.currentTimeMillis()
-        request.start()
+            val startMs = System.currentTimeMillis()
+            request.start()
 
-        if (!completed.await(http3TimeoutMs, TimeUnit.MILLISECONDS)) {
-            request.cancel()
-            throw SocketTimeoutException("HTTP/3 request timed out for $urlString")
+            if (!completed.await(http3TimeoutMs, TimeUnit.MILLISECONDS)) {
+                request.cancel()
+                throw SocketTimeoutException("HTTP/3 request timed out for $urlString")
+            }
+
+            errorRef.get()?.let { throw it }
+
+            val elapsedMs = System.currentTimeMillis() - startMs
+            val protocol = protocolRef.get().orEmpty()
+            if (!protocol.contains("h3", ignoreCase = true) &&
+                            !protocol.contains("quic", ignoreCase = true)
+            ) {
+                throw IllegalStateException(
+                        "Request completed without HTTP/3 or QUIC negotiation (protocol='$protocol')"
+                )
+            }
+
+            return "status=${statusRef.get() ?: 0} protocol=$protocol bytes=${bodyBytes.get()} in ${elapsedMs}ms"
+        } finally {
+            callbackExecutor.shutdownNow()
         }
-
-        errorRef.get()?.let { throw it }
-
-        val elapsedMs = System.currentTimeMillis() - startMs
-        val protocol = protocolRef.get().orEmpty()
-        if (!protocol.contains("h3", ignoreCase = true) &&
-                        !protocol.contains("quic", ignoreCase = true)
-        ) {
-            throw IllegalStateException(
-                    "Request completed without HTTP/3 or QUIC negotiation (protocol='$protocol')"
-            )
-        }
-
-        return "status=${statusRef.get() ?: 0} protocol=$protocol bytes=${bodyBytes.get()} in ${elapsedMs}ms"
     }
 
     private fun drainStream(connection: HttpURLConnection): Int {
