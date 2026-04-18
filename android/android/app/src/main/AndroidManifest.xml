@@ -86,6 +86,7 @@
                 <action android:name="com.bonded.bonded_app.TEST_TCP"/>
                 <action android:name="com.bonded.bonded_app.TEST_HTTP"/>
                 <action android:name="com.bonded.bonded_app.TEST_HTTP_CODINGWELL"/>
+                <action android:name="com.bonded.bonded_app.TEST_PROTOCOL_STRESS"/>
                 <action android:name="com.bonded.bonded_app.TEST_ALL"/>
             </intent-filter>
         </receiver>

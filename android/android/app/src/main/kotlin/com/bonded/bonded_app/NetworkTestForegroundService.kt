@@ -27,6 +27,11 @@ class NetworkTestForegroundService : Service() {
         const val EXTRA_EXPECTED_IP = "expected_ip"
         const val EXTRA_URL = "url"
         const val EXTRA_PORT = "port"
+        const val EXTRA_RESOLVER = "resolver"
+        const val EXTRA_HTTP_URL = "http_url"
+        const val EXTRA_HTTPS_URL = "https_url"
+        const val EXTRA_HTTP3_URL = "http3_url"
+        const val EXTRA_ROUNDS = "rounds"
 
         private const val CHANNEL_ID = "bonded_network_tests"
         private const val NOTIFICATION_ID = 1002
@@ -75,8 +80,9 @@ class NetworkTestForegroundService : Service() {
             "com.bonded.bonded_app.TEST_VPN_DISCONNECT" -> testVpnDisconnect()
             "com.bonded.bonded_app.TEST_DNS" -> {
                 val host = intent.getStringExtra(EXTRA_HOST) ?: DEFAULT_DNS_HOST
-                val expectedIp = intent.getStringExtra(EXTRA_EXPECTED_IP)
-                    ?: if (host == DEFAULT_DNS_HOST) DEFAULT_DNS_EXPECTED_IP else null
+                val expectedIp =
+                        intent.getStringExtra(EXTRA_EXPECTED_IP)
+                                ?: if (host == DEFAULT_DNS_HOST) DEFAULT_DNS_EXPECTED_IP else null
                 testDnsResolution(host, expectedIp)
             }
             "com.bonded.bonded_app.TEST_TCP" -> {
@@ -89,6 +95,29 @@ class NetworkTestForegroundService : Service() {
                 testHttpConnection(url)
             }
             "com.bonded.bonded_app.TEST_HTTP_CODINGWELL" -> testCodingwellConnection()
+            "com.bonded.bonded_app.TEST_PROTOCOL_STRESS" -> {
+                ProtocolStressTester.run(
+                        context = this,
+                        config =
+                                ProtocolStressConfig(
+                                        dnsHost = intent.getStringExtra(EXTRA_HOST)
+                                                        ?: "cloudflare.com",
+                                        dnsResolver = intent.getStringExtra(EXTRA_RESOLVER)
+                                                        ?: "1.1.1.1",
+                                        httpUrl = intent.getStringExtra(EXTRA_HTTP_URL)
+                                                        ?: "http://httpforever.com/",
+                                        httpsUrl = intent.getStringExtra(EXTRA_HTTPS_URL)
+                                                        ?: "https://example.com/",
+                                        http3Url = intent.getStringExtra(EXTRA_HTTP3_URL)
+                                                        ?: "https://cloudflare-quic.com/",
+                                        rounds = intent.getIntExtra(EXTRA_ROUNDS, 5),
+                                ),
+                        logI = ::logI,
+                        logD = ::logD,
+                        logW = ::logW,
+                        logE = ::logE,
+                )
+            }
             "com.bonded.bonded_app.TEST_ALL" -> {
                 testVpnStatus()
                 testDnsResolution(DEFAULT_DNS_HOST, DEFAULT_DNS_EXPECTED_IP)
@@ -120,7 +149,9 @@ class NetworkTestForegroundService : Service() {
         } else {
             android.util.Log.e("NetworkTest", message)
         }
-        val detail = if (error == null) message else "$message | ${error::class.java.simpleName}: ${error.message}"
+        val detail =
+                if (error == null) message
+                else "$message | ${error::class.java.simpleName}: ${error.message}"
         NetworkTestReceiver.appendServiceLog("E", detail)
     }
 
@@ -149,7 +180,9 @@ class NetworkTestForegroundService : Service() {
         val inboundBytes = snapshot["inboundBytes"]
         val pathCount = snapshot["networkPathCount"]
         val lastError = snapshot["lastError"]
-        logI("Session state=$state, paths=$pathCount, out=$outboundPackets/$outboundBytes B, in=$inboundPackets/$inboundBytes B, lastError=$lastError")
+        logI(
+                "Session state=$state, paths=$pathCount, out=$outboundPackets/$outboundBytes B, in=$inboundPackets/$inboundBytes B, lastError=$lastError"
+        )
     }
 
     private fun testVpnConnect() {
@@ -186,7 +219,9 @@ class NetworkTestForegroundService : Service() {
                     logI("✓ DNS expected IP matched: $expectedIp")
                 } else {
                     val resolved = addresses.joinToString(",") { it.hostAddress }
-                    logE("✗ DNS expected IP mismatch for '$host': expected=$expectedIp resolved=$resolved")
+                    logE(
+                            "✗ DNS expected IP mismatch for '$host': expected=$expectedIp resolved=$resolved"
+                    )
                 }
             }
         } catch (e: Exception) {
@@ -197,7 +232,9 @@ class NetworkTestForegroundService : Service() {
     private fun testTcpConnection(host: String, port: Int) {
         logI(">>> TCP Connection Test to $host:$port")
         if (port == 8080) {
-            logE("Port 8080 is Bonded NaiveTCP auth and is blocked for raw TEST_TCP probes. Use another port (e.g. 80/443/8081).")
+            logE(
+                    "Port 8080 is Bonded NaiveTCP auth and is blocked for raw TEST_TCP probes. Use another port (e.g. 80/443/8081)."
+            )
             return
         }
         var socket: Socket? = null
@@ -215,8 +252,7 @@ class NetworkTestForegroundService : Service() {
         } finally {
             try {
                 socket?.close()
-            } catch (_: Exception) {
-            }
+            } catch (_: Exception) {}
         }
     }
 
@@ -245,11 +281,12 @@ class NetworkTestForegroundService : Service() {
     }
 
     private fun testCodingwellConnection() {
-        val candidates = listOf(
-            "https://codingwell.net",
-            "https://www.codingwell.net",
-            "https://example.com",
-        )
+        val candidates =
+                listOf(
+                        "https://codingwell.net",
+                        "https://www.codingwell.net",
+                        "https://example.com",
+                )
         logI(">>> Codingwell HTTPS Test (with fallback)")
         var lastError: String? = null
         for ((index, urlString) in candidates.withIndex()) {
@@ -271,7 +308,9 @@ class NetworkTestForegroundService : Service() {
                     logI("  HTTP $responseCode: $responseMessage")
                 }
                 if (urlString != candidates.first()) {
-                    logW("Primary codingwell endpoint unavailable; succeeded using fallback: $urlString")
+                    logW(
+                            "Primary codingwell endpoint unavailable; succeeded using fallback: $urlString"
+                    )
                 }
                 return
             } catch (e: Exception) {
@@ -296,8 +335,7 @@ class NetworkTestForegroundService : Service() {
                         accepted.getOutputStream().write(byteArrayOf(0x42))
                         accepted.getOutputStream().flush()
                     }
-                } catch (_: Exception) {
-                }
+                } catch (_: Exception) {}
             }
             client = Socket()
             client.connect(InetSocketAddress("127.0.0.1", port), 3000)
@@ -310,12 +348,10 @@ class NetworkTestForegroundService : Service() {
         } finally {
             try {
                 client?.close()
-            } catch (_: Exception) {
-            }
+            } catch (_: Exception) {}
             try {
                 server?.close()
-            } catch (_: Exception) {
-            }
+            } catch (_: Exception) {}
         }
     }
 
@@ -349,19 +385,19 @@ class NetworkTestForegroundService : Service() {
             val statusLine = reader.readLine() ?: ""
             val responseCode = statusLine.split(" ").getOrNull(1)?.toIntOrNull() ?: 0
             val elapsedMs = System.currentTimeMillis() - startMs
-            logI("✓ Loopback HTTP connection successful in ${elapsedMs}ms (HTTP $responseCode, port=$port)")
+            logI(
+                    "✓ Loopback HTTP connection successful in ${elapsedMs}ms (HTTP $responseCode, port=$port)"
+            )
             serverThread.join(1000)
         } catch (e: Exception) {
             logE("✗ Loopback HTTP connection failed: ${e.message}", e)
         } finally {
             try {
                 client?.close()
-            } catch (_: Exception) {
-            }
+            } catch (_: Exception) {}
             try {
                 server?.close()
-            } catch (_: Exception) {
-            }
+            } catch (_: Exception) {}
         }
     }
 
@@ -371,23 +407,25 @@ class NetworkTestForegroundService : Service() {
         val existing = manager.getNotificationChannel(CHANNEL_ID)
         if (existing != null) return
 
-        val channel = NotificationChannel(
-            CHANNEL_ID,
-            "Network Diagnostics",
-            NotificationManager.IMPORTANCE_LOW,
-        ).apply {
-            description = "Foreground execution for Bonded network diagnostic tests"
-        }
+        val channel =
+                NotificationChannel(
+                                CHANNEL_ID,
+                                "Network Diagnostics",
+                                NotificationManager.IMPORTANCE_LOW,
+                        )
+                        .apply {
+                            description = "Foreground execution for Bonded network diagnostic tests"
+                        }
         manager.createNotificationChannel(channel)
     }
 
     private fun buildNotification(content: String): Notification {
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_notify_sync)
-            .setContentTitle("Bonded Network Test")
-            .setContentText(content)
-            .setOngoing(true)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .build()
+                .setSmallIcon(android.R.drawable.stat_notify_sync)
+                .setContentTitle("Bonded Network Test")
+                .setContentText(content)
+                .setOngoing(true)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .build()
     }
 }

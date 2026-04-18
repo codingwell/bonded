@@ -177,8 +177,38 @@ class MainActivity : FlutterActivity() {
                                     (args["url"] as? String)?.let {
                                         intent.putExtra(NetworkTestForegroundService.EXTRA_URL, it)
                                     }
+                                    (args["resolver"] as? String)?.let {
+                                        intent.putExtra(
+                                                NetworkTestForegroundService.EXTRA_RESOLVER,
+                                                it
+                                        )
+                                    }
+                                    (args["http_url"] as? String)?.let {
+                                        intent.putExtra(
+                                                NetworkTestForegroundService.EXTRA_HTTP_URL,
+                                                it
+                                        )
+                                    }
+                                    (args["https_url"] as? String)?.let {
+                                        intent.putExtra(
+                                                NetworkTestForegroundService.EXTRA_HTTPS_URL,
+                                                it
+                                        )
+                                    }
+                                    (args["http3_url"] as? String)?.let {
+                                        intent.putExtra(
+                                                NetworkTestForegroundService.EXTRA_HTTP3_URL,
+                                                it
+                                        )
+                                    }
                                     (args["port"] as? Int)?.let {
                                         intent.putExtra(NetworkTestForegroundService.EXTRA_PORT, it)
+                                    }
+                                    (args["rounds"] as? Int)?.let {
+                                        intent.putExtra(
+                                                NetworkTestForegroundService.EXTRA_ROUNDS,
+                                                it
+                                        )
                                     }
                                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                                         startForegroundService(intent)

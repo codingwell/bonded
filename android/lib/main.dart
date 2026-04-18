@@ -7,6 +7,7 @@ import 'screens/server_config_screen.dart';
 import 'screens/settings_screen.dart';
 import 'screens/network_tests_screen.dart';
 import 'screens/client_logs_screen.dart';
+import 'screens/stress_test_screen.dart';
 import 'models/pairing_model.dart';
 
 void main() {
@@ -30,6 +31,7 @@ class BondedApp extends StatelessWidget {
         '/qr-scanner': (context) => const QRScannerScreen(),
         '/settings': (context) => const SettingsScreen(),
         '/network-tests': (context) => const NetworkTestsScreen(),
+        '/stress-tests': (context) => const StressTestScreen(),
         '/client-logs': (context) => const ClientLogsScreen(),
       },
       onGenerateRoute: (settings) {

@@ -139,7 +139,9 @@ class _NetworkTestsScreenState extends State<NetworkTestsScreen> {
 
       final request = await client.getUrl(Uri.parse('https://codingwell.net'));
       request.followRedirects = true;
-      final response = await request.close().timeout(const Duration(seconds: 10));
+      final response = await request.close().timeout(
+        const Duration(seconds: 10),
+      );
 
       await response.drain<void>();
       stopwatch.stop();
@@ -148,7 +150,7 @@ class _NetworkTestsScreenState extends State<NetworkTestsScreen> {
       setState(() {
         _lastResult =
             'UI probe success in ${stopwatch.elapsedMilliseconds}ms: '
-            'HTTP ${response.statusCode} (${response.reasonPhrase ?? 'OK'})';
+            'HTTP ${response.statusCode} (${response.reasonPhrase})';
       });
     } on Exception catch (e) {
       stopwatch.stop();
@@ -188,6 +190,17 @@ class _NetworkTestsScreenState extends State<NetworkTestsScreen> {
           Text(
             'Run Android network diagnostics from inside the app.',
             style: Theme.of(context).textTheme.bodyMedium,
+          ),
+          const SizedBox(height: 12),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: OutlinedButton.icon(
+              onPressed: () {
+                Navigator.of(context).pushNamed('/stress-tests');
+              },
+              icon: const Icon(Icons.bolt),
+              label: const Text('Open Stress Test Page'),
+            ),
           ),
           const SizedBox(height: 12),
           Card(

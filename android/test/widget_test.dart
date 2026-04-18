@@ -1,16 +1,41 @@
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:bonded_app/main.dart';
 
 void main() {
-  testWidgets('Bridge status screen renders', (WidgetTester tester) async {
-    await tester.pumpWidget(const BondedApp());
-    await tester.pump();
+  TestWidgetsFlutterBinding.ensureInitialized();
 
-    expect(find.text('Bonded Android Shell'), findsOneWidget);
-    expect(find.text('Bridge status'), findsOneWidget);
-    expect(find.text('Refresh bridge status'), findsOneWidget);
-    expect(find.text('Start VPN'), findsOneWidget);
-    expect(find.text('Stop VPN'), findsOneWidget);
+  const channel = MethodChannel('bonded/native');
+
+  setUp(() {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+          switch (call.method) {
+            case 'getPairedServers':
+              return <Map<String, dynamic>>[];
+            case 'getVpnStatus':
+              return false;
+            case 'getVpnSessionStatus':
+              return <String, dynamic>{};
+            default:
+              return null;
+          }
+        });
+  });
+
+  tearDown(() {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, null);
+  });
+
+  testWidgets('Home screen renders', (WidgetTester tester) async {
+    await tester.pumpWidget(const BondedApp());
+    await tester.pumpAndSettle();
+
+    expect(find.text('Bonded VPN'), findsOneWidget);
+    expect(find.text('No paired servers'), findsOneWidget);
+    expect(find.text('Scan a server QR code to get started'), findsOneWidget);
+    expect(find.text('Scan QR Code'), findsOneWidget);
   });
 }

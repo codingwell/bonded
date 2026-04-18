@@ -1,7 +1,7 @@
 # Implementation Plan — Server, Linux Client, Android Client
 
 **Status:** In Progress
-**Last Updated:** 2026-04-17 (session 30)
+**Last Updated:** 2026-04-18 (session 31)
 
 This is a living document. Update the status column and notes as work progresses.
 
@@ -323,6 +323,7 @@ Build the Android platform layer. The core Rust logic is shared via FFI.
 | 4.10 | Background operation | completed | Completed MethodChannel/EventChannel wiring for `startBackgroundVpn`/`stopBackgroundVpn`/`isBackgroundVpnRunning`; `BondedVpnService` now supports Android foreground-service mode with persistent notification and emits background lifecycle events consumed by Dashboard UI |
 | 4.11 | End-to-end test: Android → server → internet | in-progress | Added host-side `bonded-ffi` smoke test that redeems an invite token, starts the Android session runtime, queues an outbound packet, and verifies echoed inbound traffic over NaiveTCP; host-side client/runtime tests now also assert that requested local bind addresses are actually used for outbound session connections (`127.0.0.2` loopback source assertion), while full APK/device validation remains blocked by Maven DNS/network resolution in the dev container |
 | 4.11 | End-to-end test: Android → server → internet | in-progress | Host-side FFI smoke tests pass (50/50 including bind-address assertion); `libbonded_ffi.so` built for arm64-v8a and x86_64 and placed in jniLibs; debug APK builds successfully; full device/emulator validation (actual VPN tunnel + internet traffic) requires a physical device or running emulator — remaining for device testing phase; added Android broadcast diagnostic action `com.bonded.bonded_app.TEST_VPN_STATUS` to log `BondedVpnService.isRunning()` + current session snapshot so DNS/UDP tests can be gated on explicit VPN-up evidence; applied Android protect-path mitigation (app disallowed from VPN, protect non-fatal on Android, protect-before-bind ordering) and rebuilt JNI libs + APK, but device run still times out path-0 connect with `deadline has elapsed`; latest explicit receiver tests now validate DNS target `unifi.g.codingwell.net` with expected IP `34.82.88.79`, while requested TCP probe to `codingwell.net:80` still times out after 10s even with app foregrounded |
+| 4.12 | Android in-app protocol stress diagnostics page | completed | Added Flutter `StressTestScreen` with configurable EDNS host/resolver, HTTP/HTTPS/HTTP3 targets, and round count; wired a new native `TEST_PROTOCOL_STRESS` action through the existing MethodChannel/foreground-service path; implemented concurrent per-round EDNS UDP queries with explicit OPT/EDNS options, cleartext HTTP, HTTPS, and Cronet-backed QUIC/HTTP3 probes with aggregated in-app log summaries |
 
 Acceptance gate:
 
@@ -437,6 +438,7 @@ Decisions made during implementation that aren't in the requirements docs.
 | Bind-aware path establishment now follows protocol negotiation order (including WebSocket) | 2026-04-04 | Removed special-case NaiveTCP pre-attempt for bound paths and added bind-aware WebSocket dialing so Android `wss` preference is honored when path bind addresses are present |
 | Device-test workflow now gates DNS checks on explicit Android-side VPN state probe (`TEST_VPN_STATUS`) before running network diagnostics | 2026-04-02 | Avoids ambiguous results from DNS checks that run before VPN session establishment and keeps tunnel validation aligned with UDP-forwarding goals |
 | Android network diagnostics now default DNS checks to `unifi.g.codingwell.net` with optional `expected_ip` assertion and use explicit component broadcasts for deterministic receiver execution | 2026-04-02 | Ensures DNS test intent validates a concrete expected answer (`34.82.88.79`) and avoids implicit-broadcast delivery ambiguity during adb-driven validation |
+| Android HTTP/3 diagnostics use embedded Cronet and require negotiated protocol `h3`/`quic` to count as success | 2026-04-18 | Keeps the QUIC/HTTP3 stress path honest instead of silently succeeding over HTTPS fallback when the target or stack downgrades |
 | Android VPN now disallows the app package from tunnel capture and treats `protect(fd)=false` as non-fatal on Android | 2026-04-02 | Prevents startup deadlocks when control-plane sockets would otherwise be captured by the VPN and removes brittle dependency on per-socket protect success |
 | Android launcher icon generation is managed via `flutter_launcher_icons` using workspace-root `icon.png` | 2026-04-03 | Keeps launcher assets reproducible across densities and Android adaptive-icon resources instead of hand-editing mipmap files |
 | Rust-only DNS tunnel diagnostics use an ignored localhost integration test in `bonded-server` that runs real server+client crates and injects synthetic UDP DNS probes | 2026-04-03 | Enables reproducible E2E debugging of server/client forwarding behavior without Android app/device dependencies |

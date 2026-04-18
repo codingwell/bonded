@@ -116,6 +116,13 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             ),
           IconButton(
+            icon: const Icon(Icons.bolt),
+            tooltip: 'Protocol Stress Test',
+            onPressed: () {
+              Navigator.of(context).pushNamed('/stress-tests');
+            },
+          ),
+          IconButton(
             icon: const Icon(Icons.science),
             tooltip: 'Network Tests',
             onPressed: () {
