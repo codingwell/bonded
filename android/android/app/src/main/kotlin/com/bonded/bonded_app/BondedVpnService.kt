@@ -303,22 +303,15 @@ class BondedVpnService : VpnService() {
                     val output = FileOutputStream(pfd.fileDescriptor)
                     try {
                         while (packetIoRunning) {
-                            var drained = 0
-                            repeat(MAX_POLLED_INBOUND_PER_CYCLE) {
-                                val inbound = pollInboundPacket()
-                                if (inbound == null || inbound.isEmpty()) {
-                                    return@repeat
-                                }
-
-                                output.write(inbound)
-                                output.flush()
-                                drained++
+                            val inbound = pollInboundPacket()
+                            if (inbound == null || inbound.isEmpty()) {
+                                // If nothing was available, sleep briefly to avoid busy-spinning.
+                                Thread.sleep(INBOUND_IDLE_SLEEP_MS)
+                                continue
                             }
 
-                            // If nothing was available, sleep briefly to avoid busy-spinning.
-                            if (drained == 0) {
-                                Thread.sleep(5)
-                            }
+                            output.write(inbound)
+                            output.flush()
                         }
                     } catch (_: InterruptedException) {
                         // Normal shutdown signal.
@@ -808,8 +801,7 @@ class BondedVpnService : VpnService() {
         private const val EXTRA_RUN_IN_BACKGROUND = "run_in_background"
         private const val NOTIFICATION_CHANNEL_ID = "bonded_vpn_background"
         private const val NOTIFICATION_ID = 1001
-        private const val PACKET_IO_EVENT_EVERY = 200L
-        private const val MAX_POLLED_INBOUND_PER_CYCLE = 32
+        private const val INBOUND_IDLE_SLEEP_MS = 1L
         private const val MAX_PENDING_OUTBOUND_PACKETS = 256
         private const val MAX_PENDING_FLUSH_PER_CYCLE = 16
         private const val MAX_PENDING_FLUSH_ON_SESSION_START = 128
