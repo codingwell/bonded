@@ -381,7 +381,6 @@ fn start_android_session(
                                 }
 
                                 let packet_len = packet.len() as u64;
-                                eprintln!("[bonded-ffi] Worker: sending {} byte outbound packet via transport[{}] (active)", packet_len, active_index);
                                 let frame = session.create_outbound_frame(Bytes::from(packet), 0);
                                 if let Err(err) = transports[active_index].send(frame).await {
                                     eprintln!("[bonded-ffi] Worker: send on transport[{}] failed: {}", active_index, err);
@@ -439,7 +438,6 @@ fn start_android_session(
                                     continue;
                                 }
 
-                                eprintln!("[bonded-ffi] Worker: received frame from transport {}", active_index);
                                 // Deliver the response payload immediately without reordering.
                                 // At the raw-IP VPN layer the Android kernel handles its own
                                 // TCP reordering; forcing in-order delivery here causes inbound
@@ -447,10 +445,6 @@ fn start_android_session(
                                 if !frame.payload.is_empty() {
                                     let payload = frame.payload.to_vec();
                                     let payload_len = payload.len() as u64;
-                                    eprintln!(
-                                        "[bonded-ffi] Worker: queuing {} byte inbound packet (seq={})",
-                                        payload_len, frame.header.sequence
-                                    );
                                     worker_inbound_queue
                                         .lock()
                                         .expect("android inbound queue lock poisoned")
@@ -554,7 +548,6 @@ fn queue_outbound_packet(packet: Vec<u8>) -> bool {
         .as_ref()
     {
         let packet_len = packet.len();
-        eprintln!("[bonded-ffi] Queuing {} byte outbound packet", packet_len);
         let result = handle.outbound_tx.send(packet);
         if let Err(_) = result {
             let message = "Failed to queue outbound packet: channel closed";
@@ -589,9 +582,6 @@ fn poll_inbound_packet() -> Option<Vec<u8>> {
                 .pop_front()
         });
 
-    if let Some(ref packet) = result {
-        eprintln!("[bonded-ffi] Polled {} byte inbound packet", packet.len());
-    }
     result
 }
 
