@@ -72,5 +72,6 @@ flutter {
 }
 
 dependencies {
-    implementation("org.chromium.net:cronet-embedded:119.6045.31")
+    // Consider viability of com.google.android.gms:play-services-cronet
+    implementation("org.chromium.net:cronet-embedded:143.7445.0")
 }
