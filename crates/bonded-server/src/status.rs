@@ -157,14 +157,20 @@ fn render_status_page(
         .iter()
         .map(|entry| {
             format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{} B</td><td>{}</td><td>{} B</td><td>{}</td><td>{} B</td></tr>",
                 escape_html(&entry.session_id.to_string()),
                 escape_html(&entry.client_src),
                 escape_html(&entry.client_dst),
                 escape_html(&entry.created_ago),
                 escape_html(&entry.last_activity_ago),
                 escape_html(&entry.client_to_remote_packets.to_string()),
-                escape_html(&entry.remote_to_client_packets.to_string())
+                escape_html(&entry.remote_to_client_packets.to_string()),
+                escape_html(&entry.bridge_read_chunks.to_string()),
+                escape_html(&entry.bridge_read_avg_bytes.to_string()),
+                escape_html(&entry.bridge_read_bytes.to_string()),
+                escape_html(&entry.bridge_to_smoltcp_chunks.to_string()),
+                escape_html(&entry.bridge_to_smoltcp_avg_bytes.to_string()),
+                escape_html(&entry.bridge_to_smoltcp_bytes.to_string())
             )
         })
         .collect::<Vec<_>>()
@@ -225,7 +231,7 @@ small {{ color: #6b7280; }}
 <div class="card">
 <h2 id="tcp-title">Active TCP Flows ({})</h2>
 <table>
-<thead><tr><th>Session ID</th><th>Client Source</th><th>Remote Target</th><th>Created</th><th>Last Activity</th><th>Client->Remote Packets</th><th>Remote->Client Packets</th></tr></thead>
+<thead><tr><th>Session ID</th><th>Client Source</th><th>Remote Target</th><th>Created</th><th>Last Activity</th><th>Client->Remote Packets</th><th>Remote->Client Packets</th><th>Bridge Reads</th><th>Bridge Read Avg</th><th>Bridge Read Bytes</th><th>Smoltcp Writes</th><th>Smoltcp Write Avg</th><th>Smoltcp Write Bytes</th></tr></thead>
 <tbody id="tcp-body">{}</tbody>
 </table>
 </div>
@@ -273,9 +279,9 @@ function render(data) {{
     );
     setRows(
         "tcp-body",
-        data.tcp_flows.map((entry) => `<tr><td>${{escapeHtml(entry.session_id)}}</td><td>${{escapeHtml(entry.client_src)}}</td><td>${{escapeHtml(entry.client_dst)}}</td><td>${{escapeHtml(entry.created_ago)}}</td><td>${{escapeHtml(entry.last_activity_ago)}}</td><td>${{escapeHtml(entry.client_to_remote_packets)}}</td><td>${{escapeHtml(entry.remote_to_client_packets)}}</td></tr>`),
+        data.tcp_flows.map((entry) => `<tr><td>${{escapeHtml(entry.session_id)}}</td><td>${{escapeHtml(entry.client_src)}}</td><td>${{escapeHtml(entry.client_dst)}}</td><td>${{escapeHtml(entry.created_ago)}}</td><td>${{escapeHtml(entry.last_activity_ago)}}</td><td>${{escapeHtml(entry.client_to_remote_packets)}}</td><td>${{escapeHtml(entry.remote_to_client_packets)}}</td><td>${{escapeHtml(entry.bridge_read_chunks)}}</td><td>${{escapeHtml(entry.bridge_read_avg_bytes)}} B</td><td>${{escapeHtml(entry.bridge_read_bytes)}}</td><td>${{escapeHtml(entry.bridge_to_smoltcp_chunks)}}</td><td>${{escapeHtml(entry.bridge_to_smoltcp_avg_bytes)}} B</td><td>${{escapeHtml(entry.bridge_to_smoltcp_bytes)}}</td></tr>`),
         "No active TCP flows.",
-        7
+        13
     );
     setRows(
         "icmp-body",
@@ -316,7 +322,7 @@ setInterval(refresh, 2000);
         },
         tcp_flows.len(),
         if tcp_rows.is_empty() {
-            "<tr><td colspan=\"7\">No active TCP flows.</td></tr>".to_owned()
+            "<tr><td colspan=\"13\">No active TCP flows.</td></tr>".to_owned()
         } else {
             tcp_rows
         },
@@ -375,6 +381,12 @@ fn render_status_json(
                 "last_activity_ago": entry.last_activity_ago,
                 "client_to_remote_packets": entry.client_to_remote_packets,
                 "remote_to_client_packets": entry.remote_to_client_packets,
+                "bridge_read_chunks": entry.bridge_read_chunks,
+                "bridge_read_bytes": entry.bridge_read_bytes,
+                "bridge_read_avg_bytes": entry.bridge_read_avg_bytes,
+                "bridge_to_smoltcp_chunks": entry.bridge_to_smoltcp_chunks,
+                "bridge_to_smoltcp_bytes": entry.bridge_to_smoltcp_bytes,
+                "bridge_to_smoltcp_avg_bytes": entry.bridge_to_smoltcp_avg_bytes,
             })
         })
         .collect::<Vec<_>>();

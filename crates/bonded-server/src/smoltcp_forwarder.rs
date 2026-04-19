@@ -66,6 +66,12 @@ pub struct TcpFlowSnapshot {
     pub last_activity_ago: String,
     pub client_to_remote_packets: u64,
     pub remote_to_client_packets: u64,
+    pub bridge_read_chunks: u64,
+    pub bridge_read_bytes: u64,
+    pub bridge_read_avg_bytes: u64,
+    pub bridge_to_smoltcp_chunks: u64,
+    pub bridge_to_smoltcp_bytes: u64,
+    pub bridge_to_smoltcp_avg_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +109,7 @@ pub struct ForwarderSnapshot {
 
 #[derive(Debug)]
 struct TcpFlowRecord {
+    conn_id: u32,
     session_id: u64,
     src_ip: Ipv4Addr,
     src_port: u16,
@@ -112,6 +119,10 @@ struct TcpFlowRecord {
     last_activity_at: SystemTime,
     client_to_remote: u64,
     remote_to_client: u64,
+    bridge_read_chunks: u64,
+    bridge_read_bytes: u64,
+    bridge_to_smoltcp_chunks: u64,
+    bridge_to_smoltcp_bytes: u64,
 }
 
 #[derive(Debug, Default)]
@@ -223,6 +234,20 @@ impl SmoltcpForwarder {
                     last_activity_ago: format_elapsed(now, r.last_activity_at),
                     client_to_remote_packets: r.client_to_remote,
                     remote_to_client_packets: r.remote_to_client,
+                    bridge_read_chunks: r.bridge_read_chunks,
+                    bridge_read_bytes: r.bridge_read_bytes,
+                    bridge_read_avg_bytes: if r.bridge_read_chunks == 0 {
+                        0
+                    } else {
+                        r.bridge_read_bytes / r.bridge_read_chunks
+                    },
+                    bridge_to_smoltcp_chunks: r.bridge_to_smoltcp_chunks,
+                    bridge_to_smoltcp_bytes: r.bridge_to_smoltcp_bytes,
+                    bridge_to_smoltcp_avg_bytes: if r.bridge_to_smoltcp_chunks == 0 {
+                        0
+                    } else {
+                        r.bridge_to_smoltcp_bytes / r.bridge_to_smoltcp_chunks
+                    },
                 })
                 .collect()
         };
@@ -618,6 +643,7 @@ fn smoltcp_poll_thread(
             let outbound_bridge = outbound_tx.clone();
             let session_id_copy = session_id;
             let conn_id_copy = conn_id;
+            let tcp_stats_bridge = tcp_stats.clone();
 
             tokio_handle.spawn(async move {
                 tcp_bridge_task(
@@ -627,6 +653,7 @@ fn smoltcp_poll_thread(
                     to_bridge_rx,
                     from_bridge_tx,
                     work_notify,
+                    tcp_stats_bridge,
                     outbound_bridge,
                 )
                 .await;
@@ -637,6 +664,7 @@ fn smoltcp_poll_thread(
                 stats.flows.insert(
                     p.handle,
                     TcpFlowRecord {
+                        conn_id,
                         session_id,
                         src_ip: p.client_src_ip,
                         src_port: p.client_src_port,
@@ -646,6 +674,10 @@ fn smoltcp_poll_thread(
                         last_activity_at: now,
                         client_to_remote: 0,
                         remote_to_client: 0,
+                        bridge_read_chunks: 0,
+                        bridge_read_bytes: 0,
+                        bridge_to_smoltcp_chunks: 0,
+                        bridge_to_smoltcp_bytes: 0,
                     },
                 );
             }
@@ -695,6 +727,10 @@ fn smoltcp_poll_thread(
                         if let Ok(mut stats) = tcp_stats.write() {
                             if let Some(r) = stats.flows.get_mut(&handle) {
                                 r.remote_to_client = r.remote_to_client.saturating_add(1);
+                                r.bridge_to_smoltcp_chunks =
+                                    r.bridge_to_smoltcp_chunks.saturating_add(1);
+                                r.bridge_to_smoltcp_bytes =
+                                    r.bridge_to_smoltcp_bytes.saturating_add(bytes.len() as u64);
                                 r.last_activity_at = SystemTime::now();
                             }
                         }
@@ -738,6 +774,7 @@ async fn tcp_bridge_task(
     mut from_smoltcp: tokio::sync::mpsc::UnboundedReceiver<Bytes>,
     to_smoltcp: std::sync::mpsc::Sender<Bytes>,
     work: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    tcp_stats: Arc<std::sync::RwLock<TcpStats>>,
     _outbound_tx: mpsc::UnboundedSender<SessionFrame>,
 ) {
     let stream = match TcpStream::connect(dst).await {
@@ -755,6 +792,7 @@ async fn tcp_bridge_task(
     let (mut reader, mut writer) = stream.into_split();
     let to_smoltcp_read = to_smoltcp.clone();
     let work_read = work.clone();
+    let tcp_stats_read = tcp_stats.clone();
 
     // Spawn a separate task to pump data from the real server → smoltcp.
     let read_task = tokio::spawn(async move {
@@ -764,6 +802,16 @@ async fn tcp_bridge_task(
                 Ok(0) => break,
                 Ok(n) => {
                     let bytes = Bytes::copy_from_slice(&buf[..n]);
+                    if let Ok(mut stats) = tcp_stats_read.write() {
+                        if let Some(record) =
+                            stats.flows.values_mut().find(|r| r.conn_id == conn_id)
+                        {
+                            record.bridge_read_chunks = record.bridge_read_chunks.saturating_add(1);
+                            record.bridge_read_bytes =
+                                record.bridge_read_bytes.saturating_add(n as u64);
+                            record.last_activity_at = SystemTime::now();
+                        }
+                    }
                     if to_smoltcp_read.send(bytes).is_err() {
                         break;
                     }
