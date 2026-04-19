@@ -47,6 +47,7 @@ pub struct WebSocketTlsTransport {
 impl NaiveTcpTransport {
     pub async fn connect(address: &str) -> anyhow::Result<Self> {
         let stream = TcpStream::connect(address).await?;
+        stream.set_nodelay(true)?;
         Ok(Self {
             stream,
             read_buf: BytesMut::new(),
@@ -54,6 +55,7 @@ impl NaiveTcpTransport {
     }
 
     pub fn from_stream(stream: TcpStream) -> Self {
+        let _ = stream.set_nodelay(true);
         Self {
             stream,
             read_buf: BytesMut::new(),

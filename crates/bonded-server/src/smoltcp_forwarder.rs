@@ -747,6 +747,9 @@ async fn tcp_bridge_task(
             return;
         }
     };
+    if let Err(err) = stream.set_nodelay(true) {
+        warn!(session_id, %dst, error = %err, "TCP bridge: failed to enable TCP_NODELAY");
+    }
     debug!(session_id, %dst, "TCP bridge: connected");
 
     let (mut reader, mut writer) = stream.into_split();

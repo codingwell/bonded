@@ -1,7 +1,7 @@
 # Implementation Plan — Server, Linux Client, Android Client
 
 **Status:** In Progress
-**Last Updated:** 2026-04-19 (session 35)
+**Last Updated:** 2026-04-19 (session 36)
 
 This is a living document. Update the status column and notes as work progresses.
 
@@ -442,6 +442,7 @@ Decisions made during implementation that aren't in the requirements docs.
 | Android inbound TUN drain now batches writes per cycle (single flush) with larger poll window and shorter idle sleep | 2026-04-18 | Throughput-testing optimization: moved from per-packet flush to per-cycle flush, increased `MAX_POLLED_INBOUND_PER_CYCLE` (32→128), and reduced idle sleep (5ms→1ms) to reduce server→Android bottlenecks |
 | Android inbound JNI batching experiment was reverted; VPN now uses single-packet inbound polling for simplicity | 2026-04-18 | Device tests showed no meaningful throughput gain from batch JNI dequeue in current environment, so the path was removed to keep packet I/O behavior simple and debuggable |
 | Server session loops now pre-drain queued forwarded/TUN response frames before `tokio::select!` blocking | 2026-04-19 | Throughput-debugging slice: avoids one-frame-per-select scheduling bottleneck for bursty server→client traffic in both TCP and WebSocket session loops; capped by `MAX_RESPONSE_DRAIN_PER_CYCLE` for fairness |
+| NaiveTCP transport and smoltcp upstream bridge sockets now enable `TCP_NODELAY` | 2026-04-19 | Throughput/latency debugging slice: disables Nagle coalescing on framed session/control streams to reduce small-frame batching delays under VPN packetized traffic |
 | Android VPN now disallows the app package from tunnel capture and treats `protect(fd)=false` as non-fatal on Android | 2026-04-02 | Prevents startup deadlocks when control-plane sockets would otherwise be captured by the VPN and removes brittle dependency on per-socket protect success |
 | Android launcher icon generation is managed via `flutter_launcher_icons` using workspace-root `icon.png` | 2026-04-03 | Keeps launcher assets reproducible across densities and Android adaptive-icon resources instead of hand-editing mipmap files |
 | Rust-only DNS tunnel diagnostics use an ignored localhost integration test in `bonded-server` that runs real server+client crates and injects synthetic UDP DNS probes | 2026-04-03 | Enables reproducible E2E debugging of server/client forwarding behavior without Android app/device dependencies |
