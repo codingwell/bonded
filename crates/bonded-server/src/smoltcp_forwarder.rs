@@ -489,7 +489,7 @@ fn smoltcp_poll_thread(
             let (lock, cvar) = &*work;
             let guard = lock.lock().expect("work lock should not be poisoned");
             if !*guard {
-                let _ = cvar.wait_timeout(guard, Duration::from_millis(10));
+                let _ = cvar.wait_timeout(guard, Duration::from_millis(1));
             } else {
                 let mut g = guard;
                 *g = false;
