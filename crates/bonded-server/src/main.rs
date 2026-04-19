@@ -65,6 +65,7 @@ use tracing::{error, info, warn, Level};
 use tun_bridge::TunBridge;
 
 type ForwarderRegistry = Arc<RwLock<HashMap<u64, Arc<SmoltcpForwarder>>>>;
+const MAX_RESPONSE_DRAIN_PER_CYCLE: usize = 256;
 
 #[derive(Debug, Parser)]
 #[command(name = "bonded-server")]
@@ -328,6 +329,33 @@ async fn run_websocket_server(
                         .insert(handle.session_id, forwarder.clone());
 
                     loop {
+                        // Drain queued forwarded frames before blocking in select! so bursty
+                        // response traffic is not serialized to one frame per scheduler turn.
+                        for _ in 0..MAX_RESPONSE_DRAIN_PER_CYCLE {
+                            let maybe_forwarded_frame = match forward_rx.try_recv() {
+                                Ok(frame) => Some(frame),
+                                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
+                                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                    break;
+                                }
+                            };
+
+                            let Some(forwarded_frame) = maybe_forwarded_frame else {
+                                break;
+                            };
+
+                            if let Err(err) = transport.send(forwarded_frame).await {
+                                warn!(
+                                    peer = %peer,
+                                    public_key = %public_key,
+                                    session_id = handle.session_id,
+                                    error = %err,
+                                    "failed to return drained websocket forwarded frame"
+                                );
+                                break;
+                            }
+                        }
+
                         tokio::select! {
                             maybe_forwarded_frame = forward_rx.recv() => {
                                 let Some(forwarded_frame) = maybe_forwarded_frame else {
@@ -538,6 +566,60 @@ async fn run_server(
                         bridge.register_session(handle.session_id, tun_tx).await;
                     }
                     loop {
+                        // Drain queued response frames before blocking in select! so bursty
+                        // server->client traffic is not throttled by select scheduling.
+                        for _ in 0..MAX_RESPONSE_DRAIN_PER_CYCLE {
+                            let maybe_tun_frame = match tun_rx.try_recv() {
+                                Ok(frame) => Some(frame),
+                                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
+                                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                    break;
+                                }
+                            };
+
+                            let Some(tun_frame) = maybe_tun_frame else {
+                                break;
+                            };
+
+                            if let Err(err) = transport.send(tun_frame).await {
+                                warn!(
+                                    peer = %peer,
+                                    public_key = %public_key,
+                                    session_id = handle.session_id,
+                                    error = %err,
+                                    "failed to send drained TUN return packet to client"
+                                );
+                                break;
+                            }
+                        }
+
+                        if !use_tun_bridge {
+                            for _ in 0..MAX_RESPONSE_DRAIN_PER_CYCLE {
+                                let maybe_forwarded_frame = match forward_rx.try_recv() {
+                                    Ok(frame) => Some(frame),
+                                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
+                                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                        break;
+                                    }
+                                };
+
+                                let Some(forwarded_frame) = maybe_forwarded_frame else {
+                                    break;
+                                };
+
+                                if let Err(err) = transport.send(forwarded_frame).await {
+                                    warn!(
+                                        peer = %peer,
+                                        public_key = %public_key,
+                                        session_id = handle.session_id,
+                                        error = %err,
+                                        "failed to return drained forwarded frame"
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+
                         tokio::select! {
                             maybe_tun_frame = tun_rx.recv() => {
                                 let Some(tun_frame) = maybe_tun_frame else {

@@ -454,6 +454,47 @@ fn start_android_session(
                                         session_snapshot.inbound_bytes = session_snapshot.inbound_bytes.saturating_add(payload_len);
                                     });
                                 }
+
+                                // Drain all frames already buffered in the transport without
+                                // yielding back to tokio::select!. Each select! iteration has
+                                // scheduler overhead, so processing one frame per iteration
+                                // limits download throughput when the server bursts many frames.
+                                // timeout(ZERO) polls recv() once: if a full frame is already in
+                                // the read buffer it completes immediately; otherwise it times out
+                                // and we yield back to select! for fairness with outbound traffic.
+                                loop {
+                                    match tokio::time::timeout(
+                                        Duration::ZERO,
+                                        transports[active_index].recv(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(next_frame)) => {
+                                            if next_frame.header.flags & FLAG_PONG != 0 {
+                                                continue;
+                                            }
+                                            if !next_frame.payload.is_empty() {
+                                                let payload = next_frame.payload.to_vec();
+                                                let payload_len = payload.len() as u64;
+                                                worker_inbound_queue
+                                                    .lock()
+                                                    .expect("android inbound queue lock poisoned")
+                                                    .push_back(payload);
+                                                update_snapshot(
+                                                    &worker_snapshot,
+                                                    |session_snapshot| {
+                                                        session_snapshot.inbound_packets = session_snapshot.inbound_packets.saturating_add(1);
+                                                        session_snapshot.inbound_bytes = session_snapshot.inbound_bytes.saturating_add(payload_len);
+                                                    },
+                                                );
+                                            }
+                                        }
+                                        // Timeout means no more immediately buffered data —
+                                        // yield back to select!. Any transport error is also
+                                        // left for the next select! recv() arm to handle.
+                                        _ => break,
+                                    }
+                                }
                             }
                             Err(err) => {
                                 eprintln!("[bonded-ffi] Worker: recv on transport[{}] failed: {}", active_index, err);
