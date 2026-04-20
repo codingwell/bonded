@@ -1531,6 +1531,7 @@ fn format_elapsed(now: SystemTime, value: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::net::Ipv4Addr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -1554,7 +1555,7 @@ mod tests {
         payload: Vec<u8>,
     }
 
-    fn build_ipv4_tcp_packet(
+    fn build_ipv4_tcp_packet_with_options(
         src_ip: Ipv4Addr,
         dst_ip: Ipv4Addr,
         src_port: u16,
@@ -1563,9 +1564,15 @@ mod tests {
         ack: u32,
         flags: u8,
         payload: &[u8],
+        tcp_options: &[u8],
     ) -> Vec<u8> {
+        assert_eq!(
+            tcp_options.len() % 4,
+            0,
+            "tcp options must be 32-bit aligned"
+        );
         let ip_hlen = 20usize;
-        let tcp_hlen = 20usize;
+        let tcp_hlen = 20usize + tcp_options.len();
         let total_len = ip_hlen + tcp_hlen + payload.len();
         let mut pkt = vec![0u8; total_len];
 
@@ -1583,10 +1590,13 @@ mod tests {
         tcp[2..4].copy_from_slice(&dst_port.to_be_bytes());
         tcp[4..8].copy_from_slice(&seq.to_be_bytes());
         tcp[8..12].copy_from_slice(&ack.to_be_bytes());
-        tcp[12] = 0x50;
+        tcp[12] = ((tcp_hlen / 4) as u8) << 4;
         tcp[13] = flags;
         tcp[14..16].copy_from_slice(&65535u16.to_be_bytes());
         tcp[18..20].copy_from_slice(&0u16.to_be_bytes());
+        if !tcp_options.is_empty() {
+            tcp[20..20 + tcp_options.len()].copy_from_slice(tcp_options);
+        }
         tcp[tcp_hlen..].copy_from_slice(payload);
 
         let ip_cksum = ipv4_checksum(&pkt[..ip_hlen]);
@@ -1595,6 +1605,29 @@ mod tests {
         pkt[ip_hlen + 16..ip_hlen + 18].copy_from_slice(&tcp_cksum.to_be_bytes());
 
         pkt
+    }
+
+    fn build_ipv4_tcp_packet(
+        src_ip: Ipv4Addr,
+        dst_ip: Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        build_ipv4_tcp_packet_with_options(
+            src_ip,
+            dst_ip,
+            src_port,
+            dst_port,
+            seq,
+            ack,
+            flags,
+            payload,
+            &[],
+        )
     }
 
     fn parse_ipv4_tcp_packet(packet: &[u8]) -> Option<ParsedTcpPacket> {
@@ -1667,6 +1700,66 @@ mod tests {
         timeout(deadline, fut)
             .await
             .expect("timed out waiting for matching TCP packet")
+    }
+
+    async fn recv_payload_bytes(
+        outbound_rx: &mut mpsc::UnboundedReceiver<SessionFrame>,
+        client_ip: Ipv4Addr,
+        client_port: u16,
+        server_ip: Ipv4Addr,
+        server_port: u16,
+        expected_len: usize,
+        deadline: Duration,
+    ) -> (Vec<u8>, u32, u32) {
+        let fut = async {
+            let mut segments: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+            let mut start_seq: Option<u32> = None;
+            loop {
+                let pkt = recv_matching_tcp_packet(
+                    outbound_rx,
+                    client_ip,
+                    client_port,
+                    server_ip,
+                    server_port,
+                    Duration::from_secs(3),
+                )
+                .await;
+                if pkt.payload.is_empty() {
+                    continue;
+                }
+                start_seq = Some(match start_seq {
+                    Some(s) => s.min(pkt.seq),
+                    None => pkt.seq,
+                });
+                segments.entry(pkt.seq).or_insert(pkt.payload);
+
+                let mut out = Vec::with_capacity(expected_len);
+                let mut cursor = start_seq.expect("start sequence should be known");
+                for (&seg_seq, seg_payload) in &segments {
+                    if seg_seq > cursor {
+                        break;
+                    }
+                    let seg_end = seg_seq.wrapping_add(seg_payload.len() as u32);
+                    if seg_end <= cursor {
+                        continue;
+                    }
+                    let offset = cursor.wrapping_sub(seg_seq) as usize;
+                    out.extend_from_slice(&seg_payload[offset..]);
+                    cursor = seg_end;
+                    if out.len() >= expected_len {
+                        out.truncate(expected_len);
+                        return (
+                            out,
+                            start_seq.expect("start sequence should be available"),
+                            pkt.ack,
+                        );
+                    }
+                }
+            }
+        };
+        timeout(deadline, fut)
+            .await
+            .expect("timed out waiting for expected TCP payload bytes")
     }
 
     #[test]
@@ -1767,6 +1860,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn smoltcp_tcp_bridge_packet_by_packet_e2e() {
+        const MTU_TCP_PAYLOAD: usize = 1460;
+
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("test TCP server should bind");
@@ -1775,15 +1870,24 @@ mod tests {
             .expect("listener should have local addr")
             .port();
 
+        let client_payload: Vec<u8> = (0..MTU_TCP_PAYLOAD).map(|i| (i % 251) as u8).collect();
+        let server_payload: Vec<u8> = (0..MTU_TCP_PAYLOAD)
+            .map(|i| 255u8.wrapping_sub((i % 251) as u8))
+            .collect();
+
+        let client_payload_server = client_payload.clone();
+        let server_payload_server = server_payload.clone();
+
         let server_task = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.expect("server should accept");
-            let mut buf = [0u8; 4];
+            let mut buf = vec![0u8; MTU_TCP_PAYLOAD];
             socket
                 .read_exact(&mut buf)
                 .await
                 .expect("server should read client payload");
+            assert_eq!(buf, client_payload_server);
             socket
-                .write_all(b"PONG")
+                .write_all(&server_payload_server)
                 .await
                 .expect("server should write response");
             buf
@@ -1797,7 +1901,8 @@ mod tests {
         let server_ip = Ipv4Addr::LOCALHOST;
 
         let client_isn = 1000u32;
-        let syn = build_ipv4_tcp_packet(
+        // Advertise MSS=1460 so the server can return MTU-scale payload in one segment.
+        let syn = build_ipv4_tcp_packet_with_options(
             client_ip,
             server_ip,
             client_port,
@@ -1806,6 +1911,7 @@ mod tests {
             0,
             TCP_SYN,
             &[],
+            &[2, 4, 0x05, 0xB4],
         );
         forwarder.ingest_packet(SessionFrame {
             header: SessionHeader {
@@ -1857,7 +1963,7 @@ mod tests {
             client_isn.wrapping_add(1),
             server_isn.wrapping_add(1),
             TCP_PSH | TCP_ACK,
-            b"PING",
+            &client_payload,
         );
         forwarder.ingest_packet(SessionFrame {
             header: SessionHeader {
@@ -1868,33 +1974,29 @@ mod tests {
             payload: data.into(),
         });
 
-        let mut pong_packet = None;
-        for _ in 0..16 {
-            let pkt = recv_matching_tcp_packet(
-                &mut outbound_rx,
-                client_ip,
-                client_port,
-                server_ip,
-                server_port,
-                Duration::from_secs(3),
-            )
-            .await;
-            if pkt.payload == b"PONG" {
-                pong_packet = Some(pkt);
-                break;
-            }
-        }
-        let pong_packet = pong_packet.expect("expected outbound TCP payload from server");
-        assert_eq!(pong_packet.flags & TCP_ACK, TCP_ACK);
-        assert_eq!(pong_packet.ack, client_isn.wrapping_add(1 + 4));
+        let (pong_payload, server_data_start_seq, server_data_ack) = recv_payload_bytes(
+            &mut outbound_rx,
+            client_ip,
+            client_port,
+            server_ip,
+            server_port,
+            MTU_TCP_PAYLOAD,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(pong_payload, server_payload);
+        assert_eq!(
+            server_data_ack,
+            client_isn.wrapping_add(1 + MTU_TCP_PAYLOAD as u32)
+        );
 
         let ack_pong = build_ipv4_tcp_packet(
             client_ip,
             server_ip,
             client_port,
             server_port,
-            client_isn.wrapping_add(1 + 4),
-            pong_packet.seq.wrapping_add(4),
+            client_isn.wrapping_add(1 + MTU_TCP_PAYLOAD as u32),
+            server_data_start_seq.wrapping_add(MTU_TCP_PAYLOAD as u32),
             TCP_ACK,
             &[],
         );
@@ -1912,8 +2014,8 @@ mod tests {
             server_ip,
             client_port,
             server_port,
-            client_isn.wrapping_add(1 + 4),
-            pong_packet.seq.wrapping_add(4),
+            client_isn.wrapping_add(1 + MTU_TCP_PAYLOAD as u32),
+            server_data_start_seq.wrapping_add(MTU_TCP_PAYLOAD as u32),
             TCP_FIN | TCP_ACK,
             &[],
         );
@@ -1930,6 +2032,6 @@ mod tests {
             .await
             .expect("server task should complete")
             .expect("server task should not panic");
-        assert_eq!(&server_received, b"PING");
+        assert_eq!(server_received, client_payload);
     }
 }

@@ -1,7 +1,7 @@
 # Implementation Plan — Server, Linux Client, Android Client
 
 **Status:** In Progress
-**Last Updated:** 2026-04-20 (session 38)
+**Last Updated:** 2026-04-20 (session 39)
 
 This is a living document. Update the status column and notes as work progresses.
 
@@ -262,7 +262,7 @@ Build the server binary on top of `bonded-core`.
 | 2.9 | Health check endpoint (HTTP) | completed | Added lightweight HTTP 200 `OK` endpoint on configured `health_bind`, started alongside NaiveTCP listener |
 | 2.10 | Configurable log verbosity | completed | Startup tracing level now maps from server config `log_level` (with `BONDED_LOG_LEVEL` override) |
 | 2.11 | Dockerfile update for new workspace structure | completed | Updated Docker build to target workspace crates, expose app+health ports, and set runtime config/state defaults under `/etc/bonded` and `/var/lib/bonded` |
-| 2.12 | Integration test: server starts, accepts connection, forwards traffic | completed | Added integration coverage at two layers: (1) authenticated NaiveTCP framed payload exchange on a live server stream; (2) packet-by-packet smoltcp TCP bridge e2e in `smoltcp_forwarder` tests that starts a real localhost TCP server, drives synthetic IPv4/TCP handshake + data frames through `SmoltcpForwarder::ingest_packet()`, and asserts bidirectional payload flow (`PING` -> `PONG`) across the bridge |
+| 2.12 | Integration test: server starts, accepts connection, forwards traffic | completed | Added integration coverage at two layers: (1) authenticated NaiveTCP framed payload exchange on a live server stream; (2) packet-by-packet smoltcp TCP bridge e2e in `smoltcp_forwarder` tests that starts a real localhost TCP server, drives synthetic IPv4/TCP handshake + data frames through `SmoltcpForwarder::ingest_packet()`, and asserts bidirectional payload flow. Session 39 extends this e2e to MTU-scale payload transfer (1460-byte TCP payload each direction) with SYN MSS option advertisement and sequence-based response reassembly so large-packet behavior remains deterministic under segment reordering/duplication. |
 | 2.13 | Rust-only localhost E2E DNS diagnostic harness | completed | Added ignored/manual `bonded-server` integration test that boots `run_server` on localhost, connects using `bonded-client::establish_naive_tcp_session`, injects synthetic IPv4 UDP DNS query packet to `8.8.8.8:53`, and asserts/prints response-path diagnostics |
 | 2.14 | Rust-only localhost E2E HTTP diagnostic harness | completed | Added ignored/manual `bonded-server` integration test that boots `run_server` on localhost, resolves `example.com`, drives synthetic IPv4 TCP handshake + HTTP GET over packet relay, and asserts a valid HTTP status line in returned payload |
 | 2.15 | Rust-only localhost E2E SMTP diagnostic harness | completed | Added ignored/manual `bonded-server` integration test that boots `run_server` on localhost, resolves `smtp.gmail.com:587`, drives synthetic IPv4 TCP handshake, sends SMTP `EHLO` and `QUIT`, and asserts SMTP reply codes in returned payload |
