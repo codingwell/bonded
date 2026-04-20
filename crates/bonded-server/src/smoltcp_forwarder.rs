@@ -1527,3 +1527,409 @@ fn format_elapsed(now: SystemTime, value: SystemTime) -> String {
         Err(_) => "just now".to_owned(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::mpsc;
+    use tokio::time::{timeout, Duration};
+
+    const TCP_FIN: u8 = 0x01;
+    const TCP_SYN: u8 = 0x02;
+    const TCP_ACK: u8 = 0x10;
+    const TCP_PSH: u8 = 0x08;
+
+    #[derive(Debug)]
+    struct ParsedTcpPacket {
+        src_ip: Ipv4Addr,
+        dst_ip: Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        payload: Vec<u8>,
+    }
+
+    fn build_ipv4_tcp_packet(
+        src_ip: Ipv4Addr,
+        dst_ip: Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let ip_hlen = 20usize;
+        let tcp_hlen = 20usize;
+        let total_len = ip_hlen + tcp_hlen + payload.len();
+        let mut pkt = vec![0u8; total_len];
+
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+        pkt[4..6].copy_from_slice(&0x4321u16.to_be_bytes());
+        pkt[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 6;
+        pkt[12..16].copy_from_slice(&src_ip.octets());
+        pkt[16..20].copy_from_slice(&dst_ip.octets());
+
+        let tcp = &mut pkt[ip_hlen..];
+        tcp[0..2].copy_from_slice(&src_port.to_be_bytes());
+        tcp[2..4].copy_from_slice(&dst_port.to_be_bytes());
+        tcp[4..8].copy_from_slice(&seq.to_be_bytes());
+        tcp[8..12].copy_from_slice(&ack.to_be_bytes());
+        tcp[12] = 0x50;
+        tcp[13] = flags;
+        tcp[14..16].copy_from_slice(&65535u16.to_be_bytes());
+        tcp[18..20].copy_from_slice(&0u16.to_be_bytes());
+        tcp[tcp_hlen..].copy_from_slice(payload);
+
+        let ip_cksum = ipv4_checksum(&pkt[..ip_hlen]);
+        pkt[10..12].copy_from_slice(&ip_cksum.to_be_bytes());
+        let tcp_cksum = tcp_udp_checksum_ipv4(src_ip, dst_ip, 6, &pkt[ip_hlen..]);
+        pkt[ip_hlen + 16..ip_hlen + 18].copy_from_slice(&tcp_cksum.to_be_bytes());
+
+        pkt
+    }
+
+    fn parse_ipv4_tcp_packet(packet: &[u8]) -> Option<ParsedTcpPacket> {
+        if packet.len() < 40 || packet[0] >> 4 != 4 || packet[9] != 6 {
+            return None;
+        }
+        let ihl = (packet[0] & 0x0f) as usize;
+        if ihl < 5 {
+            return None;
+        }
+        let ip_hlen = ihl * 4;
+        if packet.len() < ip_hlen + 20 {
+            return None;
+        }
+        let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+        if total_len < ip_hlen + 20 || total_len > packet.len() {
+            return None;
+        }
+
+        let src_ip = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+        let dst_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+        let tcp = &packet[ip_hlen..total_len];
+        let data_offset_words = (tcp[12] >> 4) as usize;
+        if data_offset_words < 5 {
+            return None;
+        }
+        let tcp_hlen = data_offset_words * 4;
+        if tcp.len() < tcp_hlen {
+            return None;
+        }
+
+        Some(ParsedTcpPacket {
+            src_ip,
+            dst_ip,
+            src_port: u16::from_be_bytes([tcp[0], tcp[1]]),
+            dst_port: u16::from_be_bytes([tcp[2], tcp[3]]),
+            seq: u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]),
+            ack: u32::from_be_bytes([tcp[8], tcp[9], tcp[10], tcp[11]]),
+            flags: tcp[13],
+            payload: tcp[tcp_hlen..].to_vec(),
+        })
+    }
+
+    async fn recv_matching_tcp_packet(
+        outbound_rx: &mut mpsc::UnboundedReceiver<SessionFrame>,
+        client_ip: Ipv4Addr,
+        client_port: u16,
+        server_ip: Ipv4Addr,
+        server_port: u16,
+        deadline: Duration,
+    ) -> ParsedTcpPacket {
+        let fut = async {
+            loop {
+                let frame = outbound_rx
+                    .recv()
+                    .await
+                    .expect("outbound channel should stay open");
+                let Some(pkt) = parse_ipv4_tcp_packet(&frame.payload) else {
+                    continue;
+                };
+                if pkt.src_ip == server_ip
+                    && pkt.dst_ip == client_ip
+                    && pkt.src_port == server_port
+                    && pkt.dst_port == client_port
+                {
+                    return pkt;
+                }
+            }
+        };
+        timeout(deadline, fut)
+            .await
+            .expect("timed out waiting for matching TCP packet")
+    }
+
+    #[test]
+    fn parse_ipv4_udp_packet_accepts_valid_packet() {
+        let src_ip = Ipv4Addr::new(1, 1, 1, 1);
+        let dst_ip = Ipv4Addr::new(2, 2, 2, 2);
+        let packet = build_ipv4_udp_packet(src_ip, dst_ip, 1234, 53, 0x1234, b"hello").unwrap();
+
+        let parsed = parse_ipv4_udp_packet(&packet).expect("packet should parse");
+        assert_eq!(parsed.src_ip, src_ip);
+        assert_eq!(parsed.dst_ip, dst_ip);
+        assert_eq!(parsed.src_port, 1234);
+        assert_eq!(parsed.dst_port, 53);
+        assert_eq!(parsed.identification, 0x1234);
+        assert_eq!(parsed.payload, b"hello");
+    }
+
+    #[test]
+    fn rewrite_dst_ip_inbound_rewrites_ipv4_destination_and_fix_checksum() {
+        let src_ip = Ipv4Addr::new(1, 2, 3, 4);
+        let dst_ip = Ipv4Addr::new(5, 6, 7, 8);
+        let mut pkt = vec![0u8; 40];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&(40u16).to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 6;
+        pkt[12..16].copy_from_slice(&src_ip.octets());
+        pkt[16..20].copy_from_slice(&dst_ip.octets());
+        let ip_cksum = ipv4_checksum(&pkt[..20]);
+        pkt[10..12].copy_from_slice(&ip_cksum.to_be_bytes());
+
+        let rewritten = rewrite_dst_ip_inbound(&pkt).expect("rewrite should succeed");
+        assert_eq!(&rewritten[16..20], &SMOLTCP_IP_ARRAY);
+
+        let mut header = rewritten[..20].to_vec();
+        header[10..12].copy_from_slice(&[0, 0]);
+        assert_eq!(
+            u16::from_be_bytes([rewritten[10], rewritten[11]]),
+            ipv4_checksum(&header)
+        );
+    }
+
+    #[test]
+    fn rewrite_src_ip_outbound_recomputes_ip_and_udp_checksum() {
+        let smoltcp_src = Ipv4Addr::new(
+            SMOLTCP_IP_ARRAY[0],
+            SMOLTCP_IP_ARRAY[1],
+            SMOLTCP_IP_ARRAY[2],
+            SMOLTCP_IP_ARRAY[3],
+        );
+        let client_ip = Ipv4Addr::new(1, 2, 3, 4);
+        let original_src = Ipv4Addr::new(5, 6, 7, 8);
+        let mut packet =
+            build_ipv4_udp_packet(smoltcp_src, client_ip, 1234, 4321, 0x2222, b"payload").unwrap();
+
+        rewrite_src_ip_outbound(&mut packet, original_src);
+        assert_eq!(
+            Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]),
+            original_src
+        );
+
+        let mut header = packet[..20].to_vec();
+        header[10..12].copy_from_slice(&[0, 0]);
+        assert_eq!(
+            u16::from_be_bytes([packet[10], packet[11]]),
+            ipv4_checksum(&header)
+        );
+
+        let mut transport = packet[20..].to_vec();
+        transport[6..8].copy_from_slice(&[0, 0]);
+        assert_eq!(
+            u16::from_be_bytes([packet[26], packet[27]]),
+            tcp_udp_checksum_ipv4(original_src, client_ip, 17, &transport)
+        );
+    }
+
+    #[test]
+    fn parse_tcp_header_extracts_syn_flag() {
+        let mut pkt = vec![0u8; 40];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&(40u16).to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 6;
+        pkt[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        pkt[16..20].copy_from_slice(&[93, 184, 216, 34]);
+        pkt[20..22].copy_from_slice(&12345u16.to_be_bytes());
+        pkt[22..24].copy_from_slice(&80u16.to_be_bytes());
+        pkt[32] = 0x50; // data offset 5
+        pkt[33] = 0x02; // SYN set, ACK clear
+
+        let parsed = parse_tcp_header(&pkt).expect("tcp header should parse");
+        assert_eq!(parsed.0, Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(parsed.1, 12345);
+        assert_eq!(parsed.2, Ipv4Addr::new(93, 184, 216, 34));
+        assert_eq!(parsed.3, 80);
+        assert!(parsed.4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn smoltcp_tcp_bridge_packet_by_packet_e2e() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("test TCP server should bind");
+        let server_port = listener
+            .local_addr()
+            .expect("listener should have local addr")
+            .port();
+
+        let server_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("server should accept");
+            let mut buf = [0u8; 4];
+            socket
+                .read_exact(&mut buf)
+                .await
+                .expect("server should read client payload");
+            socket
+                .write_all(b"PONG")
+                .await
+                .expect("server should write response");
+            buf
+        });
+
+        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<SessionFrame>();
+        let forwarder = SmoltcpForwarder::new(42, outbound_tx);
+
+        let client_ip = Ipv4Addr::new(10, 8, 0, 2);
+        let client_port = 40000u16;
+        let server_ip = Ipv4Addr::LOCALHOST;
+
+        let client_isn = 1000u32;
+        let syn = build_ipv4_tcp_packet(
+            client_ip,
+            server_ip,
+            client_port,
+            server_port,
+            client_isn,
+            0,
+            TCP_SYN,
+            &[],
+        );
+        forwarder.ingest_packet(SessionFrame {
+            header: SessionHeader {
+                connection_id: 1,
+                sequence: 1,
+                flags: 0,
+            },
+            payload: syn.into(),
+        });
+
+        let syn_ack = recv_matching_tcp_packet(
+            &mut outbound_rx,
+            client_ip,
+            client_port,
+            server_ip,
+            server_port,
+            Duration::from_secs(3),
+        )
+        .await;
+        assert_eq!(syn_ack.flags & (TCP_SYN | TCP_ACK), TCP_SYN | TCP_ACK);
+        assert_eq!(syn_ack.ack, client_isn.wrapping_add(1));
+
+        let server_isn = syn_ack.seq;
+
+        let ack = build_ipv4_tcp_packet(
+            client_ip,
+            server_ip,
+            client_port,
+            server_port,
+            client_isn.wrapping_add(1),
+            server_isn.wrapping_add(1),
+            TCP_ACK,
+            &[],
+        );
+        forwarder.ingest_packet(SessionFrame {
+            header: SessionHeader {
+                connection_id: 1,
+                sequence: 2,
+                flags: 0,
+            },
+            payload: ack.into(),
+        });
+
+        let data = build_ipv4_tcp_packet(
+            client_ip,
+            server_ip,
+            client_port,
+            server_port,
+            client_isn.wrapping_add(1),
+            server_isn.wrapping_add(1),
+            TCP_PSH | TCP_ACK,
+            b"PING",
+        );
+        forwarder.ingest_packet(SessionFrame {
+            header: SessionHeader {
+                connection_id: 1,
+                sequence: 3,
+                flags: 0,
+            },
+            payload: data.into(),
+        });
+
+        let mut pong_packet = None;
+        for _ in 0..16 {
+            let pkt = recv_matching_tcp_packet(
+                &mut outbound_rx,
+                client_ip,
+                client_port,
+                server_ip,
+                server_port,
+                Duration::from_secs(3),
+            )
+            .await;
+            if pkt.payload == b"PONG" {
+                pong_packet = Some(pkt);
+                break;
+            }
+        }
+        let pong_packet = pong_packet.expect("expected outbound TCP payload from server");
+        assert_eq!(pong_packet.flags & TCP_ACK, TCP_ACK);
+        assert_eq!(pong_packet.ack, client_isn.wrapping_add(1 + 4));
+
+        let ack_pong = build_ipv4_tcp_packet(
+            client_ip,
+            server_ip,
+            client_port,
+            server_port,
+            client_isn.wrapping_add(1 + 4),
+            pong_packet.seq.wrapping_add(4),
+            TCP_ACK,
+            &[],
+        );
+        forwarder.ingest_packet(SessionFrame {
+            header: SessionHeader {
+                connection_id: 1,
+                sequence: 4,
+                flags: 0,
+            },
+            payload: ack_pong.into(),
+        });
+
+        let fin = build_ipv4_tcp_packet(
+            client_ip,
+            server_ip,
+            client_port,
+            server_port,
+            client_isn.wrapping_add(1 + 4),
+            pong_packet.seq.wrapping_add(4),
+            TCP_FIN | TCP_ACK,
+            &[],
+        );
+        forwarder.ingest_packet(SessionFrame {
+            header: SessionHeader {
+                connection_id: 1,
+                sequence: 5,
+                flags: 0,
+            },
+            payload: fin.into(),
+        });
+
+        let server_received = timeout(Duration::from_secs(3), server_task)
+            .await
+            .expect("server task should complete")
+            .expect("server task should not panic");
+        assert_eq!(&server_received, b"PING");
+    }
+}
