@@ -11,6 +11,7 @@ mod session_registry;
 mod smoltcp_forwarder;
 mod status;
 mod tun_bridge;
+mod tunnel_pcap;
 
 #[cfg(test)]
 mod server_integration;
@@ -63,9 +64,11 @@ use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, warn, Level};
 use tun_bridge::TunBridge;
+use tunnel_pcap::TunnelPcapLogger;
 
 type ForwarderRegistry = Arc<RwLock<HashMap<u64, Arc<SmoltcpForwarder>>>>;
 const MAX_RESPONSE_DRAIN_PER_CYCLE: usize = 256;
+const TUNNEL_PCAP_MAX_MB_ENV: &str = "BONDED_TUNNEL_PCAP_MAX_MB";
 
 #[derive(Debug, Parser)]
 #[command(name = "bonded-server")]
@@ -91,6 +94,7 @@ async fn main() -> anyhow::Result<()> {
 
     apply_env_overrides(&mut cfg, |key| std::env::var(key).ok());
     init_tracing_from_level(&cfg.server.log_level);
+    let tunnel_pcap = TunnelPcapLogger::from_env(TUNNEL_PCAP_MAX_MB_ENV)?;
     ensure_server_state_files(&cfg)?;
     let mut network_runtime = match NetworkRuntime::setup(&cfg.server) {
         Ok(runtime) => runtime,
@@ -169,6 +173,7 @@ async fn main() -> anyhow::Result<()> {
     let websocket_sessions = sessions.clone();
     let websocket_forwarders = forwarders.clone();
     let websocket_keys = authorized_keys.clone();
+    let websocket_tunnel_pcap = tunnel_pcap.clone();
     let websocket_tls_acceptor = load_websocket_tls_acceptor(
         &cfg.server.websocket_tls_cert_file,
         &cfg.server.websocket_tls_key_file,
@@ -183,6 +188,7 @@ async fn main() -> anyhow::Result<()> {
                 websocket_sessions,
                 websocket_forwarders,
                 websocket_tls_acceptor,
+                websocket_tunnel_pcap,
             )
             .await
             {
@@ -202,6 +208,7 @@ async fn main() -> anyhow::Result<()> {
             sessions,
             forwarders,
             tun_bridge,
+            tunnel_pcap,
         ) => result,
         signal_result = signal::ctrl_c() => {
             match signal_result {
@@ -257,6 +264,7 @@ async fn run_websocket_server(
     sessions: SessionRegistry,
     forwarders: ForwarderRegistry,
     tls_acceptor: Option<TlsAcceptor>,
+    tunnel_pcap: Option<Arc<TunnelPcapLogger>>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(bind).await?;
     info!(bind = %bind, "websocket listener bound");
@@ -275,6 +283,7 @@ async fn run_websocket_server(
         let forwarders = forwarders.clone();
         let invite_tokens_file = invite_tokens_file.to_owned();
         let tls_acceptor = tls_acceptor.clone();
+        let tunnel_pcap = tunnel_pcap.clone();
         tokio::spawn(async move {
             let mut transport = match tls_acceptor {
                 Some(acceptor) => {
@@ -344,6 +353,7 @@ async fn run_websocket_server(
                                 break;
                             };
 
+                            maybe_log_tunnel_packet(&tunnel_pcap, &forwarded_frame.payload);
                             if let Err(err) = transport.send(forwarded_frame).await {
                                 warn!(
                                     peer = %peer,
@@ -368,6 +378,7 @@ async fn run_websocket_server(
                                     break;
                                 };
 
+                                maybe_log_tunnel_packet(&tunnel_pcap, &forwarded_frame.payload);
                                 if let Err(err) = transport.send(forwarded_frame).await {
                                     warn!(
                                         peer = %peer,
@@ -382,6 +393,7 @@ async fn run_websocket_server(
                             recv_result = transport.recv() => {
                                 match recv_result {
                                     Ok(frame) => {
+                                        maybe_log_tunnel_packet(&tunnel_pcap, &frame.payload);
                                         // Respond to heartbeat pings without forwarding them.
                                         // Only treat ping-bit frames as control heartbeats when
                                         // they carry no payload; otherwise keep forwarding.
@@ -506,6 +518,7 @@ async fn run_server(
     sessions: SessionRegistry,
     forwarders: ForwarderRegistry,
     tun_bridge: Option<TunBridge>,
+    tunnel_pcap: Option<Arc<TunnelPcapLogger>>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(bind).await?;
     info!(bind = %bind, "naive tcp listener bound");
@@ -523,6 +536,7 @@ async fn run_server(
         let sessions = sessions.clone();
         let forwarders = forwarders.clone();
         let tun_bridge = tun_bridge.clone();
+        let tunnel_pcap = tunnel_pcap.clone();
         let invite_tokens_file = invite_tokens_file.to_owned();
         tokio::spawn(async move {
             match perform_auth_handshake(
@@ -581,6 +595,7 @@ async fn run_server(
                                 break;
                             };
 
+                            maybe_log_tunnel_packet(&tunnel_pcap, &tun_frame.payload);
                             if let Err(err) = transport.send(tun_frame).await {
                                 warn!(
                                     peer = %peer,
@@ -607,6 +622,7 @@ async fn run_server(
                                     break;
                                 };
 
+                                maybe_log_tunnel_packet(&tunnel_pcap, &forwarded_frame.payload);
                                 if let Err(err) = transport.send(forwarded_frame).await {
                                     warn!(
                                         peer = %peer,
@@ -626,6 +642,7 @@ async fn run_server(
                                     break;
                                 };
 
+                                maybe_log_tunnel_packet(&tunnel_pcap, &tun_frame.payload);
                                 if let Err(err) = transport.send(tun_frame).await {
                                     warn!(
                                         peer = %peer,
@@ -651,6 +668,7 @@ async fn run_server(
                                     break;
                                 };
 
+                                maybe_log_tunnel_packet(&tunnel_pcap, &forwarded_frame.payload);
                                 if let Err(err) = transport.send(forwarded_frame).await {
                                     warn!(
                                         peer = %peer,
@@ -665,6 +683,7 @@ async fn run_server(
                             recv_result = transport.recv() => {
                                 match recv_result {
                                     Ok(frame) => {
+                                        maybe_log_tunnel_packet(&tunnel_pcap, &frame.payload);
                                         // Respond to heartbeat pings without forwarding them.
                                         // Only treat ping-bit frames as control heartbeats when
                                         // they carry no payload; otherwise keep forwarding.
@@ -754,6 +773,15 @@ async fn run_server(
                 }
             }
         });
+    }
+}
+
+fn maybe_log_tunnel_packet(tunnel_pcap: &Option<Arc<TunnelPcapLogger>>, payload: &[u8]) {
+    if payload.is_empty() {
+        return;
+    }
+    if let Some(writer) = tunnel_pcap {
+        writer.log_packet(payload);
     }
 }
 
