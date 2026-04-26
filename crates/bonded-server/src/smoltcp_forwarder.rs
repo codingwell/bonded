@@ -42,7 +42,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Mutex as TokioMutex};
 use tokio::time::{timeout, Instant};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -482,6 +482,10 @@ fn smoltcp_poll_thread(
 
     let mut next_conn_id: u32 = 1;
     let mut global_seq: u64 = 0;
+    let mut inbound_tcp_rst_total: u64 = 0;
+    let mut outbound_tcp_rst_total: u64 = 0;
+    let mut outbound_tcp_rst_unmatched_total: u64 = 0;
+    let mut ambiguous_tcp_tuple_drop_total: u64 = 0;
 
     loop {
         // ── Wait for work or 10 ms TCP-timer tick ────────────────────────────
@@ -500,6 +504,20 @@ fn smoltcp_poll_thread(
         loop {
             match cmd_rx.try_recv() {
                 Ok(PollCommand::InjectPacket(pkt)) => {
+                    if let Some((src_ip, src_port, dst_ip, dst_port, flags)) =
+                        parse_ipv4_tcp_tuple_flags(&pkt)
+                    {
+                        if flags & 0x04 != 0 {
+                            inbound_tcp_rst_total = inbound_tcp_rst_total.saturating_add(1);
+                            debug!(
+                                session_id,
+                                src = %format!("{}:{}", src_ip, src_port),
+                                dst = %format!("{}:{}", dst_ip, dst_port),
+                                inbound_tcp_rst_total,
+                                "smoltcp forwarder observed inbound TCP RST"
+                            );
+                        }
+                    }
                     device.rx.push_back(pkt);
                 }
                 Ok(PollCommand::CreateTcpSocket {
@@ -543,8 +561,13 @@ fn smoltcp_poll_thread(
                 if pkt.len() < 20 || pkt[0] >> 4 != 4 {
                     continue;
                 }
+                let maybe_tcp_tuple_flags = parse_ipv4_tcp_tuple_flags(&pkt);
                 let smoltcp_dst_ip = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
-                let smoltcp_src_port_at = 20u16; // TCP/UDP src port offset in transport header
+                let smoltcp_src_port = if pkt.len() >= 22 {
+                    u16::from_be_bytes([pkt[20], pkt[21]])
+                } else {
+                    continue;
+                };
                 let smoltcp_dst_port = if pkt.len() >= 24 {
                     u16::from_be_bytes([pkt[22], pkt[23]])
                 } else {
@@ -553,41 +576,116 @@ fn smoltcp_poll_thread(
 
                 // Find the original dst IP: match active conn by (dst_ip=client, dst_port=client_src_port, src_port=conn_port)
                 // smoltcp emits: src=SMOLTCP_IP:listen_port, dst=client_src_ip:client_src_port
-                let original_src_ip = active.values().find_map(|c| {
+                let mut original_src_ip = None;
+                let mut active_tuple_ambiguous = false;
+                for c in active.values() {
                     if c.client_src_ip == smoltcp_dst_ip
                         && c.client_src_port == smoltcp_dst_port
-                        && c.dst_port
-                            == u16::from_be_bytes([
-                                pkt[smoltcp_src_port_at as usize],
-                                pkt[smoltcp_src_port_at as usize + 1],
-                            ])
+                        && c.dst_port == smoltcp_src_port
                     {
-                        Some(c.original_dst_ip)
-                    } else {
-                        None
+                        match original_src_ip {
+                            None => original_src_ip = Some(c.original_dst_ip),
+                            Some(existing) if existing == c.original_dst_ip => {}
+                            Some(_) => {
+                                active_tuple_ambiguous = true;
+                                break;
+                            }
+                        }
                     }
-                });
+                }
+
+                if active_tuple_ambiguous {
+                    ambiguous_tcp_tuple_drop_total = ambiguous_tcp_tuple_drop_total.saturating_add(1);
+                    if ambiguous_tcp_tuple_drop_total <= 10
+                        || ambiguous_tcp_tuple_drop_total % 100 == 0
+                    {
+                        warn!(
+                            session_id,
+                            client_ip = %smoltcp_dst_ip,
+                            client_port = smoltcp_dst_port,
+                            server_port = smoltcp_src_port,
+                            ambiguous_tcp_tuple_drop_total,
+                            "dropping outbound packet for ambiguous active TCP tuple (possible cross-flow mix risk)"
+                        );
+                    }
+                    continue;
+                }
 
                 let Some(original_src) = original_src_ip else {
                     // Could not find matching connection (e.g. SYN-ACK before
                     // we moved to active).  Look in pending too.
-                    let original_src_pending = pending.iter().find_map(|p| {
+                    let mut original_src_pending = None;
+                    let mut pending_tuple_ambiguous = false;
+                    for p in &pending {
                         if p.client_src_ip == smoltcp_dst_ip
                             && p.client_src_port == smoltcp_dst_port
-                            && p.dst_port
-                                == u16::from_be_bytes([
-                                    pkt[smoltcp_src_port_at as usize],
-                                    pkt[smoltcp_src_port_at as usize + 1],
-                                ])
+                            && p.dst_port == smoltcp_src_port
                         {
-                            Some(p.original_dst_ip)
-                        } else {
-                            None
+                            match original_src_pending {
+                                None => original_src_pending = Some(p.original_dst_ip),
+                                Some(existing) if existing == p.original_dst_ip => {}
+                                Some(_) => {
+                                    pending_tuple_ambiguous = true;
+                                    break;
+                                }
+                            }
                         }
-                    });
+                    }
+
+                    if pending_tuple_ambiguous {
+                        ambiguous_tcp_tuple_drop_total =
+                            ambiguous_tcp_tuple_drop_total.saturating_add(1);
+                        if ambiguous_tcp_tuple_drop_total <= 10
+                            || ambiguous_tcp_tuple_drop_total % 100 == 0
+                        {
+                            warn!(
+                                session_id,
+                                client_ip = %smoltcp_dst_ip,
+                                client_port = smoltcp_dst_port,
+                                server_port = smoltcp_src_port,
+                                ambiguous_tcp_tuple_drop_total,
+                                "dropping outbound packet for ambiguous pending TCP tuple (possible cross-flow mix risk)"
+                            );
+                        }
+                        continue;
+                    }
+
                     let Some(original_src) = original_src_pending else {
+                        if let Some((src_ip, src_port, dst_ip, dst_port, flags)) =
+                            maybe_tcp_tuple_flags
+                        {
+                            if flags & 0x04 != 0 {
+                                outbound_tcp_rst_total = outbound_tcp_rst_total.saturating_add(1);
+                                outbound_tcp_rst_unmatched_total =
+                                    outbound_tcp_rst_unmatched_total.saturating_add(1);
+                                if outbound_tcp_rst_unmatched_total <= 10
+                                    || outbound_tcp_rst_unmatched_total % 100 == 0
+                                {
+                                    warn!(
+                                        session_id,
+                                        src = %format!("{}:{}", src_ip, src_port),
+                                        dst = %format!("{}:{}", dst_ip, dst_port),
+                                        outbound_tcp_rst_total,
+                                        outbound_tcp_rst_unmatched_total,
+                                        "dropping outbound TCP RST with no flow mapping"
+                                    );
+                                }
+                            }
+                        }
                         continue;
                     };
+                    if let Some((src_ip, src_port, dst_ip, dst_port, flags)) = maybe_tcp_tuple_flags {
+                        if flags & 0x04 != 0 {
+                            outbound_tcp_rst_total = outbound_tcp_rst_total.saturating_add(1);
+                            debug!(
+                                session_id,
+                                src = %format!("{}:{}", src_ip, src_port),
+                                dst = %format!("{}:{}", dst_ip, dst_port),
+                                outbound_tcp_rst_total,
+                                "smoltcp forwarder emitted outbound TCP RST (pending flow mapping)"
+                            );
+                        }
+                    }
                     rewrite_src_ip_outbound(&mut pkt, original_src);
                     let frame = SessionFrame {
                         header: SessionHeader {
@@ -601,6 +699,19 @@ fn smoltcp_poll_thread(
                     let _ = outbound_tx.send(frame);
                     continue;
                 };
+
+                if let Some((src_ip, src_port, dst_ip, dst_port, flags)) = maybe_tcp_tuple_flags {
+                    if flags & 0x04 != 0 {
+                        outbound_tcp_rst_total = outbound_tcp_rst_total.saturating_add(1);
+                        debug!(
+                            session_id,
+                            src = %format!("{}:{}", src_ip, src_port),
+                            dst = %format!("{}:{}", dst_ip, dst_port),
+                            outbound_tcp_rst_total,
+                            "smoltcp forwarder emitted outbound TCP RST"
+                        );
+                    }
+                }
 
                 rewrite_src_ip_outbound(&mut pkt, original_src);
                 let frame = SessionFrame {
@@ -630,6 +741,26 @@ fn smoltcp_poll_thread(
 
         for &idx in newly_established.iter().rev() {
             let p = pending.remove(idx);
+
+            let tuple_conflict = active.values().any(|c| {
+                c.client_src_ip == p.client_src_ip
+                    && c.client_src_port == p.client_src_port
+                    && c.dst_port == p.dst_port
+                    && c.original_dst_ip != p.original_dst_ip
+            });
+            if tuple_conflict {
+                ambiguous_tcp_tuple_drop_total = ambiguous_tcp_tuple_drop_total.saturating_add(1);
+                warn!(
+                    session_id,
+                    client = %format!("{}:{}", p.client_src_ip, p.client_src_port),
+                    remote = %format!("{}:{}", p.original_dst_ip, p.dst_port),
+                    ambiguous_tcp_tuple_drop_total,
+                    "rejecting newly established ambiguous TCP tuple to avoid cross-flow data mix"
+                );
+                sockets.remove(p.handle);
+                promoted.remove(&p.handle);
+                continue;
+            }
             promoted.insert(p.handle);
 
             let (to_bridge_tx, to_bridge_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
@@ -760,6 +891,18 @@ fn smoltcp_poll_thread(
 
         // Clean up promoted handles that are no longer in pending.
         promoted.retain(|h| active.contains_key(h));
+
+        if (inbound_tcp_rst_total != 0 || outbound_tcp_rst_total != 0)
+            && (inbound_tcp_rst_total + outbound_tcp_rst_total) % 500 == 0
+        {
+            info!(
+                session_id,
+                inbound_tcp_rst_total,
+                outbound_tcp_rst_total,
+                outbound_tcp_rst_unmatched_total,
+                "smoltcp TCP RST summary"
+            );
+        }
     }
 }
 
@@ -960,6 +1103,28 @@ fn parse_tcp_header(packet: &[u8]) -> Option<(Ipv4Addr, u16, Ipv4Addr, u16, bool
     let flags = tcp[13];
     let is_syn = flags & 0x02 != 0 && flags & 0x10 == 0; // SYN set, ACK clear
     Some((src_ip, src_port, dst_ip, dst_port, is_syn))
+}
+
+fn parse_ipv4_tcp_tuple_flags(packet: &[u8]) -> Option<(Ipv4Addr, u16, Ipv4Addr, u16, u8)> {
+    if packet.len() < 40 {
+        return None;
+    }
+    let version = packet[0] >> 4;
+    let ihl = (packet[0] & 0x0f) as usize;
+    if version != 4 || ihl < 5 || packet[9] != 6 {
+        return None;
+    }
+    let ihl_bytes = ihl * 4;
+    if packet.len() < ihl_bytes + 20 {
+        return None;
+    }
+    let src_ip = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+    let dst_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+    let tcp = &packet[ihl_bytes..];
+    let src_port = u16::from_be_bytes([tcp[0], tcp[1]]);
+    let dst_port = u16::from_be_bytes([tcp[2], tcp[3]]);
+    let flags = tcp[13];
+    Some((src_ip, src_port, dst_ip, dst_port, flags))
 }
 
 // ── UDP handling (direct OS sockets, same pattern as original frame_forwarder) ─
