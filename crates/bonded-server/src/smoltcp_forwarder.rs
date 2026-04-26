@@ -34,9 +34,12 @@ use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::{create_dir_all, File};
+use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddrV4};
+use std::path::Path;
 use std::rc::Rc;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -54,6 +57,171 @@ const SMOLTCP_GW: Ipv4Address = Ipv4Address([10, 200, 0, 2]);
 const MTU: usize = 1500;
 const TCP_SOCKET_RX_BUF: usize = 65536;
 const TCP_SOCKET_TX_BUF: usize = 65536;
+const TCP_BRIDGE_DUMP_MAX_MB_ENV: &str = "BONDED_TCP_BRIDGE_DUMP_MAX_MB";
+const TCP_BRIDGE_DUMP_PATH: &str = "/var/lib/bonded/tcp_bridge_dump.bin";
+
+#[repr(u8)]
+enum TcpBridgeDumpDirection {
+    SmoltcpToRemote = 1,
+    RemoteToSmoltcp = 2,
+}
+
+struct TcpBridgeDumpWriter {
+    inner: Mutex<TcpBridgeDumpInner>,
+}
+
+struct TcpBridgeDumpInner {
+    file: File,
+    bytes_written: u64,
+    max_bytes: u64,
+    stopped_at_limit: bool,
+}
+
+impl TcpBridgeDumpWriter {
+    fn from_env() -> Option<Arc<Self>> {
+        let raw = match std::env::var(TCP_BRIDGE_DUMP_MAX_MB_ENV) {
+            Ok(v) => v,
+            Err(_) => return None,
+        };
+
+        let max_mb = match raw.trim().parse::<u64>() {
+            Ok(v) if v > 0 => v,
+            Ok(_) => {
+                warn!(
+                    env = %TCP_BRIDGE_DUMP_MAX_MB_ENV,
+                    value = %raw,
+                    "tcp bridge dump disabled: value must be > 0"
+                );
+                return None;
+            }
+            Err(err) => {
+                warn!(
+                    env = %TCP_BRIDGE_DUMP_MAX_MB_ENV,
+                    value = %raw,
+                    error = %err,
+                    "tcp bridge dump disabled: failed to parse max MB"
+                );
+                return None;
+            }
+        };
+
+        let max_bytes = match max_mb.checked_mul(1024 * 1024) {
+            Some(v) => v,
+            None => {
+                warn!(
+                    env = %TCP_BRIDGE_DUMP_MAX_MB_ENV,
+                    value = max_mb,
+                    "tcp bridge dump disabled: max size overflow"
+                );
+                return None;
+            }
+        };
+
+        if let Some(parent) = Path::new(TCP_BRIDGE_DUMP_PATH).parent() {
+            if let Err(err) = create_dir_all(parent) {
+                warn!(
+                    path = %TCP_BRIDGE_DUMP_PATH,
+                    error = %err,
+                    "tcp bridge dump disabled: failed to create parent directory"
+                );
+                return None;
+            }
+        }
+
+        let mut file = match File::create(TCP_BRIDGE_DUMP_PATH) {
+            Ok(f) => f,
+            Err(err) => {
+                warn!(
+                    path = %TCP_BRIDGE_DUMP_PATH,
+                    error = %err,
+                    "tcp bridge dump disabled: failed to open output file"
+                );
+                return None;
+            }
+        };
+
+        // Header: magic + version.
+        if let Err(err) = file.write_all(b"BNDBRDG1") {
+            warn!(
+                path = %TCP_BRIDGE_DUMP_PATH,
+                error = %err,
+                "tcp bridge dump disabled: failed to write header"
+            );
+            return None;
+        }
+
+        info!(
+            path = %TCP_BRIDGE_DUMP_PATH,
+            env = %TCP_BRIDGE_DUMP_MAX_MB_ENV,
+            max_mb,
+            max_bytes,
+            "tcp bridge raw dump enabled"
+        );
+
+        Some(Arc::new(Self {
+            inner: Mutex::new(TcpBridgeDumpInner {
+                file,
+                bytes_written: 8,
+                max_bytes,
+                stopped_at_limit: false,
+            }),
+        }))
+    }
+
+    fn record(
+        &self,
+        session_id: u64,
+        conn_id: u32,
+        direction: TcpBridgeDumpDirection,
+        payload: &[u8],
+    ) {
+        if payload.is_empty() {
+            return;
+        }
+        let ts_micros = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+
+        // Per-record header (32 bytes total):
+        // ts_micros(u64), session_id(u64), conn_id(u32), dir(u8), reserved[3], len(u32), reserved2(u32)
+        let payload_len = payload.len() as u64;
+        let rec_len = 32u64.saturating_add(payload_len);
+
+        let mut inner = match self.inner.lock() {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+
+        if inner.bytes_written.saturating_add(rec_len) > inner.max_bytes {
+            if !inner.stopped_at_limit {
+                inner.stopped_at_limit = true;
+                warn!(
+                    path = %TCP_BRIDGE_DUMP_PATH,
+                    max_bytes = inner.max_bytes,
+                    bytes_written = inner.bytes_written,
+                    "tcp bridge dump reached size limit; further records dropped"
+                );
+            }
+            return;
+        }
+
+        let mut header = [0u8; 32];
+        header[0..8].copy_from_slice(&ts_micros.to_le_bytes());
+        header[8..16].copy_from_slice(&session_id.to_le_bytes());
+        header[16..20].copy_from_slice(&conn_id.to_le_bytes());
+        header[20] = direction as u8;
+        header[24..28].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+
+        if inner.file.write_all(&header).is_err() {
+            return;
+        }
+        if inner.file.write_all(payload).is_err() {
+            return;
+        }
+        inner.bytes_written = inner.bytes_written.saturating_add(rec_len);
+    }
+}
 
 // ── Public snapshot types (mirror frame_forwarder types for status.rs) ────────
 
@@ -486,6 +654,8 @@ fn smoltcp_poll_thread(
     let mut outbound_tcp_rst_total: u64 = 0;
     let mut outbound_tcp_rst_unmatched_total: u64 = 0;
     let mut ambiguous_tcp_tuple_drop_total: u64 = 0;
+    let mut last_rst_summary_bucket: u64 = 0;
+    let tcp_bridge_dump = TcpBridgeDumpWriter::from_env();
 
     loop {
         // ── Wait for work or 10 ms TCP-timer tick ────────────────────────────
@@ -595,7 +765,8 @@ fn smoltcp_poll_thread(
                 }
 
                 if active_tuple_ambiguous {
-                    ambiguous_tcp_tuple_drop_total = ambiguous_tcp_tuple_drop_total.saturating_add(1);
+                    ambiguous_tcp_tuple_drop_total =
+                        ambiguous_tcp_tuple_drop_total.saturating_add(1);
                     if ambiguous_tcp_tuple_drop_total <= 10
                         || ambiguous_tcp_tuple_drop_total % 100 == 0
                     {
@@ -674,7 +845,8 @@ fn smoltcp_poll_thread(
                         }
                         continue;
                     };
-                    if let Some((src_ip, src_port, dst_ip, dst_port, flags)) = maybe_tcp_tuple_flags {
+                    if let Some((src_ip, src_port, dst_ip, dst_port, flags)) = maybe_tcp_tuple_flags
+                    {
                         if flags & 0x04 != 0 {
                             outbound_tcp_rst_total = outbound_tcp_rst_total.saturating_add(1);
                             debug!(
@@ -775,6 +947,7 @@ fn smoltcp_poll_thread(
             let session_id_copy = session_id;
             let conn_id_copy = conn_id;
             let tcp_stats_bridge = tcp_stats.clone();
+            let tcp_bridge_dump_copy = tcp_bridge_dump.clone();
 
             tokio_handle.spawn(async move {
                 tcp_bridge_task(
@@ -786,6 +959,7 @@ fn smoltcp_poll_thread(
                     work_notify,
                     tcp_stats_bridge,
                     outbound_bridge,
+                    tcp_bridge_dump_copy,
                 )
                 .await;
             });
@@ -892,9 +1066,10 @@ fn smoltcp_poll_thread(
         // Clean up promoted handles that are no longer in pending.
         promoted.retain(|h| active.contains_key(h));
 
-        if (inbound_tcp_rst_total != 0 || outbound_tcp_rst_total != 0)
-            && (inbound_tcp_rst_total + outbound_tcp_rst_total) % 500 == 0
-        {
+        let rst_total = inbound_tcp_rst_total.saturating_add(outbound_tcp_rst_total);
+        let rst_bucket = rst_total / 500;
+        if rst_total != 0 && rst_bucket > last_rst_summary_bucket {
+            last_rst_summary_bucket = rst_bucket;
             info!(
                 session_id,
                 inbound_tcp_rst_total,
@@ -919,6 +1094,7 @@ async fn tcp_bridge_task(
     work: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     tcp_stats: Arc<std::sync::RwLock<TcpStats>>,
     _outbound_tx: mpsc::UnboundedSender<SessionFrame>,
+    tcp_bridge_dump: Option<Arc<TcpBridgeDumpWriter>>,
 ) {
     let stream = match TcpStream::connect(dst).await {
         Ok(s) => s,
@@ -936,6 +1112,7 @@ async fn tcp_bridge_task(
     let to_smoltcp_read = to_smoltcp.clone();
     let work_read = work.clone();
     let tcp_stats_read = tcp_stats.clone();
+    let tcp_bridge_dump_read = tcp_bridge_dump.clone();
 
     // Spawn a separate task to pump data from the real server → smoltcp.
     let read_task = tokio::spawn(async move {
@@ -945,6 +1122,14 @@ async fn tcp_bridge_task(
                 Ok(0) => break,
                 Ok(n) => {
                     let bytes = Bytes::copy_from_slice(&buf[..n]);
+                    if let Some(dump) = &tcp_bridge_dump_read {
+                        dump.record(
+                            session_id,
+                            conn_id,
+                            TcpBridgeDumpDirection::RemoteToSmoltcp,
+                            bytes.as_ref(),
+                        );
+                    }
                     if let Ok(mut stats) = tcp_stats_read.write() {
                         if let Some(record) =
                             stats.flows.values_mut().find(|r| r.conn_id == conn_id)
@@ -975,6 +1160,14 @@ async fn tcp_bridge_task(
 
     // Pump data from smoltcp → real server.
     while let Some(bytes) = from_smoltcp.recv().await {
+        if let Some(dump) = &tcp_bridge_dump {
+            dump.record(
+                session_id,
+                conn_id,
+                TcpBridgeDumpDirection::SmoltcpToRemote,
+                bytes.as_ref(),
+            );
+        }
         if let Err(err) = writer.write_all(&bytes).await {
             debug!(session_id, conn_id, error = %err, "TCP bridge: write error");
             break;
