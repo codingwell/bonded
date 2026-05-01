@@ -1,0 +1,38 @@
+[package]
+name = "bonded-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bonded server binary"
+
+[dependencies]
+anyhow.workspace = true
+bonded-core = { path = "../bonded-core" }
+bytes.workspace = true
+clap.workspace = true
+notify.workspace = true
+qrcode.workspace = true
+serde.workspace = true
+serde_json = "1"
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+tun.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+socket2 = "0.5"
+smoltcp = { version = "0.11", default-features = false, features = [
+    "async",
+    "std",
+    "proto-ipv4",
+    "proto-ipv4-fragmentation",
+    "socket-tcp",
+    "medium-ip",
+] }
+
+[dev-dependencies]
+bonded-client = { path = "../bonded-client" }
+rcgen = "0.13"

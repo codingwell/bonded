@@ -1,0 +1,19 @@
+services:
+  devcontainer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ..:/workspace:cached
+      - ./.history:/commandhistory
+      - bonded-gradle-cache:/home/vscode/.gradle
+      - bonded-android-cache:/home/vscode/.android
+    command: sleep infinity
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp:unconfined
+
+volumes:
+  bonded-gradle-cache:
+  bonded-android-cache:

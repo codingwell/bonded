@@ -1,0 +1,46 @@
+{
+    "name": "Bonded Dev",
+    "dockerComposeFile": "docker-compose.yml",
+    "service": "devcontainer",
+    "workspaceFolder": "/workspace",
+    "features": {
+        "ghcr.io/devcontainers/features/rust:1": {
+            "profile": "default"
+        },
+        "ghcr.io/devcontainers/features/docker-in-docker:2": {},
+        "ghcr.io/devcontainers/features/github-cli:1": {}
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "rust-lang.rust-analyzer",
+                "Dart-Code.dart-code",
+                "Dart-Code.flutter",
+                "tamasfe.even-better-toml",
+                "fill-labs.dependi",
+                "ms-azuretools.vscode-docker",
+                "GitHub.copilot",
+                "github.vscode-github-actions"
+            ],
+            "settings": {
+                "rust-analyzer.cargo.features": "all",
+                "editor.formatOnSave": true,
+                "terminal.integrated.defaultProfile.linux": "bash",
+                "[rust]": {
+                    "editor.defaultFormatter": "rust-lang.rust-analyzer"
+                },
+                "[dart]": {
+                    "editor.defaultFormatter": "Dart-Code.dart-code"
+                }
+            }
+        }
+    },
+    "forwardPorts": [
+        8080
+    ],
+    "postCreateCommand": ".devcontainer/post-create.sh",
+    "remoteEnv": {
+        "HISTFILE": "/commandhistory/.bash_history"
+    },
+    "remoteUser": "vscode"
+}
