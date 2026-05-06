@@ -625,6 +625,14 @@ fn smoltcp_now() -> SmoltcpInstant {
     SmoltcpInstant::from_micros(micros as i64)
 }
 
+fn smoltcp_poll_wait_duration(
+    iface: &mut Interface,
+    sockets: &SocketSet<'_>,
+    now: SmoltcpInstant,
+) -> Option<Duration> {
+    iface.poll_delay(now, sockets).map(Duration::from)
+}
+
 fn smoltcp_poll_thread(
     session_id: u64,
     cmd_rx: std::sync::mpsc::Receiver<PollCommand>,
@@ -673,14 +681,23 @@ fn smoltcp_poll_thread(
     let mut ambiguous_tcp_tuple_drop_total: u64 = 0;
     let mut last_rst_summary_bucket: u64 = 0;
     let tcp_bridge_dump = TcpBridgeDumpWriter::from_env();
+    let mut next_poll_wait = Some(Duration::ZERO);
 
     loop {
-        // ── Wait for work or 10 ms TCP-timer tick ────────────────────────────
+        // ── Wait for work or the next smoltcp timer deadline ─────────────────
         {
             let (lock, cvar) = &*work;
             let guard = lock.lock().expect("work lock should not be poisoned");
             if !*guard {
-                let _ = cvar.wait_timeout(guard, Duration::from_millis(1));
+                match next_poll_wait {
+                    Some(wait) if wait.is_zero() => {}
+                    Some(wait) => {
+                        let _ = cvar.wait_timeout(guard, wait);
+                    }
+                    None => {
+                        drop(cvar.wait(guard));
+                    }
+                }
             } else {
                 let mut g = guard;
                 *g = false;
@@ -738,6 +755,7 @@ fn smoltcp_poll_thread(
         // ── smoltcp poll ──────────────────────────────────────────────────────
         let ts = smoltcp_now();
         iface.poll(ts, &mut device, &mut sockets);
+        next_poll_wait = smoltcp_poll_wait_duration(&mut iface, &sockets, ts);
 
         // ── Drain TX ring: rewrite src_ip and send to client ─────────────────
         {
