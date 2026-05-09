@@ -41,6 +41,8 @@ class BondedVpnService : VpnService() {
 
     @Volatile private var packetIoRunning = false
 
+    @Volatile private var nativeTunFdWriteAvailable = false
+
     @Volatile private var nativeProcessingAvailable = nativeLoaded
 
     @Volatile private var nativeAvailabilityReported = false
@@ -265,6 +267,18 @@ class BondedVpnService : VpnService() {
         }
 
         packetIoRunning = true
+        nativeTunFdWriteAvailable = configureNativeTunFd(pfd)
+        if (nativeTunFdWriteAvailable) {
+            android.util.Log.i(
+                "BondedVPN",
+                "Native TUN fd handoff enabled; inbound packets will be written directly by Rust"
+            )
+        } else {
+            android.util.Log.w(
+                "BondedVPN",
+                "Native TUN fd handoff unavailable; using legacy inbound JNI polling"
+            )
+        }
 
         // Outbound thread: reads raw IP packets from TUN and hands them to native.
         packetIoThread =
@@ -296,41 +310,41 @@ class BondedVpnService : VpnService() {
                     }
                 }
 
-        // Inbound drain thread: continuously polls native for server responses and writes
-        // them back to TUN.  Runs independently so responses are delivered immediately
-        // rather than only when a new outbound packet unblocks input.read().
-        inboundDrainThread =
-                thread(name = "bonded-vpn-inbound", start = true) {
-                    val output = FileOutputStream(pfd.fileDescriptor)
-                    try {
-                        while (packetIoRunning) {
-                            val inbound = pollInboundPacket()
-                            if (inbound == null || inbound.isEmpty()) {
-                                // If nothing was available, sleep briefly to avoid busy-spinning.
-                                Thread.sleep(INBOUND_IDLE_SLEEP_MS)
-                                continue
-                            }
-
-                            output.write(inbound)
-                            output.flush()
-                        }
-                    } catch (_: InterruptedException) {
-                        // Normal shutdown signal.
-                    } catch (e: Exception) {
-                        android.util.Log.e(
-                                "BondedVPN",
-                                "VPN inbound drain exception: ${e.message}",
-                                e
-                        )
-                        if (packetIoRunning) {
-                            emitEvent("error", "VPN inbound drain stopped: ${e.message}")
-                        }
-                    } finally {
+        if (!nativeTunFdWriteAvailable) {
+            // Fallback path: keep legacy inbound polling if native fd handoff fails.
+            inboundDrainThread =
+                    thread(name = "bonded-vpn-inbound", start = true) {
+                        val output = FileOutputStream(pfd.fileDescriptor)
                         try {
-                            output.close()
-                        } catch (_: Exception) {}
+                            while (packetIoRunning) {
+                                val inbound = pollInboundPacket()
+                                if (inbound == null || inbound.isEmpty()) {
+                                    // If nothing was available, sleep briefly to avoid busy-spinning.
+                                    Thread.sleep(INBOUND_IDLE_SLEEP_MS)
+                                    continue
+                                }
+
+                                output.write(inbound)
+                                output.flush()
+                            }
+                        } catch (_: InterruptedException) {
+                            // Normal shutdown signal.
+                        } catch (e: Exception) {
+                            android.util.Log.e(
+                                    "BondedVPN",
+                                    "VPN inbound drain exception: ${e.message}",
+                                    e
+                            )
+                            if (packetIoRunning) {
+                                emitEvent("error", "VPN inbound drain stopped: ${e.message}")
+                            }
+                        } finally {
+                            try {
+                                output.close()
+                            } catch (_: Exception) {}
+                        }
                     }
-                }
+        }
     }
 
     private fun stopPacketIoLoop() {
@@ -339,6 +353,10 @@ class BondedVpnService : VpnService() {
         packetIoThread = null
         inboundDrainThread?.interrupt()
         inboundDrainThread = null
+        try {
+            nativeSetTunFd(-1)
+        } catch (_: UnsatisfiedLinkError) {}
+        nativeTunFdWriteAvailable = false
     }
 
     private fun startSessionMonitorIfNeeded() {
@@ -528,6 +546,22 @@ class BondedVpnService : VpnService() {
         }
     }
 
+    private fun configureNativeTunFd(pfd: ParcelFileDescriptor): Boolean {
+        return try {
+            val result = nativeSetTunFd(pfd.fd)
+            if (!result) {
+                emitEvent("packet_io", "Native TUN fd handoff failed; using polling fallback")
+            }
+            result
+        } catch (_: UnsatisfiedLinkError) {
+            false
+        } catch (e: Exception) {
+            android.util.Log.e("BondedVPN", "Native TUN fd handoff failed: ${e.message}", e)
+            emitEvent("packet_io", "Native TUN fd handoff failed: ${e.message}")
+            false
+        }
+    }
+
     private fun describePacket(packet: ByteArray): String {
         if (packet.isEmpty()) return "empty"
         if (packet.size < 1) return "too-short"
@@ -548,6 +582,8 @@ class BondedVpnService : VpnService() {
     }
 
     private external fun nativeHandleTunOutbound(packet: ByteArray): Boolean
+
+    private external fun nativeSetTunFd(fd: Int): Boolean
 
     private external fun nativePollTunInbound(): ByteArray?
 

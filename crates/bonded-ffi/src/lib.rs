@@ -11,6 +11,12 @@ use bonded_core::session::{SessionState, FLAG_PING, FLAG_PONG};
 use bytes::Bytes;
 #[cfg(any(target_os = "android", test))]
 use std::collections::VecDeque;
+#[cfg(target_os = "android")]
+use std::fs::File;
+#[cfg(target_os = "android")]
+use std::io::Write;
+#[cfg(target_os = "android")]
+use std::os::fd::FromRawFd;
 #[cfg(any(target_os = "android", test))]
 use std::path::PathBuf;
 use std::slice;
@@ -43,6 +49,10 @@ static ANDROID_JVM: OnceLock<jni::JavaVM> = OnceLock::new();
 /// to call `protect(fd)` on session sockets before they connect.
 #[cfg(target_os = "android")]
 static ANDROID_VPN_SERVICE: Mutex<Option<jni::objects::GlobalRef>> = Mutex::new(None);
+
+/// A duplicated TUN fd owned by native code for direct inbound packet writes.
+#[cfg(target_os = "android")]
+static ANDROID_TUN_WRITER: OnceLock<Mutex<Option<File>>> = OnceLock::new();
 
 #[cfg(target_os = "android")]
 static LAST_NATIVE_ERROR: Mutex<Option<String>> = Mutex::new(None);
@@ -96,6 +106,57 @@ fn protect_fd(fd: i32) -> bool {
     };
     eprintln!("[bonded-ffi] protect_fd(fd={fd}) -> {result}");
     result
+}
+
+#[cfg(target_os = "android")]
+fn android_tun_writer_slot() -> &'static Mutex<Option<File>> {
+    ANDROID_TUN_WRITER.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(target_os = "android")]
+fn set_android_tun_fd(fd: i32) -> bool {
+    let mut guard = match android_tun_writer_slot().lock() {
+        Ok(lock) => lock,
+        Err(_) => return false,
+    };
+
+    if fd < 0 {
+        *guard = None;
+        eprintln!("[bonded-ffi] Cleared native TUN writer fd");
+        return true;
+    }
+
+    // Duplicate the Java-owned fd so native can own and close its copy safely.
+    let dup_fd = unsafe { libc::dup(fd) };
+    if dup_fd < 0 {
+        eprintln!("[bonded-ffi] Failed to dup TUN fd={fd}");
+        return false;
+    }
+
+    // Safety: dup() returns a fresh owned fd on success.
+    let file = unsafe { File::from_raw_fd(dup_fd) };
+    *guard = Some(file);
+    eprintln!("[bonded-ffi] Set native TUN writer fd from source fd={fd}");
+    true
+}
+
+#[cfg(target_os = "android")]
+fn write_inbound_packet_to_tun(payload: &[u8]) -> bool {
+    let mut guard = match android_tun_writer_slot().lock() {
+        Ok(lock) => lock,
+        Err(_) => return false,
+    };
+    let Some(file) = guard.as_mut() else {
+        return false;
+    };
+
+    match file.write_all(payload) {
+        Ok(()) => true,
+        Err(err) => {
+            eprintln!("[bonded-ffi] TUN write failed: {err}");
+            false
+        }
+    }
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -250,6 +311,11 @@ fn stop_android_session() {
             let _ = worker.join();
         }
     }
+
+    #[cfg(target_os = "android")]
+    {
+        let _ = set_android_tun_fd(-1);
+    }
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -376,10 +442,12 @@ fn start_android_session(
             };
             let mut active_index = 0_usize;
             let mut session = SessionState::new(1);
-            let mut select_cycle = 0u64;
             let mut ping_sequence = 0u64;
             let mut last_ping_sent_ms: Option<u64> = None;
-            const HEARTBEAT_INTERVAL_CYCLES: u64 = 200; // 200 * 50ms = 10s
+            let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Consume the immediate first tick so the first ping fires after 10s, not instantly.
+            heartbeat.tick().await;
 
             while !worker_stop_flag.load(Ordering::SeqCst) {
                 tokio::select! {
@@ -456,10 +524,22 @@ fn start_android_session(
                                 if !frame.payload.is_empty() {
                                     let payload = frame.payload.to_vec();
                                     let payload_len = payload.len() as u64;
-                                    worker_inbound_queue
-                                        .lock()
-                                        .expect("android inbound queue lock poisoned")
-                                        .push_back(payload);
+                                    let delivered_to_tun = {
+                                        #[cfg(target_os = "android")]
+                                        {
+                                            write_inbound_packet_to_tun(&payload)
+                                        }
+                                        #[cfg(not(target_os = "android"))]
+                                        {
+                                            false
+                                        }
+                                    };
+                                    if !delivered_to_tun {
+                                        worker_inbound_queue
+                                            .lock()
+                                            .expect("android inbound queue lock poisoned")
+                                            .push_back(payload);
+                                    }
                                     update_snapshot(&worker_snapshot, |session_snapshot| {
                                         session_snapshot.inbound_packets = session_snapshot.inbound_packets.saturating_add(1);
                                         session_snapshot.inbound_bytes = session_snapshot.inbound_bytes.saturating_add(payload_len);
@@ -487,10 +567,22 @@ fn start_android_session(
                                             if !next_frame.payload.is_empty() {
                                                 let payload = next_frame.payload.to_vec();
                                                 let payload_len = payload.len() as u64;
-                                                worker_inbound_queue
-                                                    .lock()
-                                                    .expect("android inbound queue lock poisoned")
-                                                    .push_back(payload);
+                                                let delivered_to_tun = {
+                                                    #[cfg(target_os = "android")]
+                                                    {
+                                                        write_inbound_packet_to_tun(&payload)
+                                                    }
+                                                    #[cfg(not(target_os = "android"))]
+                                                    {
+                                                        false
+                                                    }
+                                                };
+                                                if !delivered_to_tun {
+                                                    worker_inbound_queue
+                                                        .lock()
+                                                        .expect("android inbound queue lock poisoned")
+                                                        .push_back(payload);
+                                                }
                                                 update_snapshot(
                                                     &worker_snapshot,
                                                     |session_snapshot| {
@@ -527,31 +619,28 @@ fn start_android_session(
                             }
                         }
                     }
-                    _ = tokio::time::sleep(Duration::from_millis(50)) => {
-                        select_cycle += 1;
-                        if select_cycle % HEARTBEAT_INTERVAL_CYCLES == 0 {
-                            let now_ms = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .map(|d| d.as_millis() as u64)
-                                .unwrap_or(0);
-                            let ping = SessionFrame {
-                                header: bonded_core::session::SessionHeader {
-                                    connection_id: 0,
-                                    sequence: ping_sequence,
-                                    flags: FLAG_PING,
-                                },
-                                payload: Bytes::new(),
-                            };
-                            eprintln!(
-                                "[bonded-ffi] Sending heartbeat ping seq={} cycle={}",
-                                ping_sequence, select_cycle
-                            );
-                            if let Err(err) = transports[active_index].send(ping).await {
-                                eprintln!("[bonded-ffi] Heartbeat ping send failed: {}", err);
-                            } else {
-                                last_ping_sent_ms = Some(now_ms);
-                                ping_sequence = ping_sequence.wrapping_add(1);
-                            }
+                    _ = heartbeat.tick() => {
+                        let now_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        let ping = SessionFrame {
+                            header: bonded_core::session::SessionHeader {
+                                connection_id: 0,
+                                sequence: ping_sequence,
+                                flags: FLAG_PING,
+                            },
+                            payload: Bytes::new(),
+                        };
+                        eprintln!(
+                            "[bonded-ffi] Sending heartbeat ping seq={}",
+                            ping_sequence
+                        );
+                        if let Err(err) = transports[active_index].send(ping).await {
+                            eprintln!("[bonded-ffi] Heartbeat ping send failed: {}", err);
+                        } else {
+                            last_ping_sent_ms = Some(now_ms);
+                            ping_sequence = ping_sequence.wrapping_add(1);
                         }
                     }
                 }
@@ -599,7 +688,6 @@ fn queue_outbound_packet(packet: Vec<u8>) -> bool {
         .expect("android session slot lock poisoned")
         .as_ref()
     {
-        let packet_len = packet.len();
         let result = handle.outbound_tx.send(packet);
         if let Err(_) = result {
             let message = "Failed to queue outbound packet: channel closed";
@@ -818,6 +906,20 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeHandle
     }
 
     0
+}
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeSetTunFd(
+    _env: jni::JNIEnv,
+    _obj: jni::objects::JObject,
+    fd: jni::sys::jint,
+) -> jni::sys::jboolean {
+    if set_android_tun_fd(fd as i32) {
+        1
+    } else {
+        0
+    }
 }
 
 #[cfg(target_os = "android")]

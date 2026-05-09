@@ -18,3 +18,4 @@ tokio.workspace = true
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
 jni-sys = "0.4"
+libc = "0.2"

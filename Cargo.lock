@@ -225,6 +225,7 @@ dependencies = [
  "bytes",
  "jni",
  "jni-sys 0.4.1",
+ "libc",
  "serde_json",
  "tokio",
 ]
