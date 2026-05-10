@@ -27,7 +27,7 @@ mod client_integration;
 
 pub enum ClientTransport {
     NaiveTcp(NaiveTcpTransport),
-    WebSocket(WebSocketTlsTransport),
+    WebSocket(Box<WebSocketTlsTransport>),
 }
 
 impl ClientTransport {
@@ -136,13 +136,13 @@ pub async fn establish_transport_paths(
                 .await
                 .map_err(anyhow::Error::from)
                 .and_then(|result| result)
-                .map(ClientTransport::WebSocket),
+                .map(|transport| ClientTransport::WebSocket(Box::new(transport))),
                 ("wss" | "websocket_tls", None) => {
                     timeout(PATH_ESTABLISH_TIMEOUT, establish_websocket_session(config))
                         .await
                         .map_err(anyhow::Error::from)
                         .and_then(|result| result)
-                        .map(ClientTransport::WebSocket)
+                        .map(|transport| ClientTransport::WebSocket(Box::new(transport)))
                 }
                 _ => continue,
             };

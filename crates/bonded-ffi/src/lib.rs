@@ -444,9 +444,9 @@ fn start_android_session(
             let mut session = SessionState::new(1);
             let mut ping_sequence = 0u64;
             let mut last_ping_sent_ms: Option<u64> = None;
-            let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+            let mut heartbeat = tokio::time::interval(Duration::from_secs(25));
             heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // Consume the immediate first tick so the first ping fires after 10s, not instantly.
+            // Consume the immediate first tick so the first ping fires after 25s, not instantly.
             heartbeat.tick().await;
 
             while !worker_stop_flag.load(Ordering::SeqCst) {
@@ -553,49 +553,41 @@ fn start_android_session(
                                 // timeout(ZERO) polls recv() once: if a full frame is already in
                                 // the read buffer it completes immediately; otherwise it times out
                                 // and we yield back to select! for fairness with outbound traffic.
-                                loop {
-                                    match tokio::time::timeout(
-                                        Duration::ZERO,
-                                        transports[active_index].recv(),
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok(next_frame)) => {
-                                            if next_frame.header.flags & FLAG_PONG != 0 {
-                                                continue;
+                                while let Ok(Ok(next_frame)) = tokio::time::timeout(
+                                    Duration::ZERO,
+                                    transports[active_index].recv(),
+                                )
+                                .await
+                                {
+                                    if next_frame.header.flags & FLAG_PONG != 0 {
+                                        continue;
+                                    }
+                                    if !next_frame.payload.is_empty() {
+                                        let payload = next_frame.payload.to_vec();
+                                        let payload_len = payload.len() as u64;
+                                        let delivered_to_tun = {
+                                            #[cfg(target_os = "android")]
+                                            {
+                                                write_inbound_packet_to_tun(&payload)
                                             }
-                                            if !next_frame.payload.is_empty() {
-                                                let payload = next_frame.payload.to_vec();
-                                                let payload_len = payload.len() as u64;
-                                                let delivered_to_tun = {
-                                                    #[cfg(target_os = "android")]
-                                                    {
-                                                        write_inbound_packet_to_tun(&payload)
-                                                    }
-                                                    #[cfg(not(target_os = "android"))]
-                                                    {
-                                                        false
-                                                    }
-                                                };
-                                                if !delivered_to_tun {
-                                                    worker_inbound_queue
-                                                        .lock()
-                                                        .expect("android inbound queue lock poisoned")
-                                                        .push_back(payload);
-                                                }
-                                                update_snapshot(
-                                                    &worker_snapshot,
-                                                    |session_snapshot| {
-                                                        session_snapshot.inbound_packets = session_snapshot.inbound_packets.saturating_add(1);
-                                                        session_snapshot.inbound_bytes = session_snapshot.inbound_bytes.saturating_add(payload_len);
-                                                    },
-                                                );
+                                            #[cfg(not(target_os = "android"))]
+                                            {
+                                                false
                                             }
+                                        };
+                                        if !delivered_to_tun {
+                                            worker_inbound_queue
+                                                .lock()
+                                                .expect("android inbound queue lock poisoned")
+                                                .push_back(payload);
                                         }
-                                        // Timeout means no more immediately buffered data —
-                                        // yield back to select!. Any transport error is also
-                                        // left for the next select! recv() arm to handle.
-                                        _ => break,
+                                        update_snapshot(
+                                            &worker_snapshot,
+                                            |session_snapshot| {
+                                                session_snapshot.inbound_packets = session_snapshot.inbound_packets.saturating_add(1);
+                                                session_snapshot.inbound_bytes = session_snapshot.inbound_bytes.saturating_add(payload_len);
+                                            },
+                                        );
                                     }
                                 }
                             }
@@ -689,7 +681,7 @@ fn queue_outbound_packet(packet: Vec<u8>) -> bool {
         .as_ref()
     {
         let result = handle.outbound_tx.send(packet);
-        if let Err(_) = result {
+        if result.is_err() {
             let message = "Failed to queue outbound packet: channel closed";
             eprintln!("[bonded-ffi] {}", message);
             update_snapshot(&handle.snapshot, |session_snapshot| {
@@ -816,7 +808,7 @@ pub extern "system" fn Java_com_bonded_bonded_1app_MainActivity_nativeRedeemInvi
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_bonded_bonded_1app_MainActivity_nativeLastError(
-    mut env: jni::JNIEnv,
+    env: jni::JNIEnv,
     _obj: jni::objects::JObject,
 ) -> jni::sys::jstring {
     let message = LAST_NATIVE_ERROR
