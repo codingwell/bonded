@@ -61,6 +61,11 @@ impl NaiveTcpTransport {
             read_buf: BytesMut::new(),
         }
     }
+
+    pub async fn close(&mut self) -> anyhow::Result<()> {
+        self.stream.shutdown().await?;
+        Ok(())
+    }
 }
 
 impl WebSocketTlsTransport {
@@ -136,6 +141,15 @@ impl WebSocketTlsTransport {
                 None => anyhow::bail!("websocket closed while awaiting text"),
             }
         }
+    }
+
+    pub async fn close(&mut self) -> anyhow::Result<()> {
+        match &mut self.stream {
+            WebSocketStreamInner::Client(stream) => stream.close(None).await?,
+            WebSocketStreamInner::Server(stream) => stream.close(None).await?,
+            WebSocketStreamInner::ServerTls(stream) => stream.close(None).await?,
+        }
+        Ok(())
     }
 }
 

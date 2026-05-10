@@ -44,6 +44,13 @@ impl ClientTransport {
             ClientTransport::WebSocket(inner) => inner.recv().await,
         }
     }
+
+    pub async fn close(&mut self) -> anyhow::Result<()> {
+        match self {
+            ClientTransport::NaiveTcp(inner) => inner.close().await,
+            ClientTransport::WebSocket(inner) => inner.close().await,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

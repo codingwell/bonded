@@ -228,6 +228,7 @@ dependencies = [
  "libc",
  "serde_json",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

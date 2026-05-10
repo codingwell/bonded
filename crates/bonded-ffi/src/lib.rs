@@ -1,5 +1,5 @@
 #[cfg(any(target_os = "android", test))]
-use bonded_client::{establish_naive_tcp_session, establish_transport_paths};
+use bonded_client::{establish_naive_tcp_session, establish_transport_paths, ClientTransport};
 #[cfg(any(target_os = "android", test))]
 use bonded_core::config::ClientConfig;
 #[cfg(target_os = "android")]
@@ -21,8 +21,6 @@ use std::os::fd::FromRawFd;
 use std::path::PathBuf;
 use std::slice;
 #[cfg(any(target_os = "android", test))]
-use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(any(target_os = "android", test))]
 use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(any(target_os = "android", test))]
 use std::thread::{self, JoinHandle};
@@ -30,6 +28,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 #[cfg(any(target_os = "android", test))]
 use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(any(target_os = "android", test))]
+use tokio_util::sync::CancellationToken;
 
 // Per-path connect attempts inside establish_transport_paths each carry an 8s
 // timeout.  With two paths and a bind-aware attempt first, path 0 can take close
@@ -164,7 +164,7 @@ struct AndroidSessionHandle {
     outbound_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     inbound_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
     snapshot: Arc<Mutex<AndroidSessionSnapshot>>,
-    stop_flag: Arc<AtomicBool>,
+    cancel_token: CancellationToken,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -188,6 +188,27 @@ static ANDROID_SESSION: OnceLock<Mutex<Option<AndroidSessionHandle>>> = OnceLock
 const BONDED_FFI_OK: i32 = 0;
 const BONDED_FFI_ERR_NULL_POINTER: i32 = 1;
 const BONDED_FFI_ERR_DECODE: i32 = 2;
+
+#[cfg(any(target_os = "android", test))]
+const ANDROID_STOP_JOIN_TIMEOUT: Duration = Duration::from_millis(250);
+
+#[cfg(any(target_os = "android", test))]
+const ANDROID_TRANSPORT_CLOSE_TIMEOUT: Duration = Duration::from_millis(100);
+
+#[cfg(any(target_os = "android", test))]
+async fn close_client_transports(transports: &mut Vec<ClientTransport>) {
+    for transport in transports.iter_mut() {
+        let close_result =
+            tokio::time::timeout(ANDROID_TRANSPORT_CLOSE_TIMEOUT, transport.close()).await;
+        if let Err(err) = close_result {
+            eprintln!(
+                "[bonded-ffi] Timed out closing transport after {:?}: {}",
+                ANDROID_TRANSPORT_CLOSE_TIMEOUT, err,
+            );
+        }
+    }
+    transports.clear();
+}
 
 #[repr(C)]
 pub struct BondedFrameMetadata {
@@ -305,10 +326,21 @@ fn stop_android_session() {
             snapshot.state = "stopped".to_owned();
             snapshot.last_error = None;
         });
-        handle.stop_flag.store(true, Ordering::SeqCst);
+        handle.cancel_token.cancel();
         let _ = handle.outbound_tx.send(Vec::new());
         if let Some(worker) = handle.worker.take() {
-            let _ = worker.join();
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<()>(1);
+            thread::spawn(move || {
+                let _ = worker.join();
+                let _ = done_tx.send(());
+            });
+
+            if done_rx.recv_timeout(ANDROID_STOP_JOIN_TIMEOUT).is_err() {
+                eprintln!(
+                    "[bonded-ffi] stop_android_session: worker join timed out after {:?}; continuing teardown",
+                    ANDROID_STOP_JOIN_TIMEOUT,
+                );
+            }
         }
     }
 
@@ -351,8 +383,8 @@ fn start_android_session(
         last_error: None,
     }));
     let worker_snapshot = Arc::clone(&snapshot);
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    let worker_stop_flag = Arc::clone(&stop_flag);
+    let cancel_token = CancellationToken::new();
+    let worker_cancel_token = cancel_token.clone();
     let mut config = android_client_config(server_address, storage_dir);
     let protocols = parse_protocol_list(protocol_csv);
     let bind_addresses = parse_bind_address_list(bind_addresses_json);
@@ -449,12 +481,17 @@ fn start_android_session(
             // Consume the immediate first tick so the first ping fires after 25s, not instantly.
             heartbeat.tick().await;
 
-            while !worker_stop_flag.load(Ordering::SeqCst) {
+            loop {
                 tokio::select! {
+                    _ = worker_cancel_token.cancelled() => {
+                        eprintln!("[bonded-ffi] Worker cancellation requested");
+                        close_client_transports(&mut transports).await;
+                        break;
+                    }
                     maybe_packet = outbound_rx.recv() => {
                         match maybe_packet {
                             Some(packet) => {
-                                if packet.is_empty() && worker_stop_flag.load(Ordering::SeqCst) {
+                                if packet.is_empty() && worker_cancel_token.is_cancelled() {
                                     eprintln!("[bonded-ffi] Stop signal received");
                                     break;
                                 }
@@ -645,7 +682,7 @@ fn start_android_session(
         outbound_tx,
         inbound_queue,
         snapshot,
-        stop_flag,
+        cancel_token,
         worker: Some(worker),
     };
 
