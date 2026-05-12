@@ -1,7 +1,7 @@
 # Implementation Plan — Server, Linux Client, Android Client
 
 **Status:** In Progress
-**Last Updated:** 2026-05-10 (session 51)
+**Last Updated:** 2026-05-10 (session 52)
 
 This is a living document. Update the status column and notes as work progresses.
 
@@ -355,12 +355,94 @@ Acceptance gate:
 
 ---
 
+## Phase 6: Unified Bootstrap Port + QUIC/HTTP3 + WireGuard
+
+Goal: use the bootstrap port (taken from `server_public_address` in the pairing QR payload) as the single entry point for transport negotiation. WSS (TCP) and HTTP/3 (UDP) share the same host/port. WireGuard needs its own UDP port because QUIC and WireGuard packets cannot be demultiplexed on the same socket — but the client doesn't need to know it at pairing time; the bootstrap API hands it over after authentication. 443 is the conventional default for the bootstrap port, but any port works.
+
+### Phase 6.0: Bootstrap and Edge Design Lock
+
+| # | Task | Status | Notes |
+|---|------|--------|-------|
+| 6.0.1 | Define unified bootstrap API contract | not-started | Add versioned bootstrap endpoints under `/v1/bootstrap/*` for capability exchange and transport credential provisioning; usable over HTTPS (HTTP/1.1), WSS, and HTTP/3 |
+| 6.0.2 | Define transport capability document | not-started | Server returns transport inventory (`wss`, `h3`, `wireguard`), endpoint host/port/proto, TTL, and retry/backoff hints |
+| 6.0.3 | Define bootstrap token model | not-started | Pairing invite redemption issues a short-lived bootstrap token bound to device public key and server nonce; token authorizes transport-specific provisioning |
+| 6.0.4 | Define parallel transport dial and preferred-path policy | not-started | All enabled transports dial concurrently (WSS, H3, WireGuard); the first to succeed on each interface is used immediately; a configurable preference order (e.g. `wss > h3 > wireguard`) controls which path is promoted to primary when multiple succeed; slower paths are kept as failover or dropped depending on scheduler policy; `naive_tcp` is a debug-only fallback not included in production dial set; bootstrap port always from `server_public_address` |
+| 6.0.5 | Define TLS cert trust via ed25519 signature | not-started | If TLS cert does not validate against system root CAs (self-signed or private CA), the client must open the TLS connection with certificate verification **disabled** for that one initial request, call `GET /v1/bootstrap/cert-proof`, then verify the ed25519 signature synchronously before exchanging any credential material — only after the signature validates does the client pin the cert and proceed; connecting with verify=false is safe only because the ed25519 check is the real trust anchor and happens before any secret is sent; client must abort immediately if the signature is invalid (MITM); when a system-trusted cert is present (e.g. Let's Encrypt), TLS verifies normally and this step is skipped; pinned cert fingerprint is persisted in `PairedServerStore` (Android) or client config file (Linux); if TLS fails on a future connection due to cert rotation, the client re-runs the cert-proof step rather than hard-failing |
+| 6.0.6 | Define fd-protect API for all transport types | not-started | `ClientConfig` already carries a `SocketProtectFn` used by NaiveTCP; extend the same callback contract to cover UDP sockets created by QUIC (`quinn`) and WireGuard transports; on Android, every socket (TCP or UDP) must call `VpnService.protect(fd)` before `connect()`/`bind()` or it will be captured by the VPN TUN and deadlock; the protect callback must be invoked in each transport's socket-creation path before the socket is used; on non-Android platforms the callback is a no-op |
+| 6.0.7 | Define TUN MTU budget and per-transport frame size limits | not-started | Each transport adds overhead on top of the raw IP packet from the TUN: WSS ≈ 55 bytes (TLS record + WS frame + session frame header), QUIC/H3 ≈ 60 bytes, WireGuard ≈ 60 bytes (32-byte WG header + outer UDP/IP); if TUN MTU is 1500 and the outer network MTU is also 1500, there is no room for transport overhead and packets are fragmented or silently dropped; Android `Builder.setMtu()` is called once at VPN bring-up before transport paths are known so it must be set conservatively for the worst-case transport; default safe value is **1420** (matches WireGuard standard: `1500 - 80`), which provides headroom for all transports; each `ClientTransport` implementation must enforce a matching max session-frame payload size so the session layer never hands a transport a frame that will exceed the outer MTU after encapsulation |
+| 6.0.8 | Define NaiveTCP production retirement | not-started | CR-5 requires all traffic to be encrypted; NaiveTCP has no TLS layer and must not be used as a production transport; once WSS is established as the default transport in Phase 6.1 the Phase 6 acceptance gate explicitly requires NaiveTCP to be excluded from production dial sets and disabled by default in server config; NaiveTCP remains available as an opt-in debug mode only |
+
+### Phase 6.1: Shared Bootstrap Port Listener Architecture
+
+| # | Task | Status | Notes |
+|---|------|--------|-------|
+| 6.1.1 | Serve WSS and HTTPS on configured TCP port | not-started | Reuse existing rustls termination; expose bootstrap HTTPS routes and WSS upgrade on same TCP listener; port comes from `server_public_address` (default 443 by convention) |
+| 6.1.2 | Serve HTTP/3 on same configured UDP port | not-started | Add QUIC endpoint on the same port number as the TCP listener but over UDP; TCP and UDP are separate sockets sharing one host:port identity |
+| 6.1.5 | Serve WireGuard on its own UDP port | not-started | WireGuard cannot share a UDP port with QUIC/HTTP3 (different framing); configure a dedicated WG UDP port in `server.toml` / env; bootstrap API advertises this port to clients after authentication |
+| 6.1.3 | Unify certificate source | not-started | WSS/HTTPS and HTTP/3 must read from one live cert/key store and rotate without restart |
+| 6.1.4 | Add ALPN policy | not-started | Explicitly support `http/1.1`, `h2` (optional), and `h3`; keep websocket upgrade path on HTTP/1.1 |
+
+### Phase 6.2: QUIC/HTTP3 Transport
+
+| # | Task | Status | Notes |
+|---|------|--------|-------|
+| 6.2.1 | Implement `quinn`-backed client/server transport adapters | not-started | Add `Transport` implementation in shared core for QUIC datagram or bidirectional stream framing |
+| 6.2.2 | Add HTTP/3 bootstrap/control channel | not-started | Bootstrap API must be callable over HTTP/3 to avoid TCP-only dependency in restrictive networks |
+| 6.2.3 | Add per-path QUIC establishment in client runtime | not-started | Integrate QUIC into rotated transport attempts per interface with existing path scheduler/session layer |
+| 6.2.4 | Add QUIC transport integration tests | not-started | Cover auth handshake, framing I/O, path failover, and mixed-path operation (`wss` + `h3`) |
+
+### Phase 6.3: WireGuard Transport (Bootstrapped over configured port)
+
+| # | Task | Status | Notes |
+|---|------|--------|-------|
+| 6.3.1 | Select WG implementation strategy | not-started | Use `boringtun` purely as a **crypto library**, not as a VPN. The inner payload of every WireGuard packet is a Bonded session frame — not a raw IP packet. There is no tunnel IP, no allowed-IPs list, no IP routing, and no second TUN. `boringtun` handles the Noise handshake, ChaCha20-Poly1305 encryption, and UDP framing; Bonded owns the socket, calls `boringtun::encapsulate(session_frame)` to get an encrypted UDP datagram to send, and calls `boringtun::decapsulate(udp_payload)` to recover the session frame on receipt. The session layer and scheduler see this as just another `ClientTransport` — identical in interface to NaiveTCP or WSS. The OS VPN TUN is owned exclusively by `BondedVpnService`; boringtun never touches it. This model deliberately gives up the "two peers forward raw IP" simplicity of standard WireGuard in order to preserve Bonded's multi-path bonding (CR-1/CR-2) — a WG-as-real-VPN path would be a completely separate tunnel with no session layer, making it impossible for the scheduler to bond it with WSS/H3 paths. Kernel WireGuard is deferred indefinitely as it is incompatible with this model on Android. |
+| 6.3.2 | Define WG bootstrap payload | not-started | Bootstrap API issues a peer config containing: server WG public key, server WG UDP endpoint (`host:<wg-port>`), client WG public key echo (confirmation), keepalive interval, expiry timestamp, and an ed25519 signature over the whole payload. **No tunnel IP, no allowed-IPs** — these are standard WireGuard fields that have no meaning when the inner payload is session frames rather than routed IP packets. The WG UDP port is separate from the bootstrap TCP/UDP port and is advertised here after authentication. |
+| 6.3.3 | Add WG key lifecycle and peer state persistence | not-started | Client generates device WG keypair; rotate keys via bootstrap API; server tracks active peer keys and expiry; server must persist peer tunnel IP assignments (or regenerate them deterministically from device public key) so that WG peer configs remain valid across server restarts — without this, WG paths silently fail after any restart and the client must re-run WG provisioning; bootstrap API must re-issue peer configs on reconnect |
+| 6.3.4 | Implement WG transport adapter | not-started | Encapsulate session frames through WG tunnel path so scheduler treats WG as another transport path |
+| 6.3.5 | Add WG revocation and teardown | not-started | Device revoke must invalidate WG peer immediately and terminate existing WG-backed paths |
+| 6.3.6 | Add WG integration tests | not-started | Validate bootstrap exchange over TLS, WG bring-up on UDP bootstrap port, and mixed-path failover with WSS/QUIC |
+
+### Phase 6.4: Let’s Encrypt Automation (Domain-Configured)
+
+| # | Task | Status | Notes |
+|---|------|--------|-------|
+| 6.4.1 | Add ACME config in server.toml/env | not-started | Enable only when public domain is configured; include contact email, cache dir, challenge type, and staging/prod toggle |
+| 6.4.2 | Implement cert issuance/renewal loop | not-started | Auto-provision and renew certs for HTTPS/WSS/H3 endpoints; hot-reload certs in memory |
+| 6.4.3 | Add challenge routing and ops docs | not-started | Support HTTP-01 and/or TLS-ALPN-01; document required inbound ports and DNS prerequisites |
+| 6.4.4 | Add LE fallback behavior | not-started | If ACME fails, continue with configured static certs or explicit startup error depending on strict mode |
+
+### Bootstrap Sequence (Target)
+
+1. Client pairs (QR or manual) and gets `server_public_address` (`host:port`), invite token, and server public key (ed25519).
+2. The `host:port` from pairing **is** the bootstrap endpoint — no additional port needed.
+3. Client opens TLS connection to `https://<host>:<port>`. If the TLS cert validates via the system root CA store (or a stored fingerprint pin), proceed normally. If it does not (self-signed, private CA, or no stored pin yet), the client connects with TLS cert verification **disabled**, immediately calls `GET /v1/bootstrap/cert-proof`, and verifies the ed25519 signature over the cert fingerprint using the server public key from the QR payload — no credential material is sent before this check; if the signature is invalid the connection is aborted (MITM); if valid the fingerprint is pinned and persisted. If TLS fails on a future reconnect due to cert rotation, the client re-runs this step rather than hard-failing.
+4. Client proves device identity with device keypair over the now-trusted TLS channel.
+5. Server returns a capability document: which transports are enabled, the HTTP/3 UDP endpoint (same host:port as bootstrap but UDP), and the WireGuard UDP endpoint (separate dedicated UDP port).
+6. **Wave 1 — concurrent dial:** Client dials WSS and H3 concurrently across each available network interface. The first to succeed on each interface is used immediately. Preference order (WSS > H3 by default) promotes one to primary when both succeed on the same interface; the other is kept as hot standby. `naive_tcp` is a debug-only fallback excluded from the production dial set.
+7. **Wave 2 — WireGuard provisioning (background):** After wave 1 establishes at least one working path, client requests WG peer config over the bootstrap API (requires a wave-1 path to be live). Server returns a signed peer assignment including the dedicated WG UDP endpoint, client tunnel IP, allowed IPs, and expiry. Client establishes WG path in the background and adds it to the session once live. WG cannot participate in wave 1 because it requires this bootstrap round-trip first.
+8. Session layer uses all successful paths concurrently; scheduler remains transport-agnostic.
+
+Acceptance gate:
+
+- Single `host:port` from pairing payload reaches HTTPS/WSS (TCP) and HTTP/3 (UDP) on the same port number
+- Bootstrap API is reachable via HTTPS/WSS and HTTP/3
+- Self-signed cert is accepted after ed25519 cert-proof verification; fingerprint is persisted and reused on reconnect; cert rotation triggers re-proof rather than hard failure
+- QUIC/HTTP3 path can carry session traffic and coexist with WSS in one session
+- WireGuard path can be provisioned from bootstrap API (wave 2) and coexist with WSS/QUIC
+- WireGuard peer assignments survive server restart without requiring re-pairing
+- NaiveTCP is disabled in production server config; WSS is the default encrypted transport
+- TUN MTU is set to 1420 (or lower); all transports enforce matching max frame payload sizes
+- Optional Let’s Encrypt mode can issue and rotate certs without manual restart
+
+---
+
 ## Deferred to Later Phases
 
 These are in v1 scope but depend on the above being stable first:
 
 - **Peer connection sharing (CR-7)** — mDNS discovery, peer trust handshake, bidirectional path sharing
-- **ShadowSocks transport** — evaluate effort after WSS and QUIC
+- **ShadowSocks transport** — deferred until WSS and QUIC are stable and validated in production; CR-8 lists it as "v1 if feasible" but the effort is not justified before the primary transports are proven
+- **Bootstrap API rate limiting** — per-IP and per-token rate limits on `/v1/bootstrap/*` endpoints; deferred until bootstrap API is implemented and attack surface is better understood; mitigated in the interim by invite token single-use semantics and device keypair binding
 - **Battery optimization (AND-6)**
 - **Quick settings tile (AND-7)**
 
@@ -462,6 +544,18 @@ Decisions made during implementation that aren't in the requirements docs.
 | Android FFI session worker heartbeat now uses 25s interval ticks (no 50ms cycle counter) | 2026-05-09 | Replaced `tokio::time::sleep(50ms)` counter loop with `tokio::time::interval(25s)` + `MissedTickBehavior::Delay`, reducing idle CPU wakeups in Wi-Fi-only operation while keeping periodic keepalive pings |
 | Android FFI session stop uses cancellation token + bounded join timeout | 2026-05-10 | Replaced atomic stop flag with `tokio_util::sync::CancellationToken` in the worker loop and switched stop teardown to a 250ms join timeout path, preventing long UI-visible hangs while still triggering cooperative shutdown |
 | Android FFI cancellation now explicitly closes client transports before worker exit | 2026-05-10 | Added `ClientTransport::close()` plumbing over NaiveTCP/WebSocket transports and invoked it from the cancellation branch with a bounded timeout, so transport sockets are actively closed instead of waiting for passive drop semantics |
+| Production bootstrap uses `server_public_address` from pairing as the single bootstrap endpoint for all transports | 2026-05-10 | The `host:port` in the pairing QR payload is the bootstrap endpoint for WSS/HTTPS (TCP) and HTTP/3/WireGuard (same port, UDP); no extra configuration needed; 443 is the recommended default but any port works |
+| TLS trust for self-signed certs uses ed25519 signature over cert fingerprint (task 6.0.5) | 2026-05-11 | Client already holds server ed25519 public key from QR payload; if TLS cert is not system-CA-trusted, server signs SHA-256(cert DER) with its identity key and the client verifies before pinning; MITM is impossible without the private identity key; no new QR fields required; LE-issued certs skip this step |
+| ShadowSocks transport deferred past v1 | 2026-05-11 | CR-8 marks it "v1 if feasible"; deferred until WSS and QUIC/HTTP3 are stable in production; censorship-resistance use case is lower priority than reliability and latency goals |
+| Bootstrap API rate limiting deferred until API is implemented | 2026-05-11 | Per-IP and per-token rate limits on `/v1/bootstrap/*` are a real attack surface but premature to design before the API shape is known; interim protection comes from single-use invite tokens and device keypair binding |
+| All transports dial concurrently; preferred path wins primary slot | 2026-05-11 | Sequential dialing adds startup latency equal to each failing transport's timeout; concurrent dial lets the fastest-succeeding path carry traffic immediately while slower paths complete or time out in the background; preference order (WSS > H3 > WG) is configurable and used only when multiple paths succeed simultaneously |
+| WireGuard runs as in-process crypto engine with no second TUN | 2026-05-11 | Android gives one TUN fd to the VPN app; a kernel or full-userspace WG that owns its own TUN is incompatible with this model; instead `boringtun` runs inline — plaintext session frames pass through the WG crypto layer and egress as UDP datagrams, symmetric with how NaiveTCP sends over a TCP socket; scheduler sees WG as just another `ClientTransport`; inner payload is a session frame not a raw IP packet so there is no tunnel IP, no allowed-IPs, and no IP routing layer — WG is used purely for its Noise handshake and ChaCha20 encryption; standard two-peer raw-IP WG would be a separate non-bondable VPN path incompatible with CR-1/CR-2 |
+| `SocketProtectFn` extended to cover UDP sockets for QUIC and WireGuard | 2026-05-11 | Existing `protect_fd()` only guarded NaiveTCP TCP sockets; QUIC and WireGuard each create UDP sockets that must also be protected before use on Android or they enter the VPN routing loop; protect callback invoked in every transport's socket-creation path; no-op on non-Android |
+| TLS cert-proof uses verify=disabled initial connection; ed25519 is the real trust anchor | 2026-05-12 | Client cannot verify a self-signed cert at TLS time; the trick is to connect with verification disabled, fetch the cert-proof, verify ed25519 synchronously, then pin — no secret is sent before ed25519 passes; future connections use the pinned fingerprint to verify normally |
+| WireGuard dials in wave 2 (after wave 1 WSS/H3 succeeds) not wave 1 | 2026-05-12 | WG provisioning requires a bootstrap API round-trip to obtain server WG pubkey and peer config, which itself requires a live transport; WSS and H3 dial concurrently in wave 1; WG provisions in the background once wave 1 has a live path |
+| TUN MTU default is 1420; all transports enforce matching max frame payload | 2026-05-12 | Worst-case transport overhead is ~60 bytes (WireGuard: 32-byte WG header + outer UDP/IP); 1500 - 80 = 1420 provides safe headroom for all transport types; Android `Builder.setMtu(1420)` called at VPN bring-up before transport paths are known; each `ClientTransport` caps its frame payload to match so the outer packet never exceeds the outer network MTU |
+| NaiveTCP retired from production at Phase 6 acceptance; WSS is default encrypted transport | 2026-05-12 | CR-5 requires encryption; NaiveTCP has no TLS layer; it remains available as a debug-only opt-in but must be disabled by default in production server config once WSS is stable |
+| Let’s Encrypt automation is conditional on configured public domain and should be the default certificate source in managed mode | 2026-05-10 | ACME-managed certificates should feed all TLS consumers (HTTPS/WSS/H3) with hot reload; static cert files remain fallback |
 
 ---
 
