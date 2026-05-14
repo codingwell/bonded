@@ -50,6 +50,7 @@ use authorized_keys::{AuthorizedKeysStore, AuthorizedKeysWatcher};
 
 use anyhow::Context as _;
 use bonded_core::config::{load_server_config, ServerConfig, DEFAULT_SERVER_CONFIG_PATH};
+use rcgen;
 use bonded_core::session::{SessionFrame, SessionHeader, FLAG_PING, FLAG_PONG};
 use bonded_core::transport::{NaiveTcpTransport, Transport};
 use clap::Parser;
@@ -184,6 +185,7 @@ async fn main() -> anyhow::Result<()> {
     let (tls_acceptor, tls_cert_der, tls_key_der) = load_tls_acceptor(
         &cfg.server.tls_cert_file,
         &cfg.server.tls_key_file,
+        &cfg.server.hostname,
         acme_slot.clone(),
     )?;
     let quic_cert_der = tls_cert_der.clone();
@@ -354,14 +356,46 @@ fn ensure_state_file(path: &str, default_contents: &str, description: &str) -> a
 /// `acme_slot`) and all other connections to the main server cert.
 ///
 /// Returns `(None, None, None)` when either path is empty (TLS disabled).
+/// If both `cert_file` and `key_file` are configured but neither file exists yet,
+/// write a self-signed certificate so the server can start without manual TLS setup.
+fn ensure_self_signed_cert(cert_file: &str, key_file: &str, hostname: &str) -> anyhow::Result<()> {
+    if Path::new(cert_file).exists() && Path::new(key_file).exists() {
+        return Ok(());
+    }
+    info!("TLS files not found — generating self-signed certificate");
+    let san = if hostname.is_empty() { "localhost" } else { hostname };
+    let key_pair = rcgen::KeyPair::generate().context("self-signed: generate key pair")?;
+    let params =
+        rcgen::CertificateParams::new(vec![san.to_string()]).context("self-signed: build params")?;
+    let cert = params
+        .self_signed(&key_pair)
+        .context("self-signed: sign certificate")?;
+    for path in [cert_file, key_file] {
+        if let Some(parent) = Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("create dirs for {path}"))?;
+            }
+        }
+    }
+    std::fs::write(cert_file, cert.pem())
+        .with_context(|| format!("write self-signed cert to {cert_file}"))?;
+    std::fs::write(key_file, key_pair.serialize_pem())
+        .with_context(|| format!("write self-signed key to {key_file}"))?;
+    info!("Self-signed certificate written to {cert_file} and {key_file}");
+    Ok(())
+}
+
 fn load_tls_acceptor(
     cert_file: &str,
     key_file: &str,
+    hostname: &str,
     acme_slot: acme::AcmeChallengeSlot,
 ) -> anyhow::Result<(Option<TlsAcceptor>, Option<Vec<u8>>, Option<Vec<u8>>)> {
     if cert_file.trim().is_empty() || key_file.trim().is_empty() {
         return Ok((None, None, None));
     }
+    ensure_self_signed_cert(cert_file, key_file, hostname)?;
 
     let cert_reader = std::fs::File::open(cert_file)?;
     let mut cert_reader = BufReader::new(cert_reader);
