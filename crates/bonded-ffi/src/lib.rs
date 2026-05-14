@@ -434,6 +434,8 @@ fn start_android_session(
                         let kind = match transport {
                             bonded_client::ClientTransport::NaiveTcp(_) => "NaiveTCP",
                             bonded_client::ClientTransport::WebSocket(_) => "WebSocketTLS",
+                            bonded_client::ClientTransport::Quic(_) => "QUIC",
+                            bonded_client::ClientTransport::WireGuard(_) => "WireGuard",
                         };
                         eprintln!(
                             "[bonded-ffi] Transport path {}: {}",

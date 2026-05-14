@@ -7,6 +7,7 @@ use thiserror::Error;
 pub const DEFAULT_SERVER_CONFIG_PATH: &str = "/etc/bonded/server.toml";
 pub const DEFAULT_AUTHORIZED_KEYS_PATH: &str = "/var/lib/bonded/authorized_keys.toml";
 pub const DEFAULT_INVITE_TOKENS_PATH: &str = "/var/lib/bonded/invite_tokens.toml";
+pub const DEFAULT_SERVER_IDENTITY_KEY_PATH: &str = "/var/lib/bonded/server-identity.pem";
 
 pub const DEFAULT_CLIENT_CONFIG_PATH: &str = "~/.config/bonded/client.toml";
 pub const DEFAULT_CLIENT_PRIVATE_KEY_PATH: &str = "~/.local/share/bonded/device-key.pem";
@@ -74,6 +75,37 @@ pub struct ServerSection {
     pub log_level: String,
     pub authorized_keys_file: String,
     pub invite_tokens_file: String,
+    /// Path where the server's stable ed25519 identity key is persisted.
+    /// Created automatically on first boot; must not change after pairing QR codes are issued.
+    pub identity_key_file: String,
+    /// Enable the QUIC (HTTP/3) endpoint on the same bind address as the
+    /// WebSocket TLS listener (UDP).  Requires TLS to be configured.
+    #[serde(default)]
+    pub quic_enabled: bool,
+    /// Enable the WireGuard peer-provisioning endpoint.
+    #[serde(default)]
+    pub wireguard_enabled: bool,
+    /// Path to the 32-byte WireGuard private key seed file.  Generated on
+    /// first boot when `wireguard_enabled = true`.
+    #[serde(default)]
+    pub wireguard_key_file: Option<String>,
+    /// Domain for which to obtain a Let's Encrypt certificate via ACME HTTP-01.
+    /// If set, ACME automation is enabled and the server will manage TLS certs
+    /// automatically.  Requires the server to be reachable on port 80.
+    #[serde(default)]
+    pub acme_domain: Option<String>,
+    /// Contact e-mail sent to Let's Encrypt.  Required if `acme_domain` is set.
+    #[serde(default)]
+    pub acme_email: Option<String>,
+    /// Path to write the ACME-issued PEM certificate.  Default: `acme-cert.pem`.
+    #[serde(default)]
+    pub acme_cert_file: Option<String>,
+    /// Path to write the ACME-issued PEM private key.  Default: `acme-key.pem`.
+    #[serde(default)]
+    pub acme_key_file: Option<String>,
+    /// Use the Let's Encrypt staging environment (recommended for testing).
+    #[serde(default)]
+    pub acme_staging: bool,
 }
 
 impl Default for ServerSection {
@@ -85,7 +117,7 @@ impl Default for ServerSection {
             forwarding_mode: "proxy".to_owned(),
             tun_name: "bonded0".to_owned(),
             tun_cidr: "100.64.0.1/24".to_owned(),
-            tun_mtu: 1400,
+            tun_mtu: 1420,
             tun_egress_interface: String::new(),
             websocket_tls_cert_file: String::new(),
             websocket_tls_key_file: String::new(),
@@ -95,6 +127,15 @@ impl Default for ServerSection {
             log_level: "info".to_owned(),
             authorized_keys_file: DEFAULT_AUTHORIZED_KEYS_PATH.to_owned(),
             invite_tokens_file: DEFAULT_INVITE_TOKENS_PATH.to_owned(),
+            identity_key_file: DEFAULT_SERVER_IDENTITY_KEY_PATH.to_owned(),
+            quic_enabled: false,
+            wireguard_enabled: false,
+            wireguard_key_file: None,
+            acme_domain: None,
+            acme_email: None,
+            acme_cert_file: None,
+            acme_key_file: None,
+            acme_staging: false,
         }
     }
 }
@@ -113,6 +154,10 @@ pub struct ClientSection {
     pub device_name: String,
     pub tun_name: String,
     pub server_public_address: String,
+    /// Deprecated: use `server_public_address` (the bootstrap port serves both
+    /// WSS and HTTPS).  Kept for backward compatibility; takes precedence over
+    /// `server_public_address` for WebSocket connections when non-empty.
+    #[serde(default)]
     pub server_websocket_address: String,
     pub path_bind_addresses: Vec<String>,
     pub server_public_key: String,
@@ -120,6 +165,18 @@ pub struct ClientSection {
     pub preferred_protocols: Vec<String>,
     pub private_key_path: String,
     pub public_key_path: String,
+    /// Pinned SHA-256 fingerprint of the server TLS leaf certificate
+    /// (`"sha256:<hex>"`).  Empty string means no pin stored yet; the client
+    /// will fetch and verify a cert-proof on the next connection and then
+    /// persist the fingerprint here.  When non-empty the fingerprint is checked
+    /// against the cert presented by the server; a mismatch triggers a
+    /// re-proof rather than a hard failure (handles cert rotation).
+    #[serde(default)]
+    pub tls_cert_fingerprint: String,
+    /// Server's WireGuard X25519 public key (base64), provisioned from
+    /// `/v1/bootstrap/wireguard/peer` during pairing.
+    #[serde(default)]
+    pub wireguard_server_public_key: String,
 }
 
 impl Default for ClientSection {
@@ -135,6 +192,8 @@ impl Default for ClientSection {
             preferred_protocols: vec!["naive_tcp".to_owned(), "wss".to_owned()],
             private_key_path: DEFAULT_CLIENT_PRIVATE_KEY_PATH.to_owned(),
             public_key_path: DEFAULT_CLIENT_PUBLIC_KEY_PATH.to_owned(),
+            tls_cert_fingerprint: String::new(),
+            wireguard_server_public_key: String::new(),
         }
     }
 }
@@ -162,7 +221,7 @@ mod tests {
         assert_eq!(cfg.server.forwarding_mode, "proxy");
         assert_eq!(cfg.server.tun_name, "bonded0");
         assert_eq!(cfg.server.tun_cidr, "100.64.0.1/24");
-        assert_eq!(cfg.server.tun_mtu, 1400);
+        assert_eq!(cfg.server.tun_mtu, 1420);
         assert!(cfg.server.tun_egress_interface.is_empty());
         assert!(cfg.server.websocket_tls_cert_file.is_empty());
         assert!(cfg.server.websocket_tls_key_file.is_empty());
@@ -184,7 +243,7 @@ bind = "127.0.0.1:9000"
         assert_eq!(cfg.server.forwarding_mode, "proxy");
         assert_eq!(cfg.server.tun_name, "bonded0");
         assert_eq!(cfg.server.tun_cidr, "100.64.0.1/24");
-        assert_eq!(cfg.server.tun_mtu, 1400);
+        assert_eq!(cfg.server.tun_mtu, 1420);
         assert!(cfg.server.tun_egress_interface.is_empty());
         assert_eq!(cfg.server.health_bind, "0.0.0.0:8081");
         assert_eq!(cfg.server.log_level, "info");

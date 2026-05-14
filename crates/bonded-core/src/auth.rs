@@ -4,6 +4,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -161,6 +162,71 @@ pub fn sign_auth_challenge(
     Ok(base64::engine::general_purpose::STANDARD.encode(signature.to_bytes()))
 }
 
+/// Sign arbitrary bytes with the keypair's private key.
+/// The signature is returned as standard base64.
+pub fn sign_bytes(keypair: &DeviceKeypair, message: &[u8]) -> Result<String, AuthError> {
+    let signing_key = keypair.signing_key()?;
+    let signature = signing_key.sign(message);
+    Ok(base64::engine::general_purpose::STANDARD.encode(signature.to_bytes()))
+}
+
+/// Verify an ed25519 signature over arbitrary bytes.
+///
+/// `public_key_b64` — standard base64 encoded 32-byte ed25519 public key  
+/// `message`        — the signed message bytes  
+/// `signature_b64`  — standard base64 encoded 64-byte signature (as produced by `sign_bytes`)
+pub fn verify_signature(
+    public_key_b64: &str,
+    message: &[u8],
+    signature_b64: &str,
+) -> Result<(), AuthError> {
+    let public_key = base64::engine::general_purpose::STANDARD.decode(public_key_b64)?;
+    let public_key_bytes: [u8; 32] = public_key
+        .as_slice()
+        .try_into()
+        .map_err(|_| AuthError::InvalidPublicKeyLength(public_key.len()))?;
+    let verifying_key = VerifyingKey::from_bytes(&public_key_bytes)
+        .map_err(|_| AuthError::InvalidPublicKeyLength(public_key.len()))?;
+
+    let sig_bytes = base64::engine::general_purpose::STANDARD.decode(signature_b64)?;
+    let sig_bytes: [u8; 64] = sig_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| AuthError::InvalidSignatureLength(sig_bytes.len()))?;
+    let signature = Signature::from_bytes(&sig_bytes);
+
+    verifying_key
+        .verify(message, &signature)
+        .map_err(|_| AuthError::SignatureVerificationFailed)
+}
+
+/// Load a `DeviceKeypair` from `path`, or create and persist a new one if the
+/// file does not exist.  The private key is stored as raw base64 (one line).
+/// Fails if the file exists but cannot be read or parsed.
+pub fn load_or_create_keypair(path: &Path) -> anyhow::Result<DeviceKeypair> {
+    if path.exists() {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("failed to read keypair file {}: {e}", path.display()))?;
+        let private_key_b64 = raw.trim();
+        DeviceKeypair::from_private_key_b64(private_key_b64)
+            .map_err(|e| anyhow::anyhow!("failed to parse keypair at {}: {e}", path.display()))
+    } else {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to create key directory {}: {e}",
+                    parent.display()
+                )
+            })?;
+        }
+        let keypair = DeviceKeypair::generate();
+        std::fs::write(path, format!("{}\n", keypair.private_key_b64)).map_err(|e| {
+            anyhow::anyhow!("failed to write keypair to {}: {e}", path.display())
+        })?;
+        Ok(keypair)
+    }
+}
+
 pub fn verify_auth_challenge(
     public_key_b64: &str,
     challenge_b64: &str,
@@ -289,6 +355,36 @@ mod tests {
 
         let err = verify_auth_challenge(&keypair.public_key_b64, &bad_challenge, &signature)
             .expect_err("signature should fail against a different challenge");
+        assert!(matches!(err, AuthError::SignatureVerificationFailed));
+    }
+
+    #[test]
+    fn verify_signature_roundtrip() {
+        let keypair = DeviceKeypair::generate();
+        let message = b"sha256:abcdef1234567890";
+        let sig = super::sign_bytes(&keypair, message).expect("sign_bytes should succeed");
+        super::verify_signature(&keypair.public_key_b64, message, &sig)
+            .expect("verify_signature should accept valid signature");
+    }
+
+    #[test]
+    fn verify_signature_tampered_message_fails() {
+        let keypair = DeviceKeypair::generate();
+        let sig =
+            super::sign_bytes(&keypair, b"correct message").expect("sign_bytes should succeed");
+        let err = super::verify_signature(&keypair.public_key_b64, b"tampered message", &sig)
+            .expect_err("verify_signature should reject signature over different message");
+        assert!(matches!(err, AuthError::SignatureVerificationFailed));
+    }
+
+    #[test]
+    fn verify_signature_wrong_key_fails() {
+        let signer = DeviceKeypair::generate();
+        let other = DeviceKeypair::generate();
+        let sig =
+            super::sign_bytes(&signer, b"hello").expect("sign_bytes should succeed");
+        let err = super::verify_signature(&other.public_key_b64, b"hello", &sig)
+            .expect_err("verify_signature should reject signature from a different key");
         assert!(matches!(err, AuthError::SignatureVerificationFailed));
     }
 }

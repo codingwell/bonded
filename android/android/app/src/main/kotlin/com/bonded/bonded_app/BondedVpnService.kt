@@ -127,12 +127,12 @@ class BondedVpnService : VpnService() {
             try {
                 android.util.Log.d(
                         "BondedVPN",
-                        "Establishing VPN interface: address=10.8.0.2/32, mtu=1500, route=0.0.0.0/0"
+                        "Establishing VPN interface: address=10.8.0.2/32, mtu=1420, route=0.0.0.0/0"
                 )
                 val builder =
                         Builder()
                                 .setSession("Bonded")
-                                .setMtu(1500)
+                                .setMtu(1420)
                                 .addAddress("10.8.0.2", 32)
                                 .addRoute("0.0.0.0", 0)
                                 .addDnsServer("8.8.8.8")

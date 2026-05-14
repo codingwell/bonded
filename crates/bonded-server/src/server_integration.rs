@@ -170,6 +170,7 @@ uses_remaining = 1
 
 #[tokio::test]
 async fn authenticated_websocket_client_can_exchange_session_frame() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let keypair = DeviceKeypair::generate();
     let path = temp_file_path("server-ws-e2e");
     let invites = temp_file_path("server-ws-e2e-invites");

@@ -161,6 +161,82 @@ pub async fn perform_websocket_auth_handshake(
     Ok(hello.public_key_b64)
 }
 
+/// Run the authentication handshake over a QUIC transport.
+///
+/// This is the server side of the challenge-response auth handshake.  It uses
+/// `QuicTransport::send_text` / `recv_text` (line-delimited JSON) which are
+/// backed by the raw QUIC stream bytes — identical to the WebSocket text-frame
+/// handshake in terms of wire encoding.
+///
+/// Returns the authenticated client's public key (base64).
+pub async fn perform_quic_auth_handshake(
+    transport: &mut bonded_core::transport::QuicTransport,
+    invite_tokens_file: &str,
+    authorized_keys: &AuthorizedKeysStore,
+) -> anyhow::Result<String> {
+    let hello_line = transport
+        .recv_text()
+        .await
+        .context("QUIC: failed to read client hello")?;
+    let hello: ClientHello = serde_json::from_str(hello_line.trim_end())
+        .context("QUIC: invalid client hello JSON")?;
+
+    if !authorized_keys.is_authorized(&hello.public_key_b64) {
+        let redeemed = if hello.invite_token.trim().is_empty() {
+            false
+        } else {
+            redeem_invite_token(
+                std::path::Path::new(invite_tokens_file),
+                &hello.invite_token,
+            )
+            .context("QUIC: failed to redeem invite token")?
+        };
+
+        if redeemed {
+            let _added = authorize_device_key(
+                authorized_keys.path(),
+                &hello.public_key_b64,
+            )
+            .context("QUIC: failed to persist authorized key")?;
+            authorized_keys
+                .reload()
+                .context("QUIC: failed to reload authorized keys")?;
+        } else {
+            transport
+                .send_text(&serde_json::to_string(&ServerAuthResult {
+                    status: "unauthorized".to_owned(),
+                })?)
+                .await?;
+            anyhow::bail!("QUIC: client key is not authorized");
+        }
+    }
+
+    let challenge = create_auth_challenge();
+    transport
+        .send_text(&serde_json::to_string(&ServerChallenge {
+            challenge_b64: challenge.clone(),
+        })?)
+        .await?;
+
+    let proof_line = transport
+        .recv_text()
+        .await
+        .context("QUIC: failed to read client proof")?;
+    let proof: ClientProof = serde_json::from_str(proof_line.trim_end())
+        .context("QUIC: invalid client proof JSON")?;
+
+    verify_auth_challenge(&hello.public_key_b64, &challenge, &proof.signature_b64)
+        .context("QUIC: challenge signature verification failed")?;
+
+    transport
+        .send_text(&serde_json::to_string(&ServerAuthResult {
+            status: "ok".to_owned(),
+        })?)
+        .await?;
+
+    Ok(hello.public_key_b64)
+}
+
 async fn read_json_line<T>(
     reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
 ) -> anyhow::Result<T>

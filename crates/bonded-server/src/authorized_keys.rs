@@ -28,6 +28,17 @@ pub struct AuthorizedKeysStore {
     devices: Arc<RwLock<HashMap<String, AuthorizedDevice>>>,
 }
 
+impl Default for AuthorizedKeysStore {
+    /// Creates an empty in-memory store with no backing file.  Useful for
+    /// tests and server instances that don't require device authorisation.
+    fn default() -> Self {
+        Self {
+            path: PathBuf::new(),
+            devices: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+}
+
 impl AuthorizedKeysStore {
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref().to_path_buf();

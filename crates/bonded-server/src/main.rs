@@ -3,15 +3,19 @@ use std::path::PathBuf;
 
 mod auth_handshake;
 mod authorized_keys;
+mod bootstrap;
 mod health;
 mod invite_tokens;
 mod network_runtime;
 mod pairing_qr;
+mod acme;
+mod quic;
 mod session_registry;
 mod smoltcp_forwarder;
 mod status;
 mod tun_bridge;
 mod tunnel_pcap;
+mod wireguard;
 
 #[cfg(test)]
 mod server_integration;
@@ -41,9 +45,9 @@ mod channel_tests {
     }
 }
 
-use auth_handshake::{perform_auth_handshake, perform_websocket_auth_handshake};
+use auth_handshake::perform_auth_handshake;
 use authorized_keys::{AuthorizedKeysStore, AuthorizedKeysWatcher};
-use bonded_core::auth::DeviceKeypair;
+
 use bonded_core::config::{load_server_config, ServerConfig, DEFAULT_SERVER_CONFIG_PATH};
 use bonded_core::session::{SessionFrame, SessionHeader, FLAG_PING, FLAG_PONG};
 use bonded_core::transport::{NaiveTcpTransport, Transport};
@@ -139,7 +143,9 @@ async fn main() -> anyhow::Result<()> {
         token = %invite.token,
         "startup invite token ready"
     );
-    let server_identity = DeviceKeypair::generate();
+    let server_identity = Arc::new(
+        bonded_core::auth::load_or_create_keypair(Path::new(&cfg.server.identity_key_file))?
+    );
     let _ = emit_pairing_qr(
         &cfg.server.public_address,
         &invite,
@@ -168,7 +174,6 @@ async fn main() -> anyhow::Result<()> {
 
     info!(bind = %cfg.server.bind, "bonded-server starting");
     let websocket_bind = cfg.server.websocket_bind.clone();
-    let websocket_upstream = cfg.server.upstream_tcp_target.clone();
     let websocket_invites = cfg.server.invite_tokens_file.clone();
     let websocket_sessions = sessions.clone();
     let websocket_forwarders = forwarders.clone();
@@ -178,25 +183,116 @@ async fn main() -> anyhow::Result<()> {
         &cfg.server.websocket_tls_cert_file,
         &cfg.server.websocket_tls_key_file,
     )?;
+    let (websocket_tls_acceptor, tls_cert_der, tls_key_der) = websocket_tls_acceptor;
+    let quic_cert_der = tls_cert_der.clone();
+    let quic_key_der = tls_key_der.clone();
+
+    // WireGuard server keypair and peer registry.
+    let (wg_keypair, wg_peer_registry, wg_enabled) = if cfg.server.wireguard_enabled {
+        let key_path = cfg
+            .server
+            .wireguard_key_file
+            .as_deref()
+            .unwrap_or("bonded-server-wg.key");
+        let kp = wireguard::load_or_generate_wg_keypair(key_path)?;
+        let registry = Arc::new(wireguard::WireGuardPeerRegistry::new());
+        (Some(kp), Some(registry), true)
+    } else {
+        (None, None, false)
+    };
+
+    // ACME Let's Encrypt certificate automation.
+    if let Some(domain) = cfg.server.acme_domain.as_deref() {
+        let email = cfg
+            .server
+            .acme_email
+            .clone()
+            .unwrap_or_else(|| format!("admin@{domain}"));
+        let acme_cfg = acme::AcmeConfig {
+            domain: domain.to_owned(),
+            email,
+            cert_file: cfg
+                .server
+                .acme_cert_file
+                .clone()
+                .unwrap_or_else(|| "acme-cert.pem".to_owned()),
+            key_file: cfg
+                .server
+                .acme_key_file
+                .clone()
+                .unwrap_or_else(|| "acme-key.pem".to_owned()),
+            staging: cfg.server.acme_staging,
+        };
+        let challenge_store = acme::AcmeChallengeStore::new();
+        acme::spawn_acme_renewal_loop(acme_cfg, challenge_store, || {
+            info!("ACME certificate renewed; TLS reload not yet automated (Phase 6)");
+        })
+        .await;
+    }
+
+    let bootstrap_ctx = Arc::new(bootstrap::BootstrapContext {
+        server_identity: server_identity.clone(),
+        tls_cert_der: tls_cert_der.map(Arc::new),
+        server_public_address: cfg.server.public_address.clone(),
+        quic_enabled: cfg.server.quic_enabled,
+        wireguard_enabled: wg_enabled,
+        wireguard_keypair: wg_keypair,
+        wireguard_peers: wg_peer_registry,
+    });
     if tun_bridge.is_none() {
         tokio::spawn(async move {
-            if let Err(err) = run_websocket_server(
+            if let Err(err) = bootstrap::run_bootstrap_websocket_server(
                 &websocket_bind,
-                &websocket_upstream,
                 &websocket_invites,
                 websocket_keys,
                 websocket_sessions,
                 websocket_forwarders,
                 websocket_tls_acceptor,
                 websocket_tunnel_pcap,
+                bootstrap_ctx,
             )
             .await
             {
-                error!(bind = %websocket_bind, error = %err, "websocket listener terminated");
+                error!(bind = %websocket_bind, error = %err, "bootstrap listener terminated");
             }
         });
+
+        // Start the QUIC endpoint on the same bind address as WebSocket TLS
+        // (UDP instead of TCP) when `server.quic_enabled = true` and TLS is
+        // configured.
+        if cfg.server.quic_enabled {
+            match (quic_cert_der, quic_key_der) {
+                (Some(cert_der), Some(key_der)) => {
+                    let quic_bind = cfg.server.websocket_bind.clone();
+                    let quic_invites = cfg.server.invite_tokens_file.clone();
+                    let quic_keys = authorized_keys.clone();
+                    let quic_sessions = sessions.clone();
+                    let quic_forwarders = forwarders.clone();
+                    tokio::spawn(async move {
+                        if let Err(err) = quic::run_quic_server(
+                            &quic_bind,
+                            cert_der,
+                            key_der,
+                            quic_invites,
+                            quic_keys,
+                            quic_sessions,
+                            quic_forwarders,
+                        )
+                        .await
+                        {
+                            error!(bind = %quic_bind, error = %err, "QUIC listener terminated");
+                        }
+                    });
+                }
+                _ => {
+                    warn!(
+                        "quic_enabled = true but TLS is not configured; QUIC endpoint not started"
+                    );
+                }
+            }
+        }
     } else {
-        warn!("forwarding_mode=tun currently supports naive-tcp transport only; websocket listener not started");
+        warn!("forwarding_mode=tun currently supports naive-tcp transport only; bootstrap listener not started");
     }
 
     tokio::select! {
@@ -256,222 +352,12 @@ fn ensure_state_file(path: &str, default_contents: &str, description: &str) -> a
     Ok(())
 }
 
-async fn run_websocket_server(
-    bind: &str,
-    _upstream_tcp_target: &str,
-    invite_tokens_file: &str,
-    authorized_keys: AuthorizedKeysStore,
-    sessions: SessionRegistry,
-    forwarders: ForwarderRegistry,
-    tls_acceptor: Option<TlsAcceptor>,
-    tunnel_pcap: Option<Arc<TunnelPcapLogger>>,
-) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(bind).await?;
-    info!(bind = %bind, "websocket listener bound");
-
-    loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(value) => value,
-            Err(err) => {
-                error!(error = %err, "failed to accept incoming websocket connection");
-                continue;
-            }
-        };
-
-        let authorized_keys = authorized_keys.clone();
-        let sessions = sessions.clone();
-        let forwarders = forwarders.clone();
-        let invite_tokens_file = invite_tokens_file.to_owned();
-        let tls_acceptor = tls_acceptor.clone();
-        let tunnel_pcap = tunnel_pcap.clone();
-        tokio::spawn(async move {
-            let mut transport = match tls_acceptor {
-                Some(acceptor) => {
-                    match bonded_core::transport::WebSocketTlsTransport::accept_tls(
-                        stream, acceptor,
-                    )
-                    .await
-                    {
-                        Ok(value) => value,
-                        Err(err) => {
-                            warn!(peer = %peer, error = %err, "wss upgrade failed");
-                            return;
-                        }
-                    }
-                }
-                None => match bonded_core::transport::WebSocketTlsTransport::accept(stream).await {
-                    Ok(value) => value,
-                    Err(err) => {
-                        warn!(peer = %peer, error = %err, "websocket upgrade failed");
-                        return;
-                    }
-                },
-            };
-
-            match perform_websocket_auth_handshake(
-                &mut transport,
-                authorized_keys,
-                std::path::Path::new(&invite_tokens_file),
-            )
-            .await
-            {
-                Ok(public_key) => {
-                    let handle = sessions.register_client(public_key.clone());
-                    info!(
-                        peer = %peer,
-                        public_key = %public_key,
-                        session_id = handle.session_id,
-                        active_sessions = sessions.active_sessions(),
-                        "websocket client authenticated"
-                    );
-
-                    info!(
-                        peer = %peer,
-                        session_id = handle.session_id,
-                        "starting websocket frame receive loop"
-                    );
-                    let (forward_tx, mut forward_rx) = mpsc::unbounded_channel();
-                    let forwarder = Arc::new(SmoltcpForwarder::new(handle.session_id, forward_tx));
-                    forwarders
-                        .write()
-                        .expect("forwarder registry lock should not be poisoned")
-                        .insert(handle.session_id, forwarder.clone());
-
-                    loop {
-                        // Drain queued forwarded frames before blocking in select! so bursty
-                        // response traffic is not serialized to one frame per scheduler turn.
-                        for _ in 0..MAX_RESPONSE_DRAIN_PER_CYCLE {
-                            let maybe_forwarded_frame = match forward_rx.try_recv() {
-                                Ok(frame) => Some(frame),
-                                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
-                                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                                    break;
-                                }
-                            };
-
-                            let Some(forwarded_frame) = maybe_forwarded_frame else {
-                                break;
-                            };
-
-                            maybe_log_tunnel_packet(&tunnel_pcap, &forwarded_frame.payload);
-                            if let Err(err) = transport.send(forwarded_frame).await {
-                                warn!(
-                                    peer = %peer,
-                                    public_key = %public_key,
-                                    session_id = handle.session_id,
-                                    error = %err,
-                                    "failed to return drained websocket forwarded frame"
-                                );
-                                break;
-                            }
-                        }
-
-                        tokio::select! {
-                            maybe_forwarded_frame = forward_rx.recv() => {
-                                let Some(forwarded_frame) = maybe_forwarded_frame else {
-                                    warn!(
-                                        peer = %peer,
-                                        public_key = %public_key,
-                                        session_id = handle.session_id,
-                                        "websocket forwarder response queue closed"
-                                    );
-                                    break;
-                                };
-
-                                maybe_log_tunnel_packet(&tunnel_pcap, &forwarded_frame.payload);
-                                if let Err(err) = transport.send(forwarded_frame).await {
-                                    warn!(
-                                        peer = %peer,
-                                        public_key = %public_key,
-                                        session_id = handle.session_id,
-                                        error = %err,
-                                        "failed to return websocket forwarded frame"
-                                    );
-                                    break;
-                                }
-                            }
-                            recv_result = transport.recv() => {
-                                match recv_result {
-                                    Ok(frame) => {
-                                        maybe_log_tunnel_packet(&tunnel_pcap, &frame.payload);
-                                        // Respond to heartbeat pings without forwarding them.
-                                        // Only treat ping-bit frames as control heartbeats when
-                                        // they carry no payload; otherwise keep forwarding.
-                                        if frame.header.flags & FLAG_PING != 0 && frame.payload.is_empty() {
-                                            info!(
-                                                peer = %peer,
-                                                session_id = handle.session_id,
-                                                sequence = frame.header.sequence,
-                                                "websocket heartbeat ping received, sending pong"
-                                            );
-                                            let pong = SessionFrame {
-                                                header: SessionHeader {
-                                                    connection_id: frame.header.connection_id,
-                                                    sequence: frame.header.sequence,
-                                                    flags: FLAG_PONG,
-                                                },
-                                                payload: frame.payload,
-                                            };
-                                            if let Err(err) = transport.send(pong).await {
-                                                warn!(
-                                                    peer = %peer,
-                                                    session_id = handle.session_id,
-                                                    error = %err,
-                                                    "failed to send websocket heartbeat pong"
-                                                );
-                                                break;
-                                            }
-                                            continue;
-                                        }
-
-                                        if frame.header.flags & FLAG_PING != 0 {
-                                            warn!(
-                                                peer = %peer,
-                                                session_id = handle.session_id,
-                                                sequence = frame.header.sequence,
-                                                flags = frame.header.flags,
-                                                payload_len = frame.payload.len(),
-                                                "websocket frame has ping flag with payload; forwarding as data"
-                                            );
-                                        }
-
-                                        forwarder.ingest_packet(frame);
-                                    }
-                                    Err(err) => {
-                                        info!(
-                                            peer = %peer,
-                                            public_key = %public_key,
-                                            session_id = handle.session_id,
-                                            error = ?err,
-                                            "websocket client session ended - recv error"
-                                        );
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    forwarder.clear_session();
-                    forwarders
-                        .write()
-                        .expect("forwarder registry lock should not be poisoned")
-                        .remove(&handle.session_id);
-                    sessions.unregister_client(&public_key);
-                }
-                Err(err) => {
-                    warn!(peer = %peer, error = %err, "websocket client authentication failed");
-                }
-            }
-        });
-    }
-}
-
 fn load_websocket_tls_acceptor(
     cert_file: &str,
     key_file: &str,
-) -> anyhow::Result<Option<TlsAcceptor>> {
+) -> anyhow::Result<(Option<TlsAcceptor>, Option<Vec<u8>>, Option<Vec<u8>>)> {
     if cert_file.trim().is_empty() || key_file.trim().is_empty() {
-        return Ok(None);
+        return Ok((None, None, None));
     }
 
     let cert_reader = std::fs::File::open(cert_file)?;
@@ -482,12 +368,20 @@ fn load_websocket_tls_acceptor(
         anyhow::bail!("no certificates found in websocket tls cert file");
     }
 
+    // Capture the DER bytes of the leaf certificate so the bootstrap server can
+    // sign a cert-proof for clients that connect with TLS verify disabled.
+    let leaf_der: Vec<u8> = cert_chain[0].to_vec();
+
     let key = load_private_key(key_file)?;
+
+    // Capture raw key DER bytes for the QUIC endpoint (needs its own TLS config).
+    let key_der: Vec<u8> = key.secret_der().to_vec();
+
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(cert_chain, key)?;
 
-    Ok(Some(TlsAcceptor::from(Arc::new(config))))
+    Ok((Some(TlsAcceptor::from(Arc::new(config))), Some(leaf_der), Some(key_der)))
 }
 
 fn load_private_key(path: &str) -> anyhow::Result<rustls::pki_types::PrivateKeyDer<'static>> {
