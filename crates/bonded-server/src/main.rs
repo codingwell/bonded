@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+mod acme;
 mod auth_handshake;
 mod authorized_keys;
 mod bootstrap;
@@ -8,7 +9,6 @@ mod health;
 mod invite_tokens;
 mod network_runtime;
 mod pairing_qr;
-mod acme;
 mod quic;
 mod session_registry;
 mod smoltcp_forwarder;
@@ -48,6 +48,7 @@ mod channel_tests {
 use auth_handshake::perform_auth_handshake;
 use authorized_keys::{AuthorizedKeysStore, AuthorizedKeysWatcher};
 
+use anyhow::Context as _;
 use bonded_core::config::{load_server_config, ServerConfig, DEFAULT_SERVER_CONFIG_PATH};
 use bonded_core::session::{SessionFrame, SessionHeader, FLAG_PING, FLAG_PONG};
 use bonded_core::transport::{NaiveTcpTransport, Transport};
@@ -143,11 +144,11 @@ async fn main() -> anyhow::Result<()> {
         token = %invite.token,
         "startup invite token ready"
     );
-    let server_identity = Arc::new(
-        bonded_core::auth::load_or_create_keypair(Path::new(&cfg.server.identity_key_file))?
-    );
+    let server_identity = Arc::new(bonded_core::auth::load_or_create_keypair(Path::new(
+        &cfg.server.identity_key_file,
+    ))?);
     let _ = emit_pairing_qr(
-        &cfg.server.public_address,
+        &cfg.server.https_public_addr(),
         &invite,
         &server_identity.public_key_b64,
     );
@@ -172,23 +173,24 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    info!(bind = %cfg.server.bind, "bonded-server starting");
-    let websocket_bind = cfg.server.websocket_bind.clone();
+    info!(bind = %cfg.server.https_bind, "bonded-server starting");
+    let https_bind = cfg.server.https_bind.clone();
+    let acme_slot = acme::AcmeChallengeSlot::new();
     let websocket_invites = cfg.server.invite_tokens_file.clone();
     let websocket_sessions = sessions.clone();
     let websocket_forwarders = forwarders.clone();
     let websocket_keys = authorized_keys.clone();
     let websocket_tunnel_pcap = tunnel_pcap.clone();
-    let websocket_tls_acceptor = load_websocket_tls_acceptor(
-        &cfg.server.websocket_tls_cert_file,
-        &cfg.server.websocket_tls_key_file,
+    let (tls_acceptor, tls_cert_der, tls_key_der) = load_tls_acceptor(
+        &cfg.server.tls_cert_file,
+        &cfg.server.tls_key_file,
+        acme_slot.clone(),
     )?;
-    let (websocket_tls_acceptor, tls_cert_der, tls_key_der) = websocket_tls_acceptor;
     let quic_cert_der = tls_cert_der.clone();
     let quic_key_der = tls_key_der.clone();
 
-    // WireGuard server keypair and peer registry.
-    let (wg_keypair, wg_peer_registry, wg_enabled) = if cfg.server.wireguard_enabled {
+    // WireGuard server keypair and peer registry.  Enabled when wireguard_bind is set.
+    let (wg_keypair, wg_peer_registry) = if cfg.server.wireguard_bind.is_some() {
         let key_path = cfg
             .server
             .wireguard_key_file
@@ -196,12 +198,14 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or("bonded-server-wg.key");
         let kp = wireguard::load_or_generate_wg_keypair(key_path)?;
         let registry = Arc::new(wireguard::WireGuardPeerRegistry::new());
-        (Some(kp), Some(registry), true)
+        (Some(kp), Some(registry))
     } else {
-        (None, None, false)
+        (None, None)
     };
 
-    // ACME Let's Encrypt certificate automation.
+    // ACME Let's Encrypt certificate automation.  Enabled when acme_domain is set.
+    // Writes renewed certs to the same tls_cert_file / tls_key_file paths used by
+    // the TLS listener so the reload path is trivial.
     if let Some(domain) = cfg.server.acme_domain.as_deref() {
         let email = cfg
             .server
@@ -211,20 +215,11 @@ async fn main() -> anyhow::Result<()> {
         let acme_cfg = acme::AcmeConfig {
             domain: domain.to_owned(),
             email,
-            cert_file: cfg
-                .server
-                .acme_cert_file
-                .clone()
-                .unwrap_or_else(|| "acme-cert.pem".to_owned()),
-            key_file: cfg
-                .server
-                .acme_key_file
-                .clone()
-                .unwrap_or_else(|| "acme-key.pem".to_owned()),
+            tls_cert_file: cfg.server.tls_cert_file.clone(),
+            tls_key_file: cfg.server.tls_key_file.clone(),
             staging: cfg.server.acme_staging,
         };
-        let challenge_store = acme::AcmeChallengeStore::new();
-        acme::spawn_acme_renewal_loop(acme_cfg, challenge_store, || {
+        acme::spawn_acme_renewal_loop(acme_cfg, acme_slot, || {
             info!("ACME certificate renewed; TLS reload not yet automated (Phase 6)");
         })
         .await;
@@ -233,87 +228,87 @@ async fn main() -> anyhow::Result<()> {
     let bootstrap_ctx = Arc::new(bootstrap::BootstrapContext {
         server_identity: server_identity.clone(),
         tls_cert_der: tls_cert_der.map(Arc::new),
-        server_public_address: cfg.server.public_address.clone(),
-        quic_enabled: cfg.server.quic_enabled,
-        wireguard_enabled: wg_enabled,
+        server_public_address: cfg.server.https_public_addr(),
         wireguard_keypair: wg_keypair,
         wireguard_peers: wg_peer_registry,
+        wireguard_public_addr: cfg.server.wireguard_public_addr(),
     });
     if tun_bridge.is_none() {
+        let bootstrap_bind = https_bind.clone();
         tokio::spawn(async move {
             if let Err(err) = bootstrap::run_bootstrap_websocket_server(
-                &websocket_bind,
+                &bootstrap_bind,
                 &websocket_invites,
                 websocket_keys,
                 websocket_sessions,
                 websocket_forwarders,
-                websocket_tls_acceptor,
+                tls_acceptor,
                 websocket_tunnel_pcap,
                 bootstrap_ctx,
             )
             .await
             {
-                error!(bind = %websocket_bind, error = %err, "bootstrap listener terminated");
+                error!(bind = %bootstrap_bind, error = %err, "bootstrap listener terminated");
             }
         });
 
-        // Start the QUIC endpoint on the same bind address as WebSocket TLS
-        // (UDP instead of TCP) when `server.quic_enabled = true` and TLS is
-        // configured.
-        if cfg.server.quic_enabled {
-            match (quic_cert_der, quic_key_der) {
-                (Some(cert_der), Some(key_der)) => {
-                    let quic_bind = cfg.server.websocket_bind.clone();
-                    let quic_invites = cfg.server.invite_tokens_file.clone();
-                    let quic_keys = authorized_keys.clone();
-                    let quic_sessions = sessions.clone();
-                    let quic_forwarders = forwarders.clone();
-                    tokio::spawn(async move {
-                        if let Err(err) = quic::run_quic_server(
-                            &quic_bind,
-                            cert_der,
-                            key_der,
-                            quic_invites,
-                            quic_keys,
-                            quic_sessions,
-                            quic_forwarders,
-                        )
-                        .await
-                        {
-                            error!(bind = %quic_bind, error = %err, "QUIC listener terminated");
-                        }
-                    });
+        // Start the QUIC endpoint on the same bind address as the HTTPS/WSS
+        // listener (UDP) whenever TLS is configured — no explicit flag needed.
+        if let (Some(cert_der), Some(key_der)) = (quic_cert_der, quic_key_der) {
+            let quic_bind = https_bind.clone();
+            let quic_invites = cfg.server.invite_tokens_file.clone();
+            let quic_keys = authorized_keys.clone();
+            let quic_sessions = sessions.clone();
+            let quic_forwarders = forwarders.clone();
+            tokio::spawn(async move {
+                if let Err(err) = quic::run_quic_server(
+                    &quic_bind,
+                    cert_der,
+                    key_der,
+                    quic_invites,
+                    quic_keys,
+                    quic_sessions,
+                    quic_forwarders,
+                )
+                .await
+                {
+                    error!(bind = %quic_bind, error = %err, "QUIC listener terminated");
                 }
-                _ => {
-                    warn!(
-                        "quic_enabled = true but TLS is not configured; QUIC endpoint not started"
-                    );
-                }
-            }
+            });
         }
     } else {
         warn!("forwarding_mode=tun currently supports naive-tcp transport only; bootstrap listener not started");
     }
 
-    tokio::select! {
-        result = run_server(
-            &cfg.server.bind,
-            &cfg.server.upstream_tcp_target,
-            &cfg.server.invite_tokens_file,
-            authorized_keys,
-            sessions,
-            forwarders,
-            tun_bridge,
-            tunnel_pcap,
-        ) => result,
-        signal_result = signal::ctrl_c() => {
-            match signal_result {
-                Ok(()) => {
-                    info!("shutdown signal received, cleaning up network runtime");
-                    Ok(())
+    // NaiveTCP debug listener: only started when tcp_bind is configured.
+    if let Some(tcp_bind) = cfg.server.tcp_bind.clone() {
+        tokio::select! {
+            result = run_server(
+                &tcp_bind,
+                &cfg.server.invite_tokens_file,
+                authorized_keys,
+                sessions,
+                forwarders,
+                tun_bridge,
+                tunnel_pcap,
+            ) => result,
+            signal_result = signal::ctrl_c() => {
+                match signal_result {
+                    Ok(()) => {
+                        info!("shutdown signal received, cleaning up network runtime");
+                        Ok(())
+                    }
+                    Err(err) => Err(err.into()),
                 }
-                Err(err) => Err(err.into()),
             }
+        }
+    } else {
+        match signal::ctrl_c().await {
+            Ok(()) => {
+                info!("shutdown signal received, cleaning up network runtime");
+                Ok(())
+            }
+            Err(err) => Err(err.into()),
         }
     }
 }
@@ -352,9 +347,17 @@ fn ensure_state_file(path: &str, default_contents: &str, description: &str) -> a
     Ok(())
 }
 
-fn load_websocket_tls_acceptor(
+/// Build a TLS acceptor from on-disk PEM cert and key files.
+///
+/// The acceptor uses a `DynamicCertResolver` that routes connections with
+/// ALPN `"acme-tls/1"` to the ACME challenge cert (when one is loaded in
+/// `acme_slot`) and all other connections to the main server cert.
+///
+/// Returns `(None, None, None)` when either path is empty (TLS disabled).
+fn load_tls_acceptor(
     cert_file: &str,
     key_file: &str,
+    acme_slot: acme::AcmeChallengeSlot,
 ) -> anyhow::Result<(Option<TlsAcceptor>, Option<Vec<u8>>, Option<Vec<u8>>)> {
     if cert_file.trim().is_empty() || key_file.trim().is_empty() {
         return Ok((None, None, None));
@@ -365,7 +368,7 @@ fn load_websocket_tls_acceptor(
     let cert_chain: Vec<rustls::pki_types::CertificateDer<'static>> =
         rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
     if cert_chain.is_empty() {
-        anyhow::bail!("no certificates found in websocket tls cert file");
+        anyhow::bail!("no certificates found in tls cert file");
     }
 
     // Capture the DER bytes of the leaf certificate so the bootstrap server can
@@ -377,11 +380,24 @@ fn load_websocket_tls_acceptor(
     // Capture raw key DER bytes for the QUIC endpoint (needs its own TLS config).
     let key_der: Vec<u8> = key.secret_der().to_vec();
 
+    // Build a CertifiedKey for the DynamicCertResolver.
+    let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
+        .context("failed to load TLS signing key")?;
+    let main_cert = Arc::new(rustls::sign::CertifiedKey::new(cert_chain, signing_key));
+
+    let resolver = Arc::new(acme::DynamicCertResolver {
+        main_cert,
+        acme_slot,
+    });
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(cert_chain, key)?;
+        .with_cert_resolver(resolver);
 
-    Ok((Some(TlsAcceptor::from(Arc::new(config))), Some(leaf_der), Some(key_der)))
+    Ok((
+        Some(TlsAcceptor::from(Arc::new(config))),
+        Some(leaf_der),
+        Some(key_der),
+    ))
 }
 
 fn load_private_key(path: &str) -> anyhow::Result<rustls::pki_types::PrivateKeyDer<'static>> {
@@ -401,12 +417,11 @@ fn load_private_key(path: &str) -> anyhow::Result<rustls::pki_types::PrivateKeyD
         return Ok(rustls::pki_types::PrivateKeyDer::Pkcs1(key));
     }
 
-    anyhow::bail!("no supported private key found in websocket tls key file");
+    anyhow::bail!("no supported private key found in tls key file");
 }
 
 async fn run_server(
     bind: &str,
-    _upstream_tcp_target: &str,
     invite_tokens_file: &str,
     authorized_keys: AuthorizedKeysStore,
     sessions: SessionRegistry,
@@ -713,57 +728,70 @@ fn apply_env_overrides<F>(cfg: &mut ServerConfig, mut read_env: F)
 where
     F: FnMut(&str) -> Option<String>,
 {
-    if let Some(bind) = read_env("BONDED_BIND") {
-        cfg.server.bind = bind;
+    if let Some(v) = read_env("BONDED_HOSTNAME") {
+        cfg.server.hostname = v;
     }
-    if let Some(websocket_bind) = read_env("BONDED_WEBSOCKET_BIND") {
-        cfg.server.websocket_bind = websocket_bind;
+    if let Some(v) = read_env("BONDED_HTTPS_BIND") {
+        cfg.server.https_bind = v;
     }
-    if let Some(status_bind) = read_env("BONDED_STATUS_BIND") {
-        cfg.server.status_bind = status_bind;
+    if let Some(v) = read_env("BONDED_HTTPS_PUBLIC") {
+        if let Ok(port) = v.parse::<u16>() {
+            cfg.server.https_public = port;
+        }
     }
-    if let Some(forwarding_mode) = read_env("BONDED_FORWARDING_MODE") {
-        cfg.server.forwarding_mode = forwarding_mode;
+    if let Some(v) = read_env("BONDED_TLS_CERT_FILE") {
+        cfg.server.tls_cert_file = v;
     }
-    if let Some(tun_name) = read_env("BONDED_TUN_NAME") {
-        cfg.server.tun_name = tun_name;
+    if let Some(v) = read_env("BONDED_TLS_KEY_FILE") {
+        cfg.server.tls_key_file = v;
     }
-    if let Some(tun_cidr) = read_env("BONDED_TUN_CIDR") {
-        cfg.server.tun_cidr = tun_cidr;
+    if let Some(v) = read_env("BONDED_WIREGUARD_BIND") {
+        cfg.server.wireguard_bind = Some(v);
     }
-    if let Some(tun_mtu) = read_env("BONDED_TUN_MTU") {
-        if let Ok(value) = tun_mtu.parse::<u16>() {
+    if let Some(v) = read_env("BONDED_WIREGUARD_PUBLIC") {
+        if let Ok(port) = v.parse::<u16>() {
+            cfg.server.wireguard_public = Some(port);
+        }
+    }
+    if let Some(v) = read_env("BONDED_TCP_BIND") {
+        cfg.server.tcp_bind = Some(v);
+    }
+    if let Some(v) = read_env("BONDED_TCP_PUBLIC") {
+        if let Ok(port) = v.parse::<u16>() {
+            cfg.server.tcp_public = Some(port);
+        }
+    }
+    if let Some(v) = read_env("BONDED_STATUS_BIND") {
+        cfg.server.status_bind = v;
+    }
+    if let Some(v) = read_env("BONDED_HEALTH_BIND") {
+        cfg.server.health_bind = v;
+    }
+    if let Some(v) = read_env("BONDED_LOG_LEVEL") {
+        cfg.server.log_level = v;
+    }
+    if let Some(v) = read_env("BONDED_FORWARDING_MODE") {
+        cfg.server.forwarding_mode = v;
+    }
+    if let Some(v) = read_env("BONDED_TUN_NAME") {
+        cfg.server.tun_name = v;
+    }
+    if let Some(v) = read_env("BONDED_TUN_CIDR") {
+        cfg.server.tun_cidr = v;
+    }
+    if let Some(v) = read_env("BONDED_TUN_MTU") {
+        if let Ok(value) = v.parse::<u16>() {
             cfg.server.tun_mtu = value;
         }
     }
-    if let Some(tun_egress_interface) = read_env("BONDED_TUN_EGRESS_INTERFACE") {
-        cfg.server.tun_egress_interface = tun_egress_interface;
+    if let Some(v) = read_env("BONDED_TUN_EGRESS_INTERFACE") {
+        cfg.server.tun_egress_interface = v;
     }
-    if let Some(websocket_tls_cert_file) = read_env("BONDED_WEBSOCKET_TLS_CERT_FILE") {
-        cfg.server.websocket_tls_cert_file = websocket_tls_cert_file;
+    if let Some(v) = read_env("BONDED_AUTHORIZED_KEYS_FILE") {
+        cfg.server.authorized_keys_file = v;
     }
-    if let Some(websocket_tls_key_file) = read_env("BONDED_WEBSOCKET_TLS_KEY_FILE") {
-        cfg.server.websocket_tls_key_file = websocket_tls_key_file;
-    }
-    if let Some(public_address) =
-        read_env("BONDED_PUBLIC_ADDRESS").or_else(|| read_env("PUBLIC_ADDRESS"))
-    {
-        cfg.server.public_address = public_address;
-    }
-    if let Some(health_bind) = read_env("BONDED_HEALTH_BIND") {
-        cfg.server.health_bind = health_bind;
-    }
-    if let Some(upstream_tcp_target) = read_env("BONDED_UPSTREAM_TCP_TARGET") {
-        cfg.server.upstream_tcp_target = upstream_tcp_target;
-    }
-    if let Some(log_level) = read_env("BONDED_LOG_LEVEL") {
-        cfg.server.log_level = log_level;
-    }
-    if let Some(authorized_keys_file) = read_env("BONDED_AUTHORIZED_KEYS_FILE") {
-        cfg.server.authorized_keys_file = authorized_keys_file;
-    }
-    if let Some(invite_tokens_file) = read_env("BONDED_INVITE_TOKENS_FILE") {
-        cfg.server.invite_tokens_file = invite_tokens_file;
+    if let Some(v) = read_env("BONDED_INVITE_TOKENS_FILE") {
+        cfg.server.invite_tokens_file = v;
     }
 }
 
@@ -799,20 +827,23 @@ mod tests {
     fn env_overrides_replace_server_fields() {
         let mut cfg = ServerConfig::default();
         let env = [
-            ("BONDED_BIND", "127.0.0.1:9000"),
-            ("BONDED_WEBSOCKET_BIND", "127.0.0.1:9443"),
+            ("BONDED_HOSTNAME", "vpn.example.com"),
+            ("BONDED_HTTPS_BIND", "0.0.0.0:8443"),
+            ("BONDED_HTTPS_PUBLIC", "443"),
+            ("BONDED_TLS_CERT_FILE", "/etc/bonded/server.crt"),
+            ("BONDED_TLS_KEY_FILE", "/etc/bonded/server.key"),
+            ("BONDED_WIREGUARD_BIND", "0.0.0.0:51820"),
+            ("BONDED_WIREGUARD_PUBLIC", "51820"),
+            ("BONDED_TCP_BIND", "0.0.0.0:8000"),
+            ("BONDED_TCP_PUBLIC", "8000"),
             ("BONDED_STATUS_BIND", "127.0.0.1:9002"),
+            ("BONDED_HEALTH_BIND", "127.0.0.1:9001"),
+            ("BONDED_LOG_LEVEL", "debug"),
             ("BONDED_FORWARDING_MODE", "tun"),
             ("BONDED_TUN_NAME", "bondedtest0"),
             ("BONDED_TUN_CIDR", "100.65.0.1/24"),
             ("BONDED_TUN_MTU", "1380"),
             ("BONDED_TUN_EGRESS_INTERFACE", "eth0"),
-            ("BONDED_WEBSOCKET_TLS_CERT_FILE", "/tmp/wss.crt"),
-            ("BONDED_WEBSOCKET_TLS_KEY_FILE", "/tmp/wss.key"),
-            ("BONDED_PUBLIC_ADDRESS", "bonded.example.com:9000"),
-            ("BONDED_HEALTH_BIND", "127.0.0.1:9001"),
-            ("BONDED_UPSTREAM_TCP_TARGET", "127.0.0.1:9100"),
-            ("BONDED_LOG_LEVEL", "debug"),
             ("BONDED_AUTHORIZED_KEYS_FILE", "/tmp/auth.toml"),
             ("BONDED_INVITE_TOKENS_FILE", "/tmp/tokens.toml"),
         ];
@@ -823,35 +854,53 @@ mod tests {
                 .map(|(_, value)| (*value).to_owned())
         });
 
-        assert_eq!(cfg.server.bind, "127.0.0.1:9000");
-        assert_eq!(cfg.server.websocket_bind, "127.0.0.1:9443");
+        assert_eq!(cfg.server.hostname, "vpn.example.com");
+        assert_eq!(cfg.server.https_bind, "0.0.0.0:8443");
+        assert_eq!(cfg.server.https_public, 443);
+        assert_eq!(cfg.server.tls_cert_file, "/etc/bonded/server.crt");
+        assert_eq!(cfg.server.tls_key_file, "/etc/bonded/server.key");
+        assert_eq!(cfg.server.wireguard_bind, Some("0.0.0.0:51820".to_owned()));
+        assert_eq!(cfg.server.wireguard_public, Some(51820));
+        assert_eq!(cfg.server.tcp_bind, Some("0.0.0.0:8000".to_owned()));
+        assert_eq!(cfg.server.tcp_public, Some(8000));
         assert_eq!(cfg.server.status_bind, "127.0.0.1:9002");
+        assert_eq!(cfg.server.health_bind, "127.0.0.1:9001");
+        assert_eq!(cfg.server.log_level, "debug");
         assert_eq!(cfg.server.forwarding_mode, "tun");
         assert_eq!(cfg.server.tun_name, "bondedtest0");
         assert_eq!(cfg.server.tun_cidr, "100.65.0.1/24");
         assert_eq!(cfg.server.tun_mtu, 1380);
         assert_eq!(cfg.server.tun_egress_interface, "eth0");
-        assert_eq!(cfg.server.websocket_tls_cert_file, "/tmp/wss.crt");
-        assert_eq!(cfg.server.websocket_tls_key_file, "/tmp/wss.key");
-        assert_eq!(cfg.server.public_address, "bonded.example.com:9000");
-        assert_eq!(cfg.server.health_bind, "127.0.0.1:9001");
-        assert_eq!(cfg.server.upstream_tcp_target, "127.0.0.1:9100");
-        assert_eq!(cfg.server.log_level, "debug");
         assert_eq!(cfg.server.authorized_keys_file, "/tmp/auth.toml");
         assert_eq!(cfg.server.invite_tokens_file, "/tmp/tokens.toml");
     }
 
     #[test]
-    fn public_address_alias_env_var_is_supported() {
+    fn https_public_addr_combines_hostname_and_port() {
         let mut cfg = ServerConfig::default();
-        apply_env_overrides(&mut cfg, |key| {
-            if key == "PUBLIC_ADDRESS" {
-                return Some("legacy.example.com:8080".to_owned());
-            }
-            None
-        });
+        cfg.server.hostname = "vpn.example.com".to_owned();
+        cfg.server.https_public = 443;
+        assert_eq!(cfg.server.https_public_addr(), "vpn.example.com:443");
 
-        assert_eq!(cfg.server.public_address, "legacy.example.com:8080");
+        cfg.server.https_public = 8443;
+        assert_eq!(cfg.server.https_public_addr(), "vpn.example.com:8443");
+    }
+
+    #[test]
+    fn wireguard_public_addr_is_none_when_unconfigured() {
+        let cfg = ServerConfig::default();
+        assert_eq!(cfg.server.wireguard_public_addr(), None);
+    }
+
+    #[test]
+    fn wireguard_public_addr_combines_hostname_and_port() {
+        let mut cfg = ServerConfig::default();
+        cfg.server.hostname = "vpn.example.com".to_owned();
+        cfg.server.wireguard_public = Some(51820);
+        assert_eq!(
+            cfg.server.wireguard_public_addr(),
+            Some("vpn.example.com:51820".to_owned())
+        );
     }
 
     #[test]

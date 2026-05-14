@@ -59,82 +59,122 @@ pub struct ServerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ServerSection {
-    pub bind: String,
-    pub websocket_bind: String,
+    /// Public hostname of the server (no port), used to build QR-code pairing
+    /// URLs and reported in the capabilities endpoint.
+    pub hostname: String,
+
+    // ── HTTPS / WSS / QUIC ───────────────────────────────────────────────────
+    /// Local address to bind the HTTPS/WSS/QUIC listener (TCP + UDP).
+    /// Default: `0.0.0.0:443`.
+    pub https_bind: String,
+    /// Public port for HTTPS/WSS connections.  Combined with `hostname` to
+    /// form the advertised endpoint.  Default: `443`.
+    pub https_public: u16,
+    /// Path to the PEM TLS certificate chain.  Empty = TLS disabled (plain
+    /// HTTP/WS only, no QUIC).  If `acme_domain` is set, ACME writes the
+    /// renewed certificate here.
+    pub tls_cert_file: String,
+    /// Path to the PEM TLS private key.  Empty = TLS disabled.  ACME writes
+    /// the renewed key here.
+    pub tls_key_file: String,
+
+    // ── WireGuard ────────────────────────────────────────────────────────────
+    /// Local UDP address to bind the WireGuard listener (e.g.
+    /// `"0.0.0.0:51820"`).  When set, the WireGuard endpoint is enabled.
+    #[serde(default)]
+    pub wireguard_bind: Option<String>,
+    /// Public UDP port clients should use to reach the WireGuard endpoint.
+    /// Combined with `hostname` in the capabilities response.  Required when
+    /// `wireguard_bind` is set.
+    #[serde(default)]
+    pub wireguard_public: Option<u16>,
+    /// Path to the 32-byte WireGuard private key seed file.  Generated
+    /// automatically on first boot when `wireguard_bind` is set.
+    #[serde(default)]
+    pub wireguard_key_file: Option<String>,
+
+    // ── Debug NaiveTCP ───────────────────────────────────────────────────────
+    /// Local address for the unencrypted NaiveTCP listener (debug/testing
+    /// only).  Not started when unset.
+    #[serde(default)]
+    pub tcp_bind: Option<String>,
+    /// Public port for the NaiveTCP endpoint.
+    #[serde(default)]
+    pub tcp_public: Option<u16>,
+
+    // ── Infrastructure ───────────────────────────────────────────────────────
     pub status_bind: String,
+    pub health_bind: String,
+    pub log_level: String,
     pub forwarding_mode: String,
     pub tun_name: String,
     pub tun_cidr: String,
     pub tun_mtu: u16,
     pub tun_egress_interface: String,
-    pub websocket_tls_cert_file: String,
-    pub websocket_tls_key_file: String,
-    pub public_address: String,
-    pub health_bind: String,
-    pub upstream_tcp_target: String,
-    pub log_level: String,
     pub authorized_keys_file: String,
     pub invite_tokens_file: String,
     /// Path where the server's stable ed25519 identity key is persisted.
-    /// Created automatically on first boot; must not change after pairing QR codes are issued.
+    /// Created automatically on first boot; must not change after pairing QR
+    /// codes are issued.
     pub identity_key_file: String,
-    /// Enable the QUIC (HTTP/3) endpoint on the same bind address as the
-    /// WebSocket TLS listener (UDP).  Requires TLS to be configured.
-    #[serde(default)]
-    pub quic_enabled: bool,
-    /// Enable the WireGuard peer-provisioning endpoint.
-    #[serde(default)]
-    pub wireguard_enabled: bool,
-    /// Path to the 32-byte WireGuard private key seed file.  Generated on
-    /// first boot when `wireguard_enabled = true`.
-    #[serde(default)]
-    pub wireguard_key_file: Option<String>,
-    /// Domain for which to obtain a Let's Encrypt certificate via ACME HTTP-01.
-    /// If set, ACME automation is enabled and the server will manage TLS certs
-    /// automatically.  Requires the server to be reachable on port 80.
+
+    // ── ACME ─────────────────────────────────────────────────────────────────
+    /// Domain for ACME TLS-ALPN-01 certificate automation (e.g.
+    /// `"vpn.example.com"`).  When set, the server manages TLS certs via
+    /// Let's Encrypt.  Requires the server to be directly reachable on
+    /// `https_bind` (port 443 by default).
     #[serde(default)]
     pub acme_domain: Option<String>,
-    /// Contact e-mail sent to Let's Encrypt.  Required if `acme_domain` is set.
+    /// Contact e-mail sent to Let's Encrypt.  Required when `acme_domain` is
+    /// set.
     #[serde(default)]
     pub acme_email: Option<String>,
-    /// Path to write the ACME-issued PEM certificate.  Default: `acme-cert.pem`.
-    #[serde(default)]
-    pub acme_cert_file: Option<String>,
-    /// Path to write the ACME-issued PEM private key.  Default: `acme-key.pem`.
-    #[serde(default)]
-    pub acme_key_file: Option<String>,
     /// Use the Let's Encrypt staging environment (recommended for testing).
     #[serde(default)]
     pub acme_staging: bool,
 }
 
+impl ServerSection {
+    /// Returns the public HTTPS endpoint string (`hostname:https_public`),
+    /// used in pairing QR codes and the capabilities response.
+    pub fn https_public_addr(&self) -> String {
+        format!("{}:{}", self.hostname, self.https_public)
+    }
+
+    /// Returns the public WireGuard endpoint string (`hostname:port`), or
+    /// `None` when WireGuard is not configured.
+    pub fn wireguard_public_addr(&self) -> Option<String> {
+        let port = self.wireguard_public?;
+        Some(format!("{}:{}", self.hostname, port))
+    }
+}
+
 impl Default for ServerSection {
     fn default() -> Self {
         Self {
-            bind: "0.0.0.0:8080".to_owned(),
-            websocket_bind: "0.0.0.0:8443".to_owned(),
+            hostname: String::new(),
+            https_bind: "0.0.0.0:443".to_owned(),
+            https_public: 443,
+            tls_cert_file: String::new(),
+            tls_key_file: String::new(),
+            wireguard_bind: None,
+            wireguard_public: None,
+            wireguard_key_file: None,
+            tcp_bind: None,
+            tcp_public: None,
             status_bind: "0.0.0.0:8082".to_owned(),
+            health_bind: "0.0.0.0:8081".to_owned(),
+            log_level: "info".to_owned(),
             forwarding_mode: "proxy".to_owned(),
             tun_name: "bonded0".to_owned(),
             tun_cidr: "100.64.0.1/24".to_owned(),
             tun_mtu: 1420,
             tun_egress_interface: String::new(),
-            websocket_tls_cert_file: String::new(),
-            websocket_tls_key_file: String::new(),
-            public_address: String::new(),
-            health_bind: "0.0.0.0:8081".to_owned(),
-            upstream_tcp_target: String::new(),
-            log_level: "info".to_owned(),
             authorized_keys_file: DEFAULT_AUTHORIZED_KEYS_PATH.to_owned(),
             invite_tokens_file: DEFAULT_INVITE_TOKENS_PATH.to_owned(),
             identity_key_file: DEFAULT_SERVER_IDENTITY_KEY_PATH.to_owned(),
-            quic_enabled: false,
-            wireguard_enabled: false,
-            wireguard_key_file: None,
             acme_domain: None,
             acme_email: None,
-            acme_cert_file: None,
-            acme_key_file: None,
             acme_staging: false,
         }
     }
@@ -213,18 +253,20 @@ mod tests {
     use super::ServerConfig;
 
     #[test]
-    fn default_server_config_has_naive_tcp_protocol() {
+    fn default_server_config_has_expected_values() {
         let cfg = ServerConfig::default();
-        assert!(cfg.server.upstream_tcp_target.is_empty());
-        assert_eq!(cfg.server.websocket_bind, "0.0.0.0:8443");
+        assert_eq!(cfg.server.https_bind, "0.0.0.0:443");
+        assert_eq!(cfg.server.https_public, 443);
         assert_eq!(cfg.server.status_bind, "0.0.0.0:8082");
         assert_eq!(cfg.server.forwarding_mode, "proxy");
         assert_eq!(cfg.server.tun_name, "bonded0");
         assert_eq!(cfg.server.tun_cidr, "100.64.0.1/24");
         assert_eq!(cfg.server.tun_mtu, 1420);
         assert!(cfg.server.tun_egress_interface.is_empty());
-        assert!(cfg.server.websocket_tls_cert_file.is_empty());
-        assert!(cfg.server.websocket_tls_key_file.is_empty());
+        assert!(cfg.server.tls_cert_file.is_empty());
+        assert!(cfg.server.tls_key_file.is_empty());
+        assert!(cfg.server.wireguard_bind.is_none());
+        assert!(cfg.server.tcp_bind.is_none());
     }
 
     #[test]
@@ -232,13 +274,13 @@ mod tests {
         let cfg: ServerConfig = toml::from_str(
             r#"
 [server]
-bind = "127.0.0.1:9000"
+https_bind = "127.0.0.1:9000"
 "#,
         )
         .expect("partial server config should parse");
 
-        assert_eq!(cfg.server.bind, "127.0.0.1:9000");
-        assert_eq!(cfg.server.websocket_bind, "0.0.0.0:8443");
+        assert_eq!(cfg.server.https_bind, "127.0.0.1:9000");
+        assert_eq!(cfg.server.https_public, 443);
         assert_eq!(cfg.server.status_bind, "0.0.0.0:8082");
         assert_eq!(cfg.server.forwarding_mode, "proxy");
         assert_eq!(cfg.server.tun_name, "bonded0");
@@ -253,9 +295,34 @@ bind = "127.0.0.1:9000"
     fn server_config_parses_without_server_section_using_defaults() {
         let cfg: ServerConfig = toml::from_str("").expect("empty config should parse");
         let defaults = ServerConfig::default();
-        assert_eq!(cfg.server.bind, defaults.server.bind);
-        assert_eq!(cfg.server.websocket_bind, defaults.server.websocket_bind);
+        assert_eq!(cfg.server.https_bind, defaults.server.https_bind);
+        assert_eq!(cfg.server.https_public, defaults.server.https_public);
         assert_eq!(cfg.server.status_bind, defaults.server.status_bind);
         assert_eq!(cfg.server.health_bind, defaults.server.health_bind);
+    }
+
+    #[test]
+    fn https_public_addr_combines_hostname_and_port() {
+        let mut cfg = ServerConfig::default();
+        cfg.server.hostname = "vpn.example.com".to_owned();
+        cfg.server.https_public = 8443;
+        assert_eq!(cfg.server.https_public_addr(), "vpn.example.com:8443");
+    }
+
+    #[test]
+    fn wireguard_public_addr_returns_none_when_unconfigured() {
+        let cfg = ServerConfig::default();
+        assert_eq!(cfg.server.wireguard_public_addr(), None);
+    }
+
+    #[test]
+    fn wireguard_public_addr_combines_hostname_and_port() {
+        let mut cfg = ServerConfig::default();
+        cfg.server.hostname = "vpn.example.com".to_owned();
+        cfg.server.wireguard_public = Some(51820);
+        assert_eq!(
+            cfg.server.wireguard_public_addr(),
+            Some("vpn.example.com:51820".to_owned())
+        );
     }
 }

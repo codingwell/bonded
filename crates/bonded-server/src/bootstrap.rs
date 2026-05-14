@@ -53,26 +53,31 @@ pub struct BootstrapContext {
     /// that case since there is no cert to prove.
     pub tls_cert_der: Option<Arc<Vec<u8>>>,
 
-    /// Public address at which this server is reachable (e.g. `"1.2.3.4:8443"`).
-    /// Reported verbatim in `GET /v1/bootstrap/capabilities`.
+    /// Public HTTPS/WSS endpoint (`hostname:port`), reported in capabilities.
     pub server_public_address: String,
 
-    /// True when the server is accepting QUIC connections on the same port as
-    /// the WSS listener (reported in capabilities).
-    pub quic_enabled: bool,
-
-    /// True when the WireGuard peer-provisioning endpoint is active and the
-    /// server accepts WG connections (reported in capabilities).
-    pub wireguard_enabled: bool,
-
-    /// Server WireGuard keypair.  Present when `wireguard_enabled` is true.
+    /// Server WireGuard keypair.  `Some` when the WireGuard endpoint is active.
     pub wireguard_keypair: Option<Arc<bonded_core::transport::WireGuardKeypair>>,
 
     /// WireGuard peer registry.  Populated via `POST /v1/bootstrap/wireguard/peer`.
     pub wireguard_peers: Option<Arc<crate::wireguard::WireGuardPeerRegistry>>,
+
+    /// Public WireGuard endpoint (`hostname:port`), or `None` when WireGuard
+    /// is not enabled.  Reported in capabilities alongside the provisioning URL.
+    pub wireguard_public_addr: Option<String>,
 }
 
 impl BootstrapContext {
+    /// QUIC is available whenever a TLS certificate is configured.
+    pub fn quic_enabled(&self) -> bool {
+        self.tls_cert_der.is_some()
+    }
+
+    /// WireGuard is available whenever a keypair is present.
+    pub fn wireguard_enabled(&self) -> bool {
+        self.wireguard_keypair.is_some()
+    }
+
     /// Compute the SHA-256 fingerprint of the TLS cert and return an ed25519
     /// signature over the string `"sha256:<hex>"` using the server identity key.
     /// Returns `None` when no TLS cert is configured.
@@ -371,15 +376,19 @@ fn capabilities_response(ctx: &BootstrapContext) -> (&'static str, String) {
         }
     });
 
-    if ctx.quic_enabled {
+    if ctx.quic_enabled() {
         transports.push("h3");
         obj["h3"] = serde_json::json!({
             "endpoint": ctx.server_public_address,
         });
     }
 
-    if ctx.wireguard_enabled {
+    if ctx.wireguard_enabled() {
         transports.push("wireguard");
+        let wg_endpoint = ctx
+            .wireguard_public_addr
+            .as_deref()
+            .unwrap_or(&ctx.server_public_address);
         let provision_url = format!(
             "https://{}/v1/bootstrap/wireguard/peer",
             ctx.server_public_address
@@ -390,6 +399,7 @@ fn capabilities_response(ctx: &BootstrapContext) -> (&'static str, String) {
             .map(|kp| kp.public_key_b64())
             .unwrap_or_default();
         obj["wireguard"] = serde_json::json!({
+            "endpoint": wg_endpoint,
             "provision_endpoint": provision_url,
             "server_public_key": server_wg_pubkey,
         });
@@ -434,8 +444,14 @@ fn wireguard_peer_response(ctx: &BootstrapContext, body: &str) -> (&'static str,
             )
         }
     };
-    let device_pk = req.get("device_public_key").and_then(|v| v.as_str()).unwrap_or("");
-    let wg_pk = req.get("wg_public_key").and_then(|v| v.as_str()).unwrap_or("");
+    let device_pk = req
+        .get("device_public_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let wg_pk = req
+        .get("wg_public_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     if device_pk.is_empty() || wg_pk.is_empty() {
         return (
             "400 Bad Request",
@@ -451,8 +467,6 @@ fn wireguard_peer_response(ctx: &BootstrapContext, body: &str) -> (&'static str,
     .to_string();
     ("200 OK", body)
 }
-
-
 
 async fn handle_websocket_session(
     mut transport: WebSocketTlsTransport,
@@ -591,10 +605,9 @@ mod tests {
             server_identity: Arc::new(DeviceKeypair::generate()),
             tls_cert_der: None,
             server_public_address: "127.0.0.1:8443".to_owned(),
-            quic_enabled: false,
-            wireguard_enabled: false,
             wireguard_keypair: None,
             wireguard_peers: None,
+            wireguard_public_addr: None,
         })
     }
 
@@ -656,7 +669,8 @@ mod tests {
         let mut stream = tokio::net::TcpStream::connect(addr)
             .await
             .expect("connect to test server");
-        let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
         stream
             .write_all(request.as_bytes())
             .await
@@ -686,8 +700,7 @@ mod tests {
             "expected 200, got: {response}"
         );
         let body = response.split("\r\n\r\n").nth(1).unwrap_or("");
-        let json: serde_json::Value =
-            serde_json::from_str(body.trim()).expect("valid JSON body");
+        let json: serde_json::Value = serde_json::from_str(body.trim()).expect("valid JSON body");
         let transports = json["transports"].as_array().expect("transports array");
         assert!(
             transports.iter().any(|t| t.as_str() == Some("wss")),
@@ -715,14 +728,14 @@ mod tests {
         use crate::authorized_keys::AuthorizedKeysStore;
         use crate::session_registry::SessionRegistry;
 
+        // tls_cert_der being Some triggers quic_enabled() = true.
         let ctx = Arc::new(BootstrapContext {
             server_identity: Arc::new(DeviceKeypair::generate()),
-            tls_cert_der: None,
+            tls_cert_der: Some(Arc::new(vec![0u8; 32])), // non-empty → QUIC on
             server_public_address: "10.0.0.1:9443".to_owned(),
-            quic_enabled: true,
-            wireguard_enabled: true,
             wireguard_keypair: None,
             wireguard_peers: None,
+            wireguard_public_addr: None,
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -760,11 +773,12 @@ mod tests {
         let transports = json["transports"].as_array().expect("transports array");
         assert!(
             transports.iter().any(|t| t.as_str() == Some("h3")),
-            "expected 'h3' in transports: {transports:?}"
+            "expected 'h3' in transports when tls_cert_der is Some: {transports:?}"
         );
+        // wireguard_keypair is None, so WireGuard should NOT appear
         assert!(
-            transports.iter().any(|t| t.as_str() == Some("wireguard")),
-            "expected 'wireguard' in transports"
+            !transports.iter().any(|t| t.as_str() == Some("wireguard")),
+            "expected no 'wireguard' in transports when wireguard_keypair is None: {transports:?}"
         );
     }
 }
