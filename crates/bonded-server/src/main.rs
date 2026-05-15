@@ -50,7 +50,6 @@ use authorized_keys::{AuthorizedKeysStore, AuthorizedKeysWatcher};
 
 use anyhow::Context as _;
 use bonded_core::config::{load_server_config, ServerConfig, DEFAULT_SERVER_CONFIG_PATH};
-use rcgen;
 use bonded_core::session::{SessionFrame, SessionHeader, FLAG_PING, FLAG_PONG};
 use bonded_core::transport::{NaiveTcpTransport, Transport};
 use clap::Parser;
@@ -58,6 +57,7 @@ use health::run_health_server;
 use invite_tokens::ensure_startup_invite;
 use network_runtime::NetworkRuntime;
 use pairing_qr::emit_pairing_qr;
+use rcgen;
 use session_registry::SessionRegistry;
 use smoltcp_forwarder::SmoltcpForwarder;
 use status::run_status_server;
@@ -85,6 +85,10 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok(); // ignore error if already installed
+
     let args = Args::parse();
 
     let mut cfg = match load_server_config(&args.config) {
@@ -363,10 +367,14 @@ fn ensure_self_signed_cert(cert_file: &str, key_file: &str, hostname: &str) -> a
         return Ok(());
     }
     info!("TLS files not found — generating self-signed certificate");
-    let san = if hostname.is_empty() { "localhost" } else { hostname };
+    let san = if hostname.is_empty() {
+        "localhost"
+    } else {
+        hostname
+    };
     let key_pair = rcgen::KeyPair::generate().context("self-signed: generate key pair")?;
-    let params =
-        rcgen::CertificateParams::new(vec![san.to_string()]).context("self-signed: build params")?;
+    let params = rcgen::CertificateParams::new(vec![san.to_string()])
+        .context("self-signed: build params")?;
     let cert = params
         .self_signed(&key_pair)
         .context("self-signed: sign certificate")?;
