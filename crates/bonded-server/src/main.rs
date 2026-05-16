@@ -466,9 +466,11 @@ fn load_tls_acceptor(
     // IMPORTANT: when alpn_protocols is non-empty rustls enforces strict
     // negotiation — any client that offers an ALPN list containing none of
     // these values gets a fatal "no_application_protocol" alert (TLS alert
-    // 120).  Browsers, curl, and the app all send ["h2", "http/1.1"], so we
-    // must include the standard protocols here alongside "acme-tls/1".
-    config.alpn_protocols = vec![b"acme-tls/1".to_vec(), b"h2".to_vec(), b"http/1.1".to_vec()];
+    // 120).  The server only implements HTTP/1.1 framing, so we must NOT
+    // advertise "h2": a client that negotiates HTTP/2 via ALPN will immediately
+    // send a SETTINGS frame and fail when it receives an HTTP/1.1 response.
+    // Browsers/curl fall back to HTTP/1.1 cleanly when it is the only option.
+    config.alpn_protocols = vec![b"acme-tls/1".to_vec(), b"http/1.1".to_vec()];
 
     Ok((
         Some(TlsAcceptor::from(Arc::new(config))),
