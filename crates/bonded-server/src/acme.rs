@@ -200,10 +200,12 @@ pub async fn spawn_acme_renewal_loop(
 }
 
 /// Returns the number of whole days until the first certificate in `cert_file`
-/// expires, or `None` if the file is absent, unreadable, or unparseable.
+/// expires, or `None` if the file is absent, unreadable, unparseable, already
+/// expired, or **self-signed** (issuer == subject).
 ///
-/// Uses wall-clock time (UTC).  Returns `None` — treat as expired — if the
-/// cert is already past its `notAfter` date.
+/// A self-signed cert is treated as "needs renewal" regardless of its validity
+/// period: it was only written as a temporary placeholder so the server could
+/// start, and should be replaced with a CA-issued cert at the first opportunity.
 fn days_until_cert_expiry(cert_file: &str) -> Option<i64> {
     let pem_bytes = std::fs::read(cert_file).ok()?;
     // rustls-pemfile yields DER-encoded certificates one by one.
@@ -211,6 +213,13 @@ fn days_until_cert_expiry(cert_file: &str) -> Option<i64> {
         .next()?
         .ok()?;
     let (_, cert) = X509Certificate::from_der(der.as_ref()).ok()?;
+
+    // A self-signed certificate has an identical issuer and subject.  Treat it
+    // as always needing renewal so the ACME loop replaces it immediately.
+    if cert.issuer() == cert.subject() {
+        return None;
+    }
+
     let not_after = cert.validity().not_after.timestamp();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
