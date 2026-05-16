@@ -374,7 +374,7 @@ async fn establish_websocket_session(
         if websocket_address.starts_with("ws://") || websocket_address.starts_with("wss://") {
             websocket_address.clone()
         } else {
-            format!("ws://{websocket_address}")
+            format!("wss://{websocket_address}")
         };
 
     let request = websocket_url.as_str().into_client_request()?;
@@ -382,7 +382,7 @@ async fn establish_websocket_session(
     let host = uri
         .host()
         .ok_or_else(|| anyhow::anyhow!("websocket URL is missing host: {websocket_url}"))?;
-    let scheme = uri.scheme_str().unwrap_or("ws");
+    let scheme = uri.scheme_str().unwrap_or("wss");
     let default_port = if scheme.eq_ignore_ascii_case("wss") {
         443
     } else {
@@ -450,7 +450,7 @@ async fn establish_websocket_session_with_bind(
         if websocket_address.starts_with("ws://") || websocket_address.starts_with("wss://") {
             websocket_address.clone()
         } else {
-            format!("ws://{websocket_address}")
+            format!("wss://{websocket_address}")
         };
 
     let request = websocket_url.as_str().into_client_request()?;
@@ -458,7 +458,7 @@ async fn establish_websocket_session_with_bind(
     let host = uri
         .host()
         .ok_or_else(|| anyhow::anyhow!("websocket URL is missing host: {websocket_url}"))?;
-    let scheme = uri.scheme_str().unwrap_or("ws");
+    let scheme = uri.scheme_str().unwrap_or("wss");
     let default_port = if scheme.eq_ignore_ascii_case("wss") {
         443
     } else {
