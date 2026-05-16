@@ -245,9 +245,7 @@ async fn run_acme_cycle(config: &AcmeConfig, acme_slot: &AcmeChallengeSlot) -> a
             _ => {
                 if tokio::time::Instant::now() > deadline {
                     acme_slot.clear();
-                    anyhow::bail!(
-                        "ACME: timed out waiting for TLS-ALPN-01 challenge validation"
-                    );
+                    anyhow::bail!("ACME: timed out waiting for TLS-ALPN-01 challenge validation");
                 }
                 warn!(domain = %config.domain, "ACME: waiting for challenge validation…");
             }

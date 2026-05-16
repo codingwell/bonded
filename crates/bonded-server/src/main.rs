@@ -431,9 +431,16 @@ fn load_tls_acceptor(
         main_cert,
         acme_slot,
     });
-    let config = rustls::ServerConfig::builder()
+    let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(resolver);
+    // Advertise "acme-tls/1" so rustls selects it during the TLS-ALPN-01
+    // handshake.  RFC 8737 §4.2 requires the server's ServerHello to include
+    // the selected "acme-tls/1" protocol; if it's absent Let's Encrypt marks
+    // the challenge as failed.  Normal clients that send no ALPN extension are
+    // unaffected — rustls only does protocol selection when the client offers
+    // an ALPN list.
+    config.alpn_protocols = vec![b"acme-tls/1".to_vec()];
 
     Ok((
         Some(TlsAcceptor::from(Arc::new(config))),
