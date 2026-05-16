@@ -174,86 +174,86 @@ pub async fn spawn_acme_renewal_loop(
 /// Returns the number of days until the new certificate expires.
 async fn run_acme_cycle(config: &AcmeConfig, acme_slot: &AcmeChallengeSlot) -> anyhow::Result<u64> {
     let directory_url = if config.staging {
-        LetsEncrypt::Staging.url()
+        LetsEncrypt::Staging.url().to_string()
     } else {
-        LetsEncrypt::Production.url()
+        LetsEncrypt::Production.url().to_string()
     };
 
-    let (account, _credentials) = Account::create(
-        &NewAccount {
-            contact: &[&format!("mailto:{}", config.email)],
-            terms_of_service_agreed: true,
-            only_return_existing: false,
-        },
-        directory_url,
-        None,
-    )
-    .await
-    .context("ACME: create/load account")?;
+    let (account, _credentials) = Account::builder()?
+        .create(
+            &NewAccount {
+                contact: &[&format!("mailto:{}", config.email)],
+                terms_of_service_agreed: true,
+                only_return_existing: false,
+            },
+            directory_url,
+            None,
+        )
+        .await
+        .context("ACME: create/load account")?;
 
     let identifier = Identifier::Dns(config.domain.clone());
     let mut order = account
-        .new_order(&NewOrder {
-            identifiers: &[identifier],
-        })
+        .new_order(&NewOrder::new(&[identifier]))
         .await
         .context("ACME: create order")?;
 
-    let authorizations = order
-        .authorizations()
-        .await
-        .context("ACME: fetch authorizations")?;
+    // Install TLS-ALPN-01 challenge responses for every authorization.
+    // The Authorizations iterator borrows `order` mutably, so we drop it
+    // inside this block before polling order state below.
+    {
+        let mut authorizations = order.authorizations();
+        while let Some(result) = authorizations.next().await {
+            let mut auth = result.context("ACME: fetch authorization")?;
+            let mut challenge = auth
+                .challenge(ChallengeType::TlsAlpn01)
+                .context("ACME: no TLS-ALPN-01 challenge offered")?;
 
-    for auth in &authorizations {
-        let challenge = auth
-            .challenges
-            .iter()
-            .find(|c| c.r#type == ChallengeType::TlsAlpn01)
-            .context("ACME: no TLS-ALPN-01 challenge offered")?;
+            // Compute SHA-256 digest of the key authorization (RFC 8737 §3).
+            let key_auth = challenge.key_authorization();
+            let digest: Vec<u8> = key_auth.digest().as_ref().to_vec();
 
-        // Compute SHA-256 digest of the key authorization (RFC 8737 §3).
-        let key_auth = order.key_authorization(challenge);
-        let digest: Vec<u8> = key_auth.digest().as_ref().to_vec();
+            let challenge_cert = build_alpn_challenge_cert(&config.domain, &digest)
+                .context("ACME: build TLS-ALPN-01 challenge cert")?;
+            acme_slot.set(Arc::new(challenge_cert));
 
-        let challenge_cert = build_alpn_challenge_cert(&config.domain, &digest)
-            .context("ACME: build TLS-ALPN-01 challenge cert")?;
-        acme_slot.set(Arc::new(challenge_cert));
+            info!(
+                domain = %config.domain,
+                "ACME TLS-ALPN-01 challenge cert installed; signalling ready"
+            );
 
-        info!(
-            domain = %config.domain,
-            "ACME TLS-ALPN-01 challenge cert installed; signalling ready"
-        );
+            challenge
+                .set_ready()
+                .await
+                .context("ACME: set challenge ready")?;
+            // challenge and auth drop here, releasing their borrows on order
+        }
+        // authorizations drops here, releasing the mutable borrow on order
+    }
 
-        order
-            .set_challenge_ready(&challenge.url)
-            .await
-            .context("ACME: set challenge ready")?;
-
-        // Poll until the order moves to Ready/Valid (up to 60 s).
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-        loop {
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            let state = order.refresh().await.context("ACME: refresh order")?;
-            match state.status {
-                OrderStatus::Ready | OrderStatus::Valid => break,
-                OrderStatus::Invalid => {
+    // Poll until the order moves to Ready/Valid (up to 60 s).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let state = order.refresh().await.context("ACME: refresh order")?;
+        match state.status {
+            OrderStatus::Ready | OrderStatus::Valid => break,
+            OrderStatus::Invalid => {
+                acme_slot.clear();
+                anyhow::bail!("ACME: order became invalid during TLS-ALPN-01 challenge");
+            }
+            _ => {
+                if tokio::time::Instant::now() > deadline {
                     acme_slot.clear();
-                    anyhow::bail!("ACME: order became invalid during TLS-ALPN-01 challenge");
+                    anyhow::bail!(
+                        "ACME: timed out waiting for TLS-ALPN-01 challenge validation"
+                    );
                 }
-                _ => {
-                    if tokio::time::Instant::now() > deadline {
-                        acme_slot.clear();
-                        anyhow::bail!(
-                            "ACME: timed out waiting for TLS-ALPN-01 challenge validation"
-                        );
-                    }
-                    warn!(domain = %config.domain, "ACME: waiting for challenge validation…");
-                }
+                warn!(domain = %config.domain, "ACME: waiting for challenge validation…");
             }
         }
-
-        acme_slot.clear();
     }
+    acme_slot.clear();
 
     // Generate a fresh key pair and a CSR for the final certificate.
     let final_key = KeyPair::generate().context("ACME: generate final key pair")?;
@@ -266,7 +266,7 @@ async fn run_acme_cycle(config: &AcmeConfig, acme_slot: &AcmeChallengeSlot) -> a
     let csr_der = csr.der().to_vec();
 
     order
-        .finalize(&csr_der)
+        .finalize_csr(&csr_der)
         .await
         .context("ACME: finalize order")?;
 
