@@ -99,14 +99,14 @@ pub async fn run_bootstrap_websocket_server(
     authorized_keys: AuthorizedKeysStore,
     sessions: SessionRegistry,
     forwarders: ForwarderRegistry,
-    tls_acceptor: Option<TlsAcceptor>,
+    tls_acceptor: Arc<RwLock<Option<TlsAcceptor>>>,
     tunnel_pcap: Option<Arc<TunnelPcapLogger>>,
     ctx: Arc<BootstrapContext>,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("failed to bind bootstrap listener on {bind}"))?;
-    info!(bind = %bind, tls = tls_acceptor.is_some(), "bootstrap listener bound");
+    info!(bind = %bind, tls = tls_acceptor.read().expect("tls slot lock").is_some(), "bootstrap listener bound");
 
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -118,7 +118,9 @@ pub async fn run_bootstrap_websocket_server(
         };
 
         let ctx = ctx.clone();
-        let tls_acceptor = tls_acceptor.clone();
+        // Read the current acceptor from the slot at accept time so a renewed
+        // certificate is picked up by all subsequent connections.
+        let tls_acceptor = tls_acceptor.read().expect("tls slot lock").clone();
         let invite_tokens_file = invite_tokens_file.to_owned();
         let authorized_keys = authorized_keys.clone();
         let sessions = sessions.clone();

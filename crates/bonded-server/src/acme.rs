@@ -34,7 +34,9 @@ use instant_acme::{
 use rcgen::{CertificateParams, CustomExtension, DistinguishedName, KeyPair, SanType};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
+use rustls_pemfile;
 use tracing::{error, info, warn};
+use x509_parser::prelude::*;
 
 // ── Challenge slot ────────────────────────────────────────────────────────────
 
@@ -143,6 +145,36 @@ pub async fn spawn_acme_renewal_loop(
 ) {
     tokio::spawn(async move {
         loop {
+            // Check whether the existing on-disk cert is still valid for more
+            // than 30 days.  If it is, skip the ACME cycle entirely and sleep
+            // until the 30-day renewal window opens.
+            match days_until_cert_expiry(&config.tls_cert_file) {
+                Some(days_remaining) if days_remaining > 30 => {
+                    let sleep_days = (days_remaining - 30).max(1);
+                    info!(
+                        domain = %config.domain,
+                        days_remaining,
+                        sleep_days,
+                        "ACME: existing certificate is still valid; skipping renewal"
+                    );
+                    tokio::time::sleep(Duration::from_secs(sleep_days as u64 * 86_400)).await;
+                    continue;
+                }
+                Some(days_remaining) => {
+                    info!(
+                        domain = %config.domain,
+                        days_remaining,
+                        "ACME: certificate is within renewal window; renewing now"
+                    );
+                }
+                None => {
+                    info!(
+                        domain = %config.domain,
+                        "ACME: no valid certificate on disk; requesting new certificate"
+                    );
+                }
+            }
+
             match run_acme_cycle(&config, &acme_slot).await {
                 Ok(days_valid) => {
                     on_renewed();
@@ -165,6 +197,31 @@ pub async fn spawn_acme_renewal_loop(
             }
         }
     });
+}
+
+/// Returns the number of whole days until the first certificate in `cert_file`
+/// expires, or `None` if the file is absent, unreadable, or unparseable.
+///
+/// Uses wall-clock time (UTC).  Returns `None` — treat as expired — if the
+/// cert is already past its `notAfter` date.
+fn days_until_cert_expiry(cert_file: &str) -> Option<i64> {
+    let pem_bytes = std::fs::read(cert_file).ok()?;
+    // rustls-pemfile yields DER-encoded certificates one by one.
+    let der = rustls_pemfile::certs(&mut pem_bytes.as_slice())
+        .next()?
+        .ok()?;
+    let (_, cert) = X509Certificate::from_der(der.as_ref()).ok()?;
+    let not_after = cert.validity().not_after.timestamp();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    let days = (not_after - now) / 86_400;
+    if days < 0 {
+        None
+    } else {
+        Some(days)
+    }
 }
 
 // ── Internals ─────────────────────────────────────────────────────────────────

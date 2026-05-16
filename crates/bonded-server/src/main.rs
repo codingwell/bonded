@@ -186,12 +186,16 @@ async fn main() -> anyhow::Result<()> {
     let websocket_forwarders = forwarders.clone();
     let websocket_keys = authorized_keys.clone();
     let websocket_tunnel_pcap = tunnel_pcap.clone();
-    let (tls_acceptor, tls_cert_der, tls_key_der) = load_tls_acceptor(
+    let (initial_tls_acceptor, tls_cert_der, tls_key_der) = load_tls_acceptor(
         &cfg.server.tls_cert_file,
         &cfg.server.tls_key_file,
         &cfg.server.hostname,
         acme_slot.clone(),
     )?;
+    // Shared slot so the ACME renewal callback can hot-swap the acceptor without
+    // restarting the bootstrap listener.  Each accepted connection reads the
+    // current acceptor from the slot at accept time.
+    let tls_slot: Arc<RwLock<Option<TlsAcceptor>>> = Arc::new(RwLock::new(initial_tls_acceptor));
     let quic_cert_der = tls_cert_der.clone();
     let quic_key_der = tls_key_der.clone();
 
@@ -225,8 +229,28 @@ async fn main() -> anyhow::Result<()> {
             tls_key_file: cfg.server.tls_key_file.clone(),
             staging: cfg.server.acme_staging,
         };
-        acme::spawn_acme_renewal_loop(acme_cfg, acme_slot, || {
-            info!("ACME certificate renewed; TLS reload not yet automated (Phase 6)");
+        // Capture everything the reload closure needs before moving acme_slot
+        // into spawn_acme_renewal_loop.
+        let tls_cert_file_r = cfg.server.tls_cert_file.clone();
+        let tls_key_file_r = cfg.server.tls_key_file.clone();
+        let hostname_r = cfg.server.hostname.clone();
+        let acme_slot_r = acme_slot.clone();
+        let tls_slot_r = tls_slot.clone();
+        acme::spawn_acme_renewal_loop(acme_cfg, acme_slot, move || {
+            match load_tls_acceptor(
+                &tls_cert_file_r,
+                &tls_key_file_r,
+                &hostname_r,
+                acme_slot_r.clone(),
+            ) {
+                Ok((new_acceptor, _, _)) => {
+                    *tls_slot_r.write().expect("tls slot lock") = new_acceptor;
+                    info!("TLS acceptor reloaded after ACME certificate renewal");
+                }
+                Err(e) => {
+                    error!("Failed to reload TLS acceptor after ACME renewal: {e:#}");
+                }
+            }
         })
         .await;
     }
@@ -248,7 +272,7 @@ async fn main() -> anyhow::Result<()> {
                 websocket_keys,
                 websocket_sessions,
                 websocket_forwarders,
-                tls_acceptor,
+                tls_slot.clone(),
                 websocket_tunnel_pcap,
                 bootstrap_ctx,
             )
