@@ -158,8 +158,7 @@ pub async fn spawn_acme_renewal_loop(
                 Err(e) => {
                     error!(
                         domain = %config.domain,
-                        error = %e,
-                        "ACME renewal failed; retrying in 1 hour"
+                        "ACME renewal failed; retrying in 1 hour: {e:#}"
                     );
                     tokio::time::sleep(Duration::from_secs(3_600)).await;
                 }

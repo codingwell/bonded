@@ -22,6 +22,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   int _activePathCount = 1;
   bool _isConnecting = false;
   bool _isBackgroundRunning = false;
+  bool _vpnRunning = false;
   StreamSubscription<BackgroundServiceEvent>? _backgroundEventsSubscription;
 
   // Bytes / uptime
@@ -53,7 +54,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
             }
           });
 
-          if (event.type == 'session_status' || event.type == 'started') {
+          if (event.type == 'session_status' ||
+              event.type == 'started' ||
+              event.type == 'error' ||
+              event.type == 'stopped') {
             await _refreshStatus();
           }
 
@@ -101,6 +105,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
       if (mounted) {
         setState(() {
+          _vpnRunning = vpnRunning;
           _vpnStatus = switch (sessionState) {
             'connected' => 'Connected',
             'connecting' => 'Connecting',
@@ -129,7 +134,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     setState(() => _isConnecting = true);
 
     try {
-      if (_vpnStatus == 'Connected') {
+      if (_vpnRunning) {
         await BackgroundService.stopBackgroundService();
       } else {
         await BackgroundService.startBackgroundService(
@@ -233,7 +238,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     const SizedBox(height: 32),
                     // Connect / Disconnect
                     _ConnectButton(
-                      isConnected: isConnected,
+                      isConnected: _vpnRunning,
                       isConnecting: _isConnecting,
                       onTap: _toggleVpn,
                     ),
