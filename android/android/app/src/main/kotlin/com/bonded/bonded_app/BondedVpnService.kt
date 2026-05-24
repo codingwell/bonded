@@ -591,6 +591,7 @@ class BondedVpnService : VpnService() {
 
     private external fun nativeStartSession(
             serverAddress: String,
+            serverPublicKey: String,
             protocolCsv: String,
             pathCount: Int,
             bindAddressesJson: String,
@@ -717,6 +718,7 @@ class BondedVpnService : VpnService() {
             val started =
                     nativeStartSession(
                             serverAddr,
+                            server.serverPublicKey,
                             protocolCsv,
                             pathCount,
                             bindAddressesJson,

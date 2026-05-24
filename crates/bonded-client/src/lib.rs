@@ -542,12 +542,14 @@ async fn establish_quic_session(config: &ClientConfig) -> anyhow::Result<QuicTra
     let rustls_config = if !config.client.tls_cert_fingerprint.is_empty() {
         cert_proof::make_pinned_tls_config(&config.client.tls_cert_fingerprint)
     } else if !config.client.server_public_key.is_empty() {
-        let fingerprint =
-            cert_proof::fetch_and_verify_cert_proof(host, port, &config.client.server_public_key)
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!("QUIC cert-proof bootstrap failed for {host}:{port}: {e}")
-                })?;
+        let fingerprint = cert_proof::fetch_and_verify_cert_proof(
+            host,
+            port,
+            &config.client.server_public_key,
+            config.socket_protect.as_ref(),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("QUIC cert-proof bootstrap failed for {host}:{port}: {e}"))?;
         info!(fingerprint = %fingerprint, "QUIC cert-proof verified");
         cert_proof::make_pinned_tls_config(&fingerprint)
     } else {
@@ -739,8 +741,13 @@ async fn resolve_wss_tls_connector(
             host,
             port, "no TLS cert fingerprint stored; running cert-proof bootstrap"
         );
-        match cert_proof::fetch_and_verify_cert_proof(host, port, &config.client.server_public_key)
-            .await
+        match cert_proof::fetch_and_verify_cert_proof(
+            host,
+            port,
+            &config.client.server_public_key,
+            config.socket_protect.as_ref(),
+        )
+        .await
         {
             Ok(fingerprint) => {
                 info!(

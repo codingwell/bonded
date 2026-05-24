@@ -34,6 +34,16 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
+        <!-- Headless activity for ADB-driven VPN control during debugging.
+             Usage: adb shell am start -n com.bonded.bonded_app/.DebugVpnActivity
+                    with extras: action=connect|disconnect|status  device_id=UUID -->
+        <activity
+            android:name=".DebugVpnActivity"
+            android:exported="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true" />
+
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data

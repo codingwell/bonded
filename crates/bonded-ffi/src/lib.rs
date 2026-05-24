@@ -234,12 +234,17 @@ fn android_session_slot() -> &'static Mutex<Option<AndroidSessionHandle>> {
 }
 
 #[cfg(any(target_os = "android", test))]
-fn android_client_config(server_address: &str, storage_dir: &str) -> ClientConfig {
+fn android_client_config(
+    server_address: &str,
+    server_public_key: &str,
+    storage_dir: &str,
+) -> ClientConfig {
     let mut config = ClientConfig::default();
     let storage_root = PathBuf::from(storage_dir);
     config.client.device_name = "android-client".to_owned();
     config.client.server_public_address = server_address.to_owned();
     config.client.server_websocket_address = server_address.to_owned();
+    config.client.server_public_key = server_public_key.to_owned();
     config.client.preferred_protocols = vec!["wss".to_owned(), "naive_tcp".to_owned()];
     config.client.private_key_path = storage_root
         .join("bonded-device-key.pem")
@@ -353,6 +358,7 @@ fn stop_android_session() {
 #[cfg(any(target_os = "android", test))]
 fn start_android_session(
     server_address: &str,
+    server_public_key: &str,
     protocol_csv: &str,
     path_count: usize,
     bind_addresses_json: &str,
@@ -385,7 +391,7 @@ fn start_android_session(
     let worker_snapshot = Arc::clone(&snapshot);
     let cancel_token = CancellationToken::new();
     let worker_cancel_token = cancel_token.clone();
-    let mut config = android_client_config(server_address, storage_dir);
+    let mut config = android_client_config(server_address, server_public_key, storage_dir);
     let protocols = parse_protocol_list(protocol_csv);
     let bind_addresses = parse_bind_address_list(bind_addresses_json);
     if !protocols.is_empty() {
@@ -763,8 +769,7 @@ fn redeem_invite_token(
     invite_token: &str,
     storage_dir: &str,
 ) -> anyhow::Result<()> {
-    let mut config = android_client_config(server_address, storage_dir);
-    config.client.invite_token = invite_token.to_owned();
+    let mut config = android_client_config(server_address, _server_public_key, storage_dir);
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -868,6 +873,7 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeStartS
     mut env: jni::JNIEnv,
     obj: jni::objects::JObject,
     server_address: jni::objects::JString,
+    server_public_key: jni::objects::JString,
     protocol_csv: jni::objects::JString,
     path_count: jni::sys::jint,
     bind_addresses_json: jni::objects::JString,
@@ -881,6 +887,10 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeStartS
     }
 
     let server_address: String = match env.get_string(&server_address) {
+        Ok(value) => value.into(),
+        Err(_) => return 0,
+    };
+    let server_public_key: String = match env.get_string(&server_public_key) {
         Ok(value) => value.into(),
         Err(_) => return 0,
     };
@@ -899,6 +909,7 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeStartS
 
     if start_android_session(
         &server_address,
+        &server_public_key,
         &protocol_csv,
         path_count.max(1) as usize,
         &bind_addresses_json,
@@ -1164,6 +1175,7 @@ mod tests {
 
         start_android_session(
             &addr.to_string(),
+            "",
             "naive_tcp",
             1,
             "[\"127.0.0.2\"]",

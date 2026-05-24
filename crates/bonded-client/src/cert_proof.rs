@@ -21,8 +21,10 @@
 //! pinned value.  Pass it to `tokio_tungstenite::client_async_tls_with_config`
 //! as `Some(Connector::Rustls(...))`.
 
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+use bonded_core::config::SocketProtectFn;
 use rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
 };
@@ -30,7 +32,7 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, Error as TlsError, SignatureScheme};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::TcpSocket;
 use tokio_rustls::TlsConnector;
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -40,6 +42,13 @@ use tokio_rustls::TlsConnector;
 ///
 /// `server_public_key_b64` must be the standard-base64 ed25519 public key
 /// from the pairing QR — it is used to verify the signature in the response.
+///
+/// `socket_protect` is an optional Android VPN socket-protect callback.  When
+/// the VPN tunnel is already active the cert-proof TCP socket must be protected
+/// before `connect()` is called, otherwise the packet would be routed through
+/// the tunnel that is still being established (deadlock).  Pass
+/// `config.socket_protect.as_ref()` from the calling context; on non-Android
+/// this will always be `None` and the argument is a no-op.
 ///
 /// # Security
 ///
@@ -51,6 +60,7 @@ pub async fn fetch_and_verify_cert_proof(
     host: &str,
     port: u16,
     server_public_key_b64: &str,
+    socket_protect: Option<&SocketProtectFn>,
 ) -> anyhow::Result<String> {
     let captured_cert: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
 
@@ -65,8 +75,27 @@ pub async fn fetch_and_verify_cert_proof(
         .with_no_client_auth();
     let connector = TlsConnector::from(Arc::new(client_config));
 
-    // TCP connect
-    let tcp = TcpStream::connect(format!("{host}:{port}")).await?;
+    // TCP connect — use a raw TcpSocket so we can protect the fd before
+    // connecting on Android (avoids routing the cert-proof traffic through
+    // the VPN tunnel that we are in the process of establishing).
+    let addr: SocketAddr = tokio::net::lookup_host(format!("{host}:{port}"))
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to resolve {host}:{port}: {e}"))?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no addresses for {host}:{port}"))?;
+    let socket = match addr {
+        SocketAddr::V4(_) => TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => TcpSocket::new_v6()?,
+    };
+    #[cfg(unix)]
+    if let Some(protect) = socket_protect {
+        use std::os::unix::io::AsRawFd;
+        let fd = socket.as_raw_fd();
+        if !protect.0(fd) {
+            anyhow::bail!("failed to protect cert-proof socket from VPN capture (fd={fd})");
+        }
+    }
+    let tcp = socket.connect(addr).await?;
 
     // TLS handshake (skips validation, captures cert)
     let server_name = ServerName::try_from(host.to_owned())
