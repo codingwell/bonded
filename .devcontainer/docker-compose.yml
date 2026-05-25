@@ -9,8 +9,18 @@ services:
       - bonded-gradle-cache:/home/vscode/.gradle
       - bonded-android-cache:/home/vscode/.android
     command: sleep infinity
+    ports:
+      - "443:443"
+      - "443:443/udp"
+      - "8000:8000"
+      - "8081:8081"
+      - "8082:8082"
+      - "51820:51820/udp"
     cap_add:
+      - NET_ADMIN
       - SYS_PTRACE
+    devices:
+      - /dev/net/tun:/dev/net/tun
     security_opt:
       - seccomp:unconfined
 

@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Intent
 import android.net.VpnService
 import android.os.Build
+import android.os.Bundle
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
@@ -23,6 +24,12 @@ class MainActivity : FlutterActivity() {
 
     companion object {
         private const val REQUEST_CODE_VPN_PREPARE = 2001
+        private const val EXTRA_ADB_ACTION = "adb_action"
+        private const val EXTRA_SERVER_ADDRESS = "server_address"
+        private const val EXTRA_SERVER_PUBLIC_KEY = "server_public_key"
+        private const val EXTRA_INVITE_TOKEN = "invite_token"
+        private const val EXTRA_DEVICE_ID = "device_id"
+        private const val EXTRA_SUPPORTED_PROTOCOLS = "supported_protocols"
         private var nativeLoaded = false
 
         init {
@@ -44,6 +51,138 @@ class MainActivity : FlutterActivity() {
     ): Boolean
 
     private external fun nativeLastError(): String?
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        handleAdbIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleAdbIntent(intent)
+    }
+
+    private fun handleAdbIntent(intent: Intent?) {
+        val action = intent?.getStringExtra(EXTRA_ADB_ACTION)?.trim()?.lowercase() ?: return
+
+        when (action) {
+            "pair" -> {
+                val serverAddress = intent.getStringExtra(EXTRA_SERVER_ADDRESS)?.trim().orEmpty()
+                val serverPublicKey =
+                        intent.getStringExtra(EXTRA_SERVER_PUBLIC_KEY)?.trim().orEmpty()
+                val inviteToken = intent.getStringExtra(EXTRA_INVITE_TOKEN)?.trim().orEmpty()
+                val deviceId =
+                        intent.getStringExtra(EXTRA_DEVICE_ID)?.trim()?.takeIf { it.isNotEmpty() }
+                                ?: UUID.randomUUID().toString()
+                val supportedProtocols =
+                        intent.getStringExtra(EXTRA_SUPPORTED_PROTOCOLS)
+                                ?.split(',')
+                                ?.map(String::trim)
+                                ?.filter(String::isNotEmpty)
+                                ?: emptyList()
+
+                if (serverAddress.isEmpty() || serverPublicKey.isEmpty() || inviteToken.isEmpty()) {
+                    android.util.Log.e(
+                            "BondedMain",
+                            "ADB pair failed: server_address, server_public_key, and invite_token are required",
+                    )
+                    finish()
+                    return
+                }
+
+                val redeemed =
+                        redeemInviteTokenNative(serverAddress, serverPublicKey, inviteToken)
+                if (!redeemed.first) {
+                    android.util.Log.e(
+                            "BondedMain",
+                            "ADB pair failed: ${redeemed.second ?: "unknown error"}",
+                    )
+                    finish()
+                    return
+                }
+
+                savePairedServer(deviceId, serverAddress, serverPublicKey, supportedProtocols)
+                android.util.Log.i(
+                        "BondedMain",
+                        "ADB pair succeeded: deviceId=$deviceId server=$serverAddress protocols=$supportedProtocols",
+                )
+                finish()
+            }
+
+            else -> {
+                android.util.Log.w("BondedMain", "Ignoring unknown adb_action=$action")
+            }
+        }
+    }
+
+    private fun redeemInviteTokenNative(
+            serverAddress: String,
+            serverPublicKey: String,
+            inviteToken: String,
+    ): Pair<Boolean, String?> {
+        android.util.Log.i(
+                "BondedMain",
+                "Redeeming invite token via native runtime for server=$serverAddress tokenLength=${inviteToken.length}",
+        )
+
+        var failureReason: String? = null
+        val redeemed =
+                try {
+                    nativeRedeemInviteToken(
+                            serverAddress,
+                            serverPublicKey,
+                            inviteToken,
+                            filesDir.absolutePath,
+                    )
+                } catch (_: UnsatisfiedLinkError) {
+                    failureReason = "Native library is unavailable (UnsatisfiedLinkError)"
+                    false
+                } catch (t: Throwable) {
+                    failureReason = "${t::class.java.simpleName}: ${t.message ?: "unknown error"}"
+                    android.util.Log.e("BondedMain", "nativeRedeemInviteToken threw", t)
+                    false
+                }
+
+        if (redeemed) {
+            return true to null
+        }
+
+        val nativeDetail =
+                try {
+                    nativeLastError()
+                } catch (_: Throwable) {
+                    null
+                }
+        val message =
+                if (failureReason != null) {
+                    "Failed to redeem invite token via native runtime: $failureReason"
+                } else if (!nativeDetail.isNullOrBlank()) {
+                    "Failed to redeem invite token via native runtime: $nativeDetail"
+                } else {
+                    "Failed to redeem invite token via native runtime"
+                }
+        android.util.Log.e("BondedMain", message)
+        return false to message
+    }
+
+    private fun savePairedServer(
+            deviceId: String,
+            publicAddress: String,
+            serverPublicKey: String,
+            supportedProtocols: List<String>,
+    ) {
+        PairedServerStore.save(
+                this,
+                PairedServerRecord(
+                        id = deviceId,
+                        publicAddress = publicAddress,
+                        serverPublicKey = serverPublicKey,
+                        supportedProtocols = supportedProtocols,
+                        pairedAt = Instant.now().toString(),
+                ),
+        )
+    }
 
     private fun startVpnWithPermissionFlow(
             deviceId: String,
@@ -283,58 +422,20 @@ class MainActivity : FlutterActivity() {
                                         null
                                 )
                             } else {
-                                android.util.Log.i(
-                                        "BondedMain",
-                                        "Redeeming invite token via native runtime for server=$serverAddress tokenLength=${inviteToken.length}",
-                                )
-
-                                var failureReason: String? = null
                                 val redeemed =
-                                        try {
-                                            nativeRedeemInviteToken(
-                                                    serverAddress,
-                                                    serverPublicKey,
-                                                    inviteToken,
-                                                    filesDir.absolutePath,
-                                            )
-                                        } catch (_: UnsatisfiedLinkError) {
-                                            failureReason =
-                                                    "Native library is unavailable (UnsatisfiedLinkError)"
-                                            false
-                                        } catch (t: Throwable) {
-                                            failureReason =
-                                                    "${t::class.java.simpleName}: ${t.message ?: "unknown error"}"
-                                            android.util.Log.e(
-                                                    "BondedMain",
-                                                    "nativeRedeemInviteToken threw",
-                                                    t,
-                                            )
-                                            false
-                                        }
-
-                                if (!redeemed) {
-                                    val nativeDetail =
-                                            try {
-                                                nativeLastError()
-                                            } catch (_: Throwable) {
-                                                null
-                                            }
-                                    val message =
-                                            if (failureReason != null) {
-                                                "Failed to redeem invite token via native runtime: $failureReason"
-                                            } else if (!nativeDetail.isNullOrBlank()) {
-                                                "Failed to redeem invite token via native runtime: $nativeDetail"
-                                            } else {
-                                                "Failed to redeem invite token via native runtime"
-                                            }
-                                    android.util.Log.e("BondedMain", message)
+                                    redeemInviteTokenNative(
+                                        serverAddress,
+                                        serverPublicKey,
+                                        inviteToken,
+                                    )
+                                if (!redeemed.first) {
                                     result.error(
                                             "pairing_failed",
-                                            message,
+                                        redeemed.second,
                                             mapOf(
                                                     "serverAddress" to serverAddress,
                                                     "tokenLength" to inviteToken.length,
-                                                    "nativeDetail" to nativeDetail,
+                                            "nativeDetail" to nativeLastError(),
                                             ),
                                     )
                                 } else {
@@ -363,16 +464,12 @@ class MainActivity : FlutterActivity() {
                                         null
                                 )
                             } else {
-                                PairedServerStore.save(
-                                        this,
-                                        PairedServerRecord(
-                                                id = deviceId,
-                                                publicAddress = publicAddress,
-                                                serverPublicKey = serverPublicKey,
-                                                supportedProtocols = supportedProtocols,
-                                                pairedAt = Instant.now().toString(),
-                                        ),
-                                )
+                                    savePairedServer(
+                                        deviceId,
+                                        publicAddress,
+                                        serverPublicKey,
+                                        supportedProtocols,
+                                    )
                                 result.success(null)
                             }
                         }

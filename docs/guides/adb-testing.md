@@ -17,6 +17,41 @@ adb -s 192.168.1.140:5555 devices
 adb -s 192.168.1.140:5555 shell am start -n com.bonded.bonded_app/.MainActivity
 ```
 
+## Pairing via ADB
+
+The release app now supports a minimal ADB-triggered pairing path through `MainActivity`.
+This is useful for local-server testing when you do not want to scan a QR code on-device.
+
+### Pair to a server directly
+```bash
+adb -s 192.168.1.140:5555 shell am start \
+  -n com.bonded.bonded_app/.MainActivity \
+  --es adb_action pair \
+  --es device_id "00000000-0000-0000-0000-000000000001" \
+  --es server_address "127.0.0.1:8000" \
+  --es server_public_key "<server public key>" \
+  --es invite_token "<invite token>" \
+  --es supported_protocols "naive_tcp"
+```
+
+Look for `BondedMain` log lines like:
+
+```text
+I/BondedMain: Redeeming invite token via native runtime for server=127.0.0.1:8000 ...
+I/BondedMain: ADB pair succeeded: deviceId=... server=127.0.0.1:8000 protocols=[naive_tcp]
+```
+
+### Local server over `adb reverse`
+
+For a local devcontainer/server test, expose the host NaiveTCP listener to the device first:
+
+```bash
+adb -s 192.168.1.140:5555 reverse tcp:8000 tcp:8000
+adb -s 192.168.1.140:5555 reverse --list
+```
+
+Then pair using `server_address=127.0.0.1:8000` and connect with the same `device_id`.
+
 ---
 
 ## VPN Connect / Disconnect
@@ -55,6 +90,14 @@ adb -s 192.168.1.140:5555 shell am broadcast \
 
 > **Note:** `VPN_START` defaults to `run_background=true`. Both receivers are in `VpnControlReceiver.kt`.
 > If VPN permission was never granted on this device, `VPN_START` will be silently ignored — open the app and connect once manually to grant the permission, then ADB control works thereafter.
+
+### Connect a specifically paired local server via `DebugVpnActivity`
+```bash
+adb -s 192.168.1.140:5555 shell am start \
+  -n com.bonded.bonded_app/.DebugVpnActivity \
+  --es action connect \
+  --es device_id "00000000-0000-0000-0000-000000000001"
+```
 
 ---
 
