@@ -131,10 +131,13 @@ macro_rules! alog_warn  { ($($arg:tt)*) => { alog(5, &format!($($arg)*)); } }
 #[cfg(target_os = "android")]
 macro_rules! alog_error { ($($arg:tt)*) => { alog(6, &format!($($arg)*)); } }
 #[cfg(not(target_os = "android"))]
+#[allow(unused_macros)]
 macro_rules! alog_info  { ($($arg:tt)*) => { eprintln!("[bonded-ffi] {}", format!($($arg)*)); } }
 #[cfg(not(target_os = "android"))]
+#[allow(unused_macros)]
 macro_rules! alog_warn  { ($($arg:tt)*) => { eprintln!("[bonded-ffi] WARN: {}", format!($($arg)*)); } }
 #[cfg(not(target_os = "android"))]
+#[allow(unused_macros)]
 macro_rules! alog_error { ($($arg:tt)*) => { eprintln!("[bonded-ffi] ERROR: {}", format!($($arg)*)); } }
 
 /// Ask the stored VpnService to protect `fd` so the socket bypasses the VPN.
@@ -175,7 +178,7 @@ fn protect_fd(fd: i32) -> bool {
             .and_then(|v| v.z().ok())
             .unwrap_or(false)
     };
-    eprintln!("[bonded-ffi] protect_fd(fd={fd}) -> {result}");
+    alog_info!("protect_fd(fd={fd}) -> {result}");
     result
 }
 
@@ -193,21 +196,21 @@ fn set_android_tun_fd(fd: i32) -> bool {
 
     if fd < 0 {
         *guard = None;
-        eprintln!("[bonded-ffi] Cleared native TUN writer fd");
+        alog_info!("Cleared native TUN writer fd");
         return true;
     }
 
     // Duplicate the Java-owned fd so native can own and close its copy safely.
     let dup_fd = unsafe { libc::dup(fd) };
     if dup_fd < 0 {
-        eprintln!("[bonded-ffi] Failed to dup TUN fd={fd}");
+        alog_error!("Failed to dup TUN fd={fd}");
         return false;
     }
 
     // Safety: dup() returns a fresh owned fd on success.
     let file = unsafe { File::from_raw_fd(dup_fd) };
     *guard = Some(file);
-    eprintln!("[bonded-ffi] Set native TUN writer fd from source fd={fd}");
+    alog_info!("Set native TUN writer fd from source fd={fd}");
     true
 }
 
@@ -224,7 +227,7 @@ fn write_inbound_packet_to_tun(payload: &[u8]) -> bool {
     match file.write_all(payload) {
         Ok(()) => true,
         Err(err) => {
-            eprintln!("[bonded-ffi] TUN write failed: {err}");
+            alog_warn!("TUN write failed: {err}");
             false
         }
     }
@@ -414,8 +417,8 @@ fn stop_android_session() {
             });
 
             if done_rx.recv_timeout(ANDROID_STOP_JOIN_TIMEOUT).is_err() {
-                eprintln!(
-                    "[bonded-ffi] stop_android_session: worker join timed out after {:?}; continuing teardown",
+                alog_warn!(
+                    "stop_android_session: worker join timed out after {:?}; continuing teardown",
                     ANDROID_STOP_JOIN_TIMEOUT,
                 );
             }
@@ -575,7 +578,7 @@ fn start_android_session(
                         match maybe_packet {
                             Some(packet) => {
                                 if packet.is_empty() && worker_cancel_token.is_cancelled() {
-                                    eprintln!("[bonded-ffi] Stop signal received");
+                                    alog_info!("Worker: stop signal received");
                                     break;
                                 }
 
@@ -584,7 +587,7 @@ fn start_android_session(
                                 if let Err(err) = transports[active_index].send(frame).await {
                                     alog_warn!("Worker: send on transport[{}] failed: {}", active_index, err);
                                     if transports.len() == 1 {
-                                        eprintln!("[bonded-ffi] Worker: only one transport available, cannot failover");
+                                        alog_error!("Worker: only one transport available, cannot failover");
                                         update_snapshot(&worker_snapshot, |session_snapshot| {
                                             session_snapshot.state = "error".to_owned();
                                             session_snapshot.last_error = Some(err.to_string());
@@ -597,7 +600,7 @@ fn start_android_session(
                                     if active_index >= transports.len() {
                                         active_index = 0;
                                     }
-                                    eprintln!("[bonded-ffi] Worker: failover from transport[{}] to transport[{}]", old_index, active_index);
+                                    alog_warn!("Worker: failover from transport[{}] to transport[{}]", old_index, active_index);
                                     continue;
                                 }
                                 update_snapshot(&worker_snapshot, |session_snapshot| {
@@ -606,7 +609,7 @@ fn start_android_session(
                                 });
                             }
                             None => {
-                                eprintln!("[bonded-ffi] Outbound channel closed");
+                                alog_info!("Worker: outbound channel closed");
                                 break;
                             }
                         }
@@ -624,13 +627,13 @@ fn start_android_session(
                                     let rtt_ms = last_ping_sent_ms
                                         .map(|sent| now_ms.saturating_sub(sent));
                                     if let Some(rtt) = rtt_ms {
-                                        eprintln!(
-                                            "[bonded-ffi] Heartbeat pong received: seq={} rtt={}ms",
+                                        alog_info!(
+                                            "Heartbeat pong received: seq={} rtt={}ms",
                                             frame.header.sequence, rtt
                                         );
                                     } else {
-                                        eprintln!(
-                                            "[bonded-ffi] Heartbeat pong received: seq={}",
+                                        alog_info!(
+                                            "Heartbeat pong received: seq={}",
                                             frame.header.sequence
                                         );
                                     }
@@ -727,7 +730,7 @@ fn start_android_session(
                                 if active_index >= transports.len() {
                                     active_index = 0;
                                 }
-                                eprintln!("[bonded-ffi] Worker: failover from recv error on transport[{}] to transport[{}]", old_index, active_index);
+                                alog_warn!("Worker: failover from recv error on transport[{}] to transport[{}]", old_index, active_index);
                             }
                         }
                     }
@@ -744,12 +747,9 @@ fn start_android_session(
                             },
                             payload: Bytes::new(),
                         };
-                        eprintln!(
-                            "[bonded-ffi] Sending heartbeat ping seq={}",
-                            ping_sequence
-                        );
+                        alog_info!("Sending heartbeat ping seq={}", ping_sequence);
                         if let Err(err) = transports[active_index].send(ping).await {
-                            eprintln!("[bonded-ffi] Heartbeat ping send failed: {}", err);
+                            alog_warn!("Heartbeat ping send failed: {}", err);
                         } else {
                             last_ping_sent_ms = Some(now_ms);
                             ping_sequence = ping_sequence.wrapping_add(1);
@@ -757,7 +757,7 @@ fn start_android_session(
                     }
                 }
             }
-            eprintln!("[bonded-ffi] Worker thread: exiting main loop");
+            alog_info!("Worker thread: exiting main loop");
         }); // end block_on
         })); // end catch_unwind
         if let Err(panic_val) = catch_result {
@@ -857,11 +857,12 @@ fn poll_inbound_packet() -> Option<Vec<u8>> {
 #[cfg(any(target_os = "android", test))]
 fn redeem_invite_token(
     server_address: &str,
-    _server_public_key: &str,
+    server_public_key: &str,
     invite_token: &str,
     storage_dir: &str,
 ) -> anyhow::Result<()> {
-    let mut config = android_client_config(server_address, "", _server_public_key, storage_dir);
+    let mut config = android_client_config(server_address, "", server_public_key, storage_dir);
+    config.client.invite_token = invite_token.to_owned();
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -932,7 +933,7 @@ pub extern "system" fn Java_com_bonded_bonded_1app_MainActivity_nativeRedeemInvi
                 "nativeRedeemInviteToken failed: {err}; server_address={server_address}; token_len={}",
                 invite_token.len()
             );
-            eprintln!("[bonded-ffi] {message}");
+            alog_error!("{message}");
             if let Ok(mut last_error) = LAST_NATIVE_ERROR.lock() {
                 *last_error = Some(message);
             }
@@ -1274,6 +1275,7 @@ mod tests {
         start_android_session(
             &addr.to_string(),
             "",
+            "server-pub",
             "naive_tcp",
             1,
             "[\"127.0.0.2\"]",

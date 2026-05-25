@@ -277,22 +277,16 @@ pub async fn establish_naive_tcp_session(config: &ClientConfig) -> anyhow::Resul
     if let Some(protect) = &config.socket_protect {
         use std::os::unix::io::AsRawFd;
         let fd = socket.as_raw_fd();
-        eprintln!("[bonded-client] Protecting NaiveTCP socket fd={}", fd);
+        debug!("protecting NaiveTCP socket fd={}", fd);
         if !protect.0(fd) {
-            eprintln!(
-                "[bonded-client] FAILED to protect NaiveTCP socket fd={}",
-                fd
-            );
+            warn!("failed to protect NaiveTCP socket fd={}", fd);
             anyhow::bail!("failed to protect NaiveTCP socket from VPN capture");
         }
-        eprintln!(
-            "[bonded-client] Successfully protected NaiveTCP socket fd={}",
-            fd
-        );
+        debug!("successfully protected NaiveTCP socket fd={}", fd);
     }
     #[cfg(not(unix))]
     if config.socket_protect.is_some() {
-        eprintln!("[bonded-client] Socket protect callback configured but platform is not Unix");
+        debug!("socket protect callback configured but platform is not Unix");
     }
     let stream = socket.connect(server_addr).await?;
     authenticate_naive_tcp_stream(config, stream).await
@@ -322,25 +316,19 @@ pub async fn establish_naive_tcp_session_with_bind(
     if let Some(protect) = &config.socket_protect {
         use std::os::unix::io::AsRawFd;
         let fd = socket.as_raw_fd();
-        eprintln!(
-            "[bonded-client] Protecting NaiveTCP bind-aware socket fd={} bind_ip={}",
+        debug!(
+            "protecting NaiveTCP bind-aware socket fd={} bind_ip={}",
             fd, bind_ip
         );
         if !protect.0(fd) {
-            eprintln!(
-                "[bonded-client] FAILED to protect NaiveTCP bind-aware socket fd={}",
-                fd
-            );
+            warn!("failed to protect NaiveTCP bind-aware socket fd={}", fd);
             anyhow::bail!("failed to protect bind-aware NaiveTCP socket from VPN capture");
         }
-        eprintln!(
-            "[bonded-client] Successfully protected NaiveTCP bind-aware socket fd={}",
-            fd
-        );
+        debug!("successfully protected NaiveTCP bind-aware socket fd={}", fd);
     }
     #[cfg(not(unix))]
     if config.socket_protect.is_some() {
-        eprintln!("[bonded-client] Socket protect callback configured but platform is not Unix");
+        debug!("socket protect callback configured but platform is not Unix");
     }
     let stream = socket.connect(server_address).await?;
     authenticate_naive_tcp_stream(config, stream).await
