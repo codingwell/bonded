@@ -455,6 +455,10 @@ class BondedVpnService : VpnService() {
     }
 
     private fun attemptSessionRecovery(lastError: String?) {
+        if (shutdownInProgress) {
+            return
+        }
+
         if (sessionStartupInProgress || networkRebindInProgress || sessionRecoveryInProgress) {
             return
         }
@@ -473,6 +477,11 @@ class BondedVpnService : VpnService() {
         sessionRecoveryInProgress = true
         lastRecoveryAttemptMs = nowMs
         thread(name = "bonded-session-recovery", start = true) {
+            if (shutdownInProgress) {
+                sessionRecoveryInProgress = false
+                return@thread
+            }
+
             android.util.Log.w(
                     "BondedVPN",
                     "Attempting native session recovery after error: ${lastError ?: "unknown"}",
@@ -704,10 +713,18 @@ class BondedVpnService : VpnService() {
             pathCount: Int,
             bindAddresses: List<String>,
     ): Boolean {
+        if (shutdownInProgress || vpnInterface == null) {
+            android.util.Log.i(
+                    "BondedVPN",
+                    "Skipping native session start because VPN shutdown is in progress",
+            )
+            return false
+        }
+
         return try {
             // Use the pre-resolved IP address if available so native code never needs to
             // perform DNS resolution inside an active VPN (which would route through TUN).
-                val resolvedServerAddr = cachedServerAddress ?: server.publicAddress
+            val resolvedServerAddr = cachedServerAddress ?: server.publicAddress
             // Protocols are selected at VPN startup by the native runtime; pairing metadata does
             // not dictate transport preference.
             val protocolCsv = ""
@@ -789,6 +806,10 @@ class BondedVpnService : VpnService() {
     }
 
     private fun handleNetworkPathChange(count: Int) {
+        if (shutdownInProgress) {
+            return
+        }
+
         if (sessionStartupInProgress || networkRebindInProgress) {
             return
         }
@@ -804,6 +825,11 @@ class BondedVpnService : VpnService() {
         val server = PairedServerStore.findById(this, deviceId) ?: return
         networkRebindInProgress = true
         thread(name = "bonded-network-path-restart", start = true) {
+            if (shutdownInProgress) {
+                networkRebindInProgress = false
+                return@thread
+            }
+
             stopNativeSession()
             if (startNativeSession(server, count, bindAddresses)) {
                 emitEvent(
