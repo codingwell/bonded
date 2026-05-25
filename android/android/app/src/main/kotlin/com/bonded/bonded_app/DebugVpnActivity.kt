@@ -145,6 +145,16 @@ class DebugVpnActivity : Activity() {
         val running = BondedVpnService.isRunning()
         log("VPN running=$running")
 
+        // Dump all paired servers so we can verify the stored public key.
+        val servers = PairedServerStore.loadAll(this)
+        if (servers.isEmpty()) {
+            log("No paired servers stored")
+        } else {
+            servers.forEachIndexed { i, s ->
+                log("Paired server[$i]: id=${s.id} addr=${s.publicAddress} key=${s.serverPublicKey.take(20)}…")
+            }
+        }
+
         val snapshot = BondedVpnService.getSessionSnapshot() ?: run {
             log("No session snapshot available")
             return

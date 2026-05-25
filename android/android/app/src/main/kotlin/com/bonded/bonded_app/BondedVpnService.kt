@@ -591,6 +591,7 @@ class BondedVpnService : VpnService() {
 
     private external fun nativeStartSession(
             serverAddress: String,
+            resolvedServerAddress: String,
             serverPublicKey: String,
             protocolCsv: String,
             pathCount: Int,
@@ -706,18 +707,19 @@ class BondedVpnService : VpnService() {
         return try {
             // Use the pre-resolved IP address if available so native code never needs to
             // perform DNS resolution inside an active VPN (which would route through TUN).
-            val serverAddr = cachedServerAddress ?: server.publicAddress
+                val resolvedServerAddr = cachedServerAddress ?: server.publicAddress
             // Protocols are selected at VPN startup by the native runtime; pairing metadata does
             // not dictate transport preference.
             val protocolCsv = ""
             val bindAddressesJson = JSONArray(bindAddresses).toString()
             android.util.Log.i(
                     "BondedVPN",
-                    "Starting native session: server=$serverAddr (original: ${server.publicAddress}), protocols=$protocolCsv, pathCount=$pathCount, bindAddresses=$bindAddressesJson",
+                    "Starting native session: server=${server.publicAddress}, resolved=$resolvedServerAddr, protocols=$protocolCsv, pathCount=$pathCount, bindAddresses=$bindAddressesJson",
             )
             val started =
                     nativeStartSession(
-                            serverAddr,
+                        server.publicAddress,
+                        resolvedServerAddr,
                             server.serverPublicKey,
                             protocolCsv,
                             pathCount,

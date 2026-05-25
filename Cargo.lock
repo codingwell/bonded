@@ -332,6 +332,7 @@ dependencies = [
  "jni 0.21.1",
  "jni-sys 0.4.1",
  "libc",
+ "rustls",
  "serde_json",
  "tokio",
  "tokio-util",

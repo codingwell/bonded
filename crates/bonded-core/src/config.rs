@@ -194,6 +194,11 @@ pub struct ClientSection {
     pub device_name: String,
     pub tun_name: String,
     pub server_public_address: String,
+    /// Optional pre-resolved host:port dial target used when DNS must happen
+    /// before the VPN is active. TLS and HTTP identity still come from
+    /// `server_public_address` / `server_websocket_address`.
+    #[serde(default)]
+    pub server_resolved_address: String,
     /// Deprecated: use `server_public_address` (the bootstrap port serves both
     /// WSS and HTTPS).  Kept for backward compatibility; takes precedence over
     /// `server_public_address` for WebSocket connections when non-empty.
@@ -225,6 +230,7 @@ impl Default for ClientSection {
             device_name: "linux-cli".to_owned(),
             tun_name: "bonded0".to_owned(),
             server_public_address: String::new(),
+            server_resolved_address: String::new(),
             server_websocket_address: String::new(),
             path_bind_addresses: Vec::new(),
             server_public_key: String::new(),

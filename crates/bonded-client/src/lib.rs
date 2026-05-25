@@ -1,3 +1,4 @@
+use anyhow::Context;
 use bonded_core::auth::{sign_auth_challenge, DeviceKeypair};
 use bonded_core::config::ClientConfig;
 #[cfg(target_os = "linux")]
@@ -122,7 +123,7 @@ pub async fn establish_transport_paths(
     let target = count.max(1);
     let mut paths = Vec::with_capacity(target);
     for path_index in 0..target {
-        let mut last_err: Option<anyhow::Error> = None;
+        let mut attempt_errors: Vec<String> = Vec::new();
 
         let bind_address = config
             .client
@@ -188,15 +189,23 @@ pub async fn establish_transport_paths(
                     break;
                 }
                 Err(err) => {
-                    last_err = Some(err);
+                    let bind_context = bind_address
+                        .map(|bind| format!(", bind_address={bind}"))
+                        .unwrap_or_default();
+                    attempt_errors.push(format!(
+                        "protocol={protocol}, path_index={path_index}{bind_context}: {:#}",
+                        err
+                    ));
                 }
             }
         }
 
         let Some(path) = connected else {
-            let reason = last_err
-                .map(|err| err.to_string())
-                .unwrap_or_else(|| "no matching protocols configured".to_owned());
+            let reason = if attempt_errors.is_empty() {
+                "no matching protocols configured".to_owned()
+            } else {
+                attempt_errors.join(" | ")
+            };
             if path_index == 0 {
                 anyhow::bail!(
                     "failed to establish path {path_index} with configured protocols: {reason}"
@@ -253,7 +262,12 @@ pub async fn establish_naive_tcp_session(config: &ClientConfig) -> anyhow::Resul
         anyhow::bail!("server_public_address is required for NaiveTCP connection");
     }
 
-    let server_addr = resolve_server_address(&config.client.server_public_address, None).await?;
+    let dial_address = if config.client.server_resolved_address.trim().is_empty() {
+        config.client.server_public_address.as_str()
+    } else {
+        config.client.server_resolved_address.as_str()
+    };
+    let server_addr = resolve_server_address(dial_address, None).await?;
     let socket = match server_addr {
         SocketAddr::V4(_) => TcpSocket::new_v4()?,
         SocketAddr::V6(_) => TcpSocket::new_v6()?,
@@ -293,8 +307,12 @@ pub async fn establish_naive_tcp_session_with_bind(
     }
 
     let bind_ip = parse_bind_ip(bind_address)?;
-    let server_address =
-        resolve_server_address(&config.client.server_public_address, Some(bind_ip)).await?;
+    let dial_address = if config.client.server_resolved_address.trim().is_empty() {
+        config.client.server_public_address.as_str()
+    } else {
+        config.client.server_resolved_address.as_str()
+    };
+    let server_address = resolve_server_address(dial_address, Some(bind_ip)).await?;
     let socket = match bind_ip {
         IpAddr::V4(_) => TcpSocket::new_v4()?,
         IpAddr::V6(_) => TcpSocket::new_v6()?,
@@ -378,19 +396,26 @@ async fn establish_websocket_session(
         };
 
     let request = websocket_url.as_str().into_client_request()?;
-    let uri = request.uri();
+    let uri = request.uri().clone();
     let host = uri
         .host()
-        .ok_or_else(|| anyhow::anyhow!("websocket URL is missing host: {websocket_url}"))?;
-    let scheme = uri.scheme_str().unwrap_or("wss");
+        .ok_or_else(|| anyhow::anyhow!("websocket URL is missing host: {websocket_url}"))?
+        .to_owned();
+    let scheme = uri.scheme_str().unwrap_or("wss").to_owned();
     let default_port = if scheme.eq_ignore_ascii_case("wss") {
         443
     } else {
         80
     };
     let port = uri.port_u16().unwrap_or(default_port);
+    let endpoint = format!("{scheme}://{host}:{port}");
+    let dial_address = if config.client.server_resolved_address.trim().is_empty() {
+        format!("{host}:{port}")
+    } else {
+        config.client.server_resolved_address.clone()
+    };
 
-    let server_addr = resolve_server_address(&format!("{host}:{port}"), None).await?;
+    let server_addr = resolve_server_address(&dial_address, None).await?;
     let socket = match server_addr {
         SocketAddr::V4(_) => TcpSocket::new_v4()?,
         SocketAddr::V6(_) => TcpSocket::new_v6()?,
@@ -415,14 +440,29 @@ async fn establish_websocket_session(
         debug!("socket protect callback configured but platform is not Unix");
     }
 
-    let connector = resolve_wss_tls_connector(scheme, host, port, config).await?;
+    let connector = resolve_wss_tls_connector(
+        &scheme,
+        &host,
+        port,
+        config,
+        (!config.client.server_resolved_address.trim().is_empty())
+            .then_some(config.client.server_resolved_address.as_str()),
+    )
+    .await
+    .with_context(|| format!("failed to resolve WSS TLS connector for {scheme}://{host}:{port}"))?;
 
-    let stream = socket.connect(server_addr).await?;
-    let (ws_stream, _response) =
-        client_async_tls_with_config(request, stream, None, connector).await?;
+    let stream = socket
+        .connect(server_addr)
+        .await
+        .with_context(|| format!("failed to connect websocket TCP socket to {server_addr}"))?;
+    let (ws_stream, _response) = client_async_tls_with_config(request, stream, None, connector)
+        .await
+        .with_context(|| format!("websocket TLS/upgrade failed for {endpoint}"))?;
 
     let mut transport = WebSocketTlsTransport::from_client_stream(ws_stream);
-    perform_websocket_auth_handshake(&mut transport, &keypair, &config.client.invite_token).await?;
+    perform_websocket_auth_handshake(&mut transport, &keypair, &config.client.invite_token)
+        .await
+        .with_context(|| format!("websocket auth handshake failed for {host}:{port}"))?;
     Ok(transport)
 }
 
@@ -454,19 +494,26 @@ async fn establish_websocket_session_with_bind(
         };
 
     let request = websocket_url.as_str().into_client_request()?;
-    let uri = request.uri();
+    let uri = request.uri().clone();
     let host = uri
         .host()
-        .ok_or_else(|| anyhow::anyhow!("websocket URL is missing host: {websocket_url}"))?;
-    let scheme = uri.scheme_str().unwrap_or("wss");
+        .ok_or_else(|| anyhow::anyhow!("websocket URL is missing host: {websocket_url}"))?
+        .to_owned();
+    let scheme = uri.scheme_str().unwrap_or("wss").to_owned();
     let default_port = if scheme.eq_ignore_ascii_case("wss") {
         443
     } else {
         80
     };
     let port = uri.port_u16().unwrap_or(default_port);
+    let endpoint = format!("{scheme}://{host}:{port}");
+    let dial_address = if config.client.server_resolved_address.trim().is_empty() {
+        format!("{host}:{port}")
+    } else {
+        config.client.server_resolved_address.clone()
+    };
 
-    let server_addr = resolve_server_address(&format!("{host}:{port}"), Some(bind_ip)).await?;
+    let server_addr = resolve_server_address(&dial_address, Some(bind_ip)).await?;
     let socket = match bind_ip {
         IpAddr::V4(_) => TcpSocket::new_v4()?,
         IpAddr::V6(_) => TcpSocket::new_v6()?,
@@ -494,14 +541,32 @@ async fn establish_websocket_session_with_bind(
         debug!("socket protect callback configured but platform is not Unix");
     }
 
-    let connector = resolve_wss_tls_connector(scheme, host, port, config).await?;
+    let connector = resolve_wss_tls_connector(
+        &scheme,
+        &host,
+        port,
+        config,
+        (!config.client.server_resolved_address.trim().is_empty())
+            .then_some(config.client.server_resolved_address.as_str()),
+    )
+    .await
+    .with_context(|| format!("failed to resolve WSS TLS connector for {scheme}://{host}:{port}"))?;
 
-    let stream = socket.connect(server_addr).await?;
-    let (ws_stream, _response) =
-        client_async_tls_with_config(request, stream, None, connector).await?;
+    let stream = socket.connect(server_addr).await.with_context(|| {
+        format!("failed to connect websocket TCP socket to {server_addr} from bind {bind_ip}")
+    })?;
+    let (ws_stream, _response) = client_async_tls_with_config(request, stream, None, connector)
+        .await
+        .with_context(|| {
+            format!("websocket TLS/upgrade failed for {endpoint} from bind {bind_ip}")
+        })?;
 
     let mut transport = WebSocketTlsTransport::from_client_stream(ws_stream);
-    perform_websocket_auth_handshake(&mut transport, &keypair, &config.client.invite_token).await?;
+    perform_websocket_auth_handshake(&mut transport, &keypair, &config.client.invite_token)
+        .await
+        .with_context(|| {
+            format!("websocket auth handshake failed for {host}:{port} from bind {bind_ip}")
+        })?;
     Ok(transport)
 }
 
@@ -547,6 +612,7 @@ async fn establish_quic_session(config: &ClientConfig) -> anyhow::Result<QuicTra
             port,
             &config.client.server_public_key,
             config.socket_protect.as_ref(),
+            None,
         )
         .await
         .map_err(|e| anyhow::anyhow!("QUIC cert-proof bootstrap failed for {host}:{port}: {e}"))?;
@@ -719,6 +785,7 @@ async fn resolve_wss_tls_connector(
     host: &str,
     port: u16,
     config: &ClientConfig,
+    dial_address: Option<&str>,
 ) -> anyhow::Result<Option<Connector>> {
     if !scheme.eq_ignore_ascii_case("wss") {
         return Ok(None);
@@ -746,6 +813,7 @@ async fn resolve_wss_tls_connector(
             port,
             &config.client.server_public_key,
             config.socket_protect.as_ref(),
+            dial_address,
         )
         .await
         {

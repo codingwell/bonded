@@ -61,6 +61,7 @@ pub async fn fetch_and_verify_cert_proof(
     port: u16,
     server_public_key_b64: &str,
     socket_protect: Option<&SocketProtectFn>,
+    dial_address: Option<&str>,
 ) -> anyhow::Result<String> {
     let captured_cert: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
 
@@ -78,11 +79,14 @@ pub async fn fetch_and_verify_cert_proof(
     // TCP connect — use a raw TcpSocket so we can protect the fd before
     // connecting on Android (avoids routing the cert-proof traffic through
     // the VPN tunnel that we are in the process of establishing).
-    let addr: SocketAddr = tokio::net::lookup_host(format!("{host}:{port}"))
+    let connect_target = dial_address
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("{host}:{port}"));
+    let addr: SocketAddr = tokio::net::lookup_host(&connect_target)
         .await
-        .map_err(|e| anyhow::anyhow!("failed to resolve {host}:{port}: {e}"))?
+        .map_err(|e| anyhow::anyhow!("failed to resolve {connect_target}: {e}"))?
         .next()
-        .ok_or_else(|| anyhow::anyhow!("no addresses for {host}:{port}"))?;
+        .ok_or_else(|| anyhow::anyhow!("no addresses for {connect_target}"))?;
     let socket = match addr {
         SocketAddr::V4(_) => TcpSocket::new_v4()?,
         SocketAddr::V6(_) => TcpSocket::new_v6()?,

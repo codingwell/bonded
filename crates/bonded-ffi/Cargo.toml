@@ -20,3 +20,4 @@ tokio-util.workspace = true
 jni = "0.21"
 jni-sys = "0.4"
 libc = "0.2"
+rustls.workspace = true

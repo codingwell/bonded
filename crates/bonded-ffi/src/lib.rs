@@ -63,8 +63,79 @@ static LAST_NATIVE_ERROR: Mutex<Option<String>> = Mutex::new(None);
 #[unsafe(no_mangle)]
 pub extern "system" fn JNI_OnLoad(vm: jni::JavaVM, _: *mut std::ffi::c_void) -> jni::sys::jint {
     let _ = ANDROID_JVM.set(vm);
+
+    // Install the rustls crypto provider (ring) once at library load time.
+    // Without this rustls panics with "Could not automatically determine the
+    // process-level CryptoProvider" when the worker thread first tries to open
+    // a TLS connection.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Install a panic hook that writes the panic message to Android logcat so
+    // panics in Rust worker threads are visible without a debugger.
+    std::panic::set_hook(Box::new(|info| {
+        let msg = if let Some(s) = info.payload().downcast_ref::<String>() {
+            format!("PANIC at {:?}: {}", info.location(), s)
+        } else if let Some(s) = info.payload().downcast_ref::<&str>() {
+            format!("PANIC at {:?}: {}", info.location(), s)
+        } else {
+            format!("PANIC at {:?}: (non-string payload)", info.location())
+        };
+        // alog is not yet in scope here; call the C function directly.
+        use std::ffi::CString;
+        extern "C" {
+            fn __android_log_write(
+                prio: libc::c_int,
+                tag: *const libc::c_char,
+                text: *const libc::c_char,
+            ) -> libc::c_int;
+        }
+        if let (Ok(tag), Ok(text)) = (CString::new("BondedFFI"), CString::new(msg)) {
+            unsafe {
+                __android_log_write(6, tag.as_ptr(), text.as_ptr());
+            }
+        }
+    }));
+
     jni::sys::JNI_VERSION_1_6
 }
+
+/// Write a log line directly to Android's logcat via `__android_log_write`.
+/// This works from any thread, including native threads that are not attached
+/// to the JVM, so it is the right tool for Rust worker-thread diagnostics.
+///
+/// Priority constants (from <android/log.h>):
+///   2 = VERBOSE, 3 = DEBUG, 4 = INFO, 5 = WARN, 6 = ERROR
+#[cfg(target_os = "android")]
+fn alog(priority: i32, msg: &str) {
+    use std::ffi::CString;
+    extern "C" {
+        fn __android_log_write(
+            prio: libc::c_int,
+            tag: *const libc::c_char,
+            text: *const libc::c_char,
+        ) -> libc::c_int;
+    }
+    if let (Ok(tag), Ok(text)) = (CString::new("BondedFFI"), CString::new(msg)) {
+        // SAFETY: valid null-terminated C strings passed to a standard Android API.
+        unsafe {
+            __android_log_write(priority, tag.as_ptr(), text.as_ptr());
+        }
+    }
+}
+
+/// Convenience macros that route to `alog` on Android and `eprintln!` elsewhere.
+#[cfg(target_os = "android")]
+macro_rules! alog_info  { ($($arg:tt)*) => { alog(4, &format!($($arg)*)); } }
+#[cfg(target_os = "android")]
+macro_rules! alog_warn  { ($($arg:tt)*) => { alog(5, &format!($($arg)*)); } }
+#[cfg(target_os = "android")]
+macro_rules! alog_error { ($($arg:tt)*) => { alog(6, &format!($($arg)*)); } }
+#[cfg(not(target_os = "android"))]
+macro_rules! alog_info  { ($($arg:tt)*) => { eprintln!("[bonded-ffi] {}", format!($($arg)*)); } }
+#[cfg(not(target_os = "android"))]
+macro_rules! alog_warn  { ($($arg:tt)*) => { eprintln!("[bonded-ffi] WARN: {}", format!($($arg)*)); } }
+#[cfg(not(target_os = "android"))]
+macro_rules! alog_error { ($($arg:tt)*) => { eprintln!("[bonded-ffi] ERROR: {}", format!($($arg)*)); } }
 
 /// Ask the stored VpnService to protect `fd` so the socket bypasses the VPN.
 #[cfg(target_os = "android")]
@@ -236,6 +307,7 @@ fn android_session_slot() -> &'static Mutex<Option<AndroidSessionHandle>> {
 #[cfg(any(target_os = "android", test))]
 fn android_client_config(
     server_address: &str,
+    resolved_server_address: &str,
     server_public_key: &str,
     storage_dir: &str,
 ) -> ClientConfig {
@@ -244,6 +316,7 @@ fn android_client_config(
     config.client.device_name = "android-client".to_owned();
     config.client.server_public_address = server_address.to_owned();
     config.client.server_websocket_address = server_address.to_owned();
+    config.client.server_resolved_address = resolved_server_address.to_owned();
     config.client.server_public_key = server_public_key.to_owned();
     config.client.preferred_protocols = vec!["wss".to_owned(), "naive_tcp".to_owned()];
     config.client.private_key_path = storage_root
@@ -358,19 +431,20 @@ fn stop_android_session() {
 #[cfg(any(target_os = "android", test))]
 fn start_android_session(
     server_address: &str,
+    resolved_server_address: &str,
     server_public_key: &str,
     protocol_csv: &str,
     path_count: usize,
     bind_addresses_json: &str,
     storage_dir: &str,
 ) -> anyhow::Result<()> {
-    eprintln!(
-        "[bonded-ffi] Starting Android session to {}",
-        server_address
-    );
-    eprintln!(
-        "[bonded-ffi] Protocols: {}, Paths: {}, Bind addresses: {}",
-        protocol_csv, path_count, bind_addresses_json
+    alog_info!(
+        "Starting Android session: server={} resolved={} protocols={} paths={} bind={}",
+        server_address,
+        resolved_server_address,
+        protocol_csv,
+        path_count,
+        bind_addresses_json
     );
 
     stop_android_session();
@@ -391,7 +465,13 @@ fn start_android_session(
     let worker_snapshot = Arc::clone(&snapshot);
     let cancel_token = CancellationToken::new();
     let worker_cancel_token = cancel_token.clone();
-    let mut config = android_client_config(server_address, server_public_key, storage_dir);
+    let worker_snapshot_panic = Arc::clone(&snapshot);
+    let mut config = android_client_config(
+        server_address,
+        resolved_server_address,
+        server_public_key,
+        storage_dir,
+    );
     let protocols = parse_protocol_list(protocol_csv);
     let bind_addresses = parse_bind_address_list(bind_addresses_json);
     if !protocols.is_empty() {
@@ -413,7 +493,7 @@ fn start_android_session(
         {
             Ok(runtime) => runtime,
             Err(err) => {
-                eprintln!("[bonded-ffi] Failed to create tokio runtime: {}", err);
+                alog_error!("Failed to create tokio runtime: {}", err);
                 update_snapshot(&worker_snapshot, |session_snapshot| {
                     session_snapshot.state = "error".to_owned();
                     session_snapshot.last_error =
@@ -423,8 +503,9 @@ fn start_android_session(
             }
         };
 
-        runtime.block_on(async move {
-            eprintln!("[bonded-ffi] Worker thread: establishing transport paths");
+        let catch_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async move {
+            alog_info!("Worker: establishing transport paths");
             let mut transports = match tokio::time::timeout(
                 ANDROID_PATH_ESTABLISH_TIMEOUT,
                 establish_transport_paths(&config, path_count.max(1)),
@@ -432,10 +513,7 @@ fn start_android_session(
             .await
             {
                 Ok(Ok(transports)) => {
-                    eprintln!(
-                        "[bonded-ffi] Transport paths established, count: {}",
-                        transports.len()
-                    );
+                    alog_info!("Transport paths established: count={}", transports.len());
                     for (index, transport) in transports.iter().enumerate() {
                         let kind = match transport {
                             bonded_client::ClientTransport::NaiveTcp(_) => "NaiveTCP",
@@ -443,10 +521,7 @@ fn start_android_session(
                             bonded_client::ClientTransport::Quic(_) => "QUIC",
                             bonded_client::ClientTransport::WireGuard(_) => "WireGuard",
                         };
-                        eprintln!(
-                            "[bonded-ffi] Transport path {}: {}",
-                            index, kind
-                        );
+                        alog_info!("  transport[{}] = {}", index, kind);
                     }
                     let now_ms = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
@@ -460,7 +535,7 @@ fn start_android_session(
                     transports
                 }
                 Ok(Err(err)) => {
-                    eprintln!("[bonded-ffi] Failed to establish transport paths: {}", err);
+                    alog_error!("Failed to establish transport paths: {}", err);
                     update_snapshot(&worker_snapshot, |session_snapshot| {
                         session_snapshot.state = "error".to_owned();
                         session_snapshot.last_error = Some(err.to_string());
@@ -472,7 +547,7 @@ fn start_android_session(
                         "timed out after {}s while establishing transport paths",
                         ANDROID_PATH_ESTABLISH_TIMEOUT.as_secs()
                     );
-                    eprintln!("[bonded-ffi] {}", message);
+                    alog_error!("{}", message);
                     update_snapshot(&worker_snapshot, |session_snapshot| {
                         session_snapshot.state = "error".to_owned();
                         session_snapshot.last_error = Some(message.clone());
@@ -492,7 +567,7 @@ fn start_android_session(
             loop {
                 tokio::select! {
                     _ = worker_cancel_token.cancelled() => {
-                        eprintln!("[bonded-ffi] Worker cancellation requested");
+                        alog_info!("Worker: cancellation requested");
                         close_client_transports(&mut transports).await;
                         break;
                     }
@@ -507,7 +582,7 @@ fn start_android_session(
                                 let packet_len = packet.len() as u64;
                                 let frame = session.create_outbound_frame(Bytes::from(packet), 0);
                                 if let Err(err) = transports[active_index].send(frame).await {
-                                    eprintln!("[bonded-ffi] Worker: send on transport[{}] failed: {}", active_index, err);
+                                    alog_warn!("Worker: send on transport[{}] failed: {}", active_index, err);
                                     if transports.len() == 1 {
                                         eprintln!("[bonded-ffi] Worker: only one transport available, cannot failover");
                                         update_snapshot(&worker_snapshot, |session_snapshot| {
@@ -637,9 +712,9 @@ fn start_android_session(
                                 }
                             }
                             Err(err) => {
-                                eprintln!("[bonded-ffi] Worker: recv on transport[{}] failed: {}", active_index, err);
+                                alog_warn!("Worker: recv on transport[{}] failed: {}", active_index, err);
                                 if transports.len() == 1 {
-                                    eprintln!("[bonded-ffi] Worker: only one transport available, cannot failover");
+                                    alog_error!("Worker: only one transport, cannot failover");
                                     update_snapshot(&worker_snapshot, |session_snapshot| {
                                         session_snapshot.state = "error".to_owned();
                                         session_snapshot.last_error = Some(err.to_string());
@@ -683,7 +758,20 @@ fn start_android_session(
                 }
             }
             eprintln!("[bonded-ffi] Worker thread: exiting main loop");
-        });
+        }); // end block_on
+        })); // end catch_unwind
+        if let Err(panic_val) = catch_result {
+            let msg = panic_val
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic_val.downcast_ref::<&str>().copied())
+                .unwrap_or("(non-string panic payload)");
+            alog_error!("Worker panicked: {}", msg);
+            update_snapshot(&worker_snapshot_panic, |session_snapshot| {
+                session_snapshot.state = "error".to_owned();
+                session_snapshot.last_error = Some(format!("worker panicked: {msg}"));
+            });
+        }
     });
 
     let handle = AndroidSessionHandle {
@@ -698,7 +786,7 @@ fn start_android_session(
         .lock()
         .expect("android session slot lock poisoned");
     *slot = Some(handle);
-    eprintln!("[bonded-ffi] Android session started successfully");
+    alog_info!("Android session started");
     Ok(())
 }
 
@@ -728,12 +816,16 @@ fn queue_outbound_packet(packet: Vec<u8>) -> bool {
         let result = handle.outbound_tx.send(packet);
         if result.is_err() {
             let message = "Failed to queue outbound packet: channel closed";
-            eprintln!("[bonded-ffi] {}", message);
             update_snapshot(&handle.snapshot, |session_snapshot| {
-                session_snapshot.state = "error".to_owned();
-                if session_snapshot.last_error.is_none() {
+                // Log before (and instead of) overwriting — helps surface the root cause.
+                if let Some(existing) = &session_snapshot.last_error {
+                    alog_warn!("Channel closed; existing last_error={}", existing);
+                } else {
+                    alog_error!("{}", message);
+                    session_snapshot.state = "error".to_owned();
                     session_snapshot.last_error = Some(message.to_owned());
                 }
+                session_snapshot.state = "error".to_owned();
             });
             return false;
         }
@@ -741,7 +833,7 @@ fn queue_outbound_packet(packet: Vec<u8>) -> bool {
         return true;
     }
 
-    eprintln!("[bonded-ffi] Cannot queue outbound packet: no active session");
+    alog_warn!("Cannot queue outbound packet: no active session");
     false
 }
 
@@ -769,7 +861,7 @@ fn redeem_invite_token(
     invite_token: &str,
     storage_dir: &str,
 ) -> anyhow::Result<()> {
-    let mut config = android_client_config(server_address, _server_public_key, storage_dir);
+    let mut config = android_client_config(server_address, "", _server_public_key, storage_dir);
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -873,6 +965,7 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeStartS
     mut env: jni::JNIEnv,
     obj: jni::objects::JObject,
     server_address: jni::objects::JString,
+    resolved_server_address: jni::objects::JString,
     server_public_key: jni::objects::JString,
     protocol_csv: jni::objects::JString,
     path_count: jni::sys::jint,
@@ -887,6 +980,10 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeStartS
     }
 
     let server_address: String = match env.get_string(&server_address) {
+        Ok(value) => value.into(),
+        Err(_) => return 0,
+    };
+    let resolved_server_address: String = match env.get_string(&resolved_server_address) {
         Ok(value) => value.into(),
         Err(_) => return 0,
     };
@@ -909,6 +1006,7 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeStartS
 
     if start_android_session(
         &server_address,
+        &resolved_server_address,
         &server_public_key,
         &protocol_csv,
         path_count.max(1) as usize,
