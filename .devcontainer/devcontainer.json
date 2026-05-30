@@ -7,9 +7,9 @@
         "ghcr.io/devcontainers/features/rust:1": {
             "profile": "default"
         },
-        "ghcr.io/devcontainers/features/docker-in-docker:2": {
-            "moby": true
-        },
+        // "ghcr.io/devcontainers/features/docker-in-docker:2": {
+        //     "moby": true
+        // },
         "ghcr.io/devcontainers/features/github-cli:1": {}
     },
     "customizations": {
@@ -21,19 +21,19 @@
                 "tamasfe.even-better-toml",
                 "fill-labs.dependi",
                 "ms-azuretools.vscode-docker",
-                "GitHub.copilot",
+                "gitHub.copilot-chat",
                 "github.vscode-github-actions"
             ],
             "settings": {
                 "rust-analyzer.cargo.features": "all",
                 "editor.formatOnSave": true,
                 "terminal.integrated.defaultProfile.linux": "bash",
-                "[rust]": {
-                    "editor.defaultFormatter": "rust-lang.rust-analyzer"
-                },
-                "[dart]": {
-                    "editor.defaultFormatter": "Dart-Code.dart-code"
-                }
+                // "[rust]": {
+                //     "editor.defaultFormatter": "rust-lang.rust-analyzer"
+                // },
+                // "[dart]": {
+                //     "editor.defaultFormatter": "Dart-Code.dart-code"
+                // }
             }
         }
     },

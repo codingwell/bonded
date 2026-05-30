@@ -263,6 +263,31 @@ async fn main() -> anyhow::Result<()> {
         wireguard_peers: wg_peer_registry,
         wireguard_public_addr: cfg.server.wireguard_public_addr(),
     });
+    if let (Some(wireguard_bind), Some(wireguard_keypair), Some(wireguard_peers)) = (
+        cfg.server.wireguard_bind.clone(),
+        bootstrap_ctx.wireguard_keypair.clone(),
+        bootstrap_ctx.wireguard_peers.clone(),
+    ) {
+        let wireguard_sessions = sessions.clone();
+        let wireguard_forwarders = forwarders.clone();
+        let wireguard_tun_bridge = tun_bridge.clone();
+        let wireguard_tunnel_pcap = tunnel_pcap.clone();
+        tokio::spawn(async move {
+            if let Err(err) = wireguard::run_wireguard_server(
+                &wireguard_bind,
+                wireguard_keypair,
+                wireguard_peers,
+                wireguard_sessions,
+                wireguard_forwarders,
+                wireguard_tun_bridge,
+                wireguard_tunnel_pcap,
+            )
+            .await
+            {
+                error!(bind = %wireguard_bind, error = %err, "wireguard listener terminated");
+            }
+        });
+    }
     if tun_bridge.is_none() {
         let bootstrap_bind = https_bind.clone();
         tokio::spawn(async move {
@@ -831,6 +856,9 @@ where
         if let Ok(port) = v.parse::<u16>() {
             cfg.server.wireguard_public = Some(port);
         }
+    }
+    if let Some(v) = read_env("BONDED_WIREGUARD_KEY_FILE") {
+        cfg.server.wireguard_key_file = Some(v);
     }
     if let Some(v) = read_env("BONDED_TCP_BIND") {
         cfg.server.tcp_bind = Some(v);

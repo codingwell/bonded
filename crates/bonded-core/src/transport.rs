@@ -765,11 +765,20 @@ impl WireGuardTransport {
         bind_addr: &str,
         peer_addr: std::net::SocketAddr,
         session_index: u32,
+        #[cfg(unix)] socket_protect: Option<&crate::config::SocketProtectFn>,
     ) -> anyhow::Result<Self> {
         use anyhow::Context as _;
         let socket = tokio::net::UdpSocket::bind(bind_addr)
             .await
             .with_context(|| format!("WireGuard: failed to bind UDP socket on {bind_addr}"))?;
+        #[cfg(unix)]
+        if let Some(protect) = socket_protect {
+            use std::os::unix::io::AsRawFd;
+            let fd = socket.as_raw_fd();
+            if !protect.0(fd) {
+                anyhow::bail!("WireGuard: failed to protect UDP socket from VPN capture (fd={fd})");
+            }
+        }
         socket.connect(peer_addr).await?;
 
         let tunn = boringtun::noise::Tunn::new(

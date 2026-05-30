@@ -9,6 +9,7 @@ use bonded_core::transport::{
 #[cfg(target_os = "linux")]
 use bytes::Bytes;
 use pnet_datalink::NetworkInterface;
+use rustls::pki_types::ServerName;
 use serde::Deserialize;
 use serde_json::json;
 use std::fs;
@@ -20,6 +21,7 @@ use tokio::net::{lookup_host, TcpSocket, TcpStream};
 #[cfg(target_os = "linux")]
 use tokio::select;
 use tokio::time::{timeout, Duration};
+use tokio_rustls::TlsConnector;
 use tokio_tungstenite::client_async_tls_with_config;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::Connector;
@@ -257,6 +259,39 @@ pub struct PairingPayload {
     pub server_public_key: String,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum BootstrapScheme {
+    Http,
+    Https,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireGuardCapabilitiesResponse {
+    wireguard: Option<WireGuardCapability>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireGuardCapability {
+    endpoint: String,
+    #[serde(default)]
+    server_public_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireGuardProvisionResponse {
+    #[serde(default)]
+    server_wg_public_key: String,
+    #[allow(dead_code)]
+    #[serde(default)]
+    peer_ip: String,
+}
+
+#[derive(Debug)]
+struct WireGuardBootstrapInfo {
+    endpoint: String,
+    server_public_key: String,
+}
+
 pub async fn establish_naive_tcp_session(config: &ClientConfig) -> anyhow::Result<TcpStream> {
     if config.client.server_public_address.trim().is_empty() {
         anyhow::bail!("server_public_address is required for NaiveTCP connection");
@@ -324,7 +359,10 @@ pub async fn establish_naive_tcp_session_with_bind(
             warn!("failed to protect NaiveTCP bind-aware socket fd={}", fd);
             anyhow::bail!("failed to protect bind-aware NaiveTCP socket from VPN capture");
         }
-        debug!("successfully protected NaiveTCP bind-aware socket fd={}", fd);
+        debug!(
+            "successfully protected NaiveTCP bind-aware socket fd={}",
+            fd
+        );
     }
     #[cfg(not(unix))]
     if config.socket_protect.is_some() {
@@ -709,15 +747,317 @@ async fn perform_quic_auth_handshake(
 /// - `server_public_address` or `server_websocket_address` — host:port for UDP
 /// - `wireguard_server_public_key` — the server's X25519 public key (base64)
 async fn establish_wireguard_session(config: &ClientConfig) -> anyhow::Result<WireGuardTransport> {
-    use base64::Engine as _;
     use bonded_core::transport::WireGuardKeypair;
 
-    let wg_server_pub_b64 = &config.client.wireguard_server_public_key;
-    if wg_server_pub_b64.is_empty() {
-        anyhow::bail!("WireGuard transport requires wireguard_server_public_key in client config");
+    let private_key_path = expand_home_path(&config.client.private_key_path);
+    let public_key_path = expand_home_path(&config.client.public_key_path);
+    let device_keypair = load_or_create_device_keypair(&private_key_path, &public_key_path)?;
+    let local_keypair = WireGuardKeypair::generate();
+    let bootstrap = bootstrap_wireguard_peer(
+        config,
+        &device_keypair.public_key_b64,
+        &local_keypair.public_key_b64(),
+    )
+    .await?;
+    let peer_public_key = decode_wireguard_public_key(&bootstrap.server_public_key)?;
+
+    let server_addr: std::net::SocketAddr = tokio::net::lookup_host(&bootstrap.endpoint)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to resolve WireGuard server {}: {e}",
+                bootstrap.endpoint
+            )
+        })?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no addresses resolved for {}", bootstrap.endpoint))?;
+
+    let transport = WireGuardTransport::new(
+        local_keypair,
+        peer_public_key,
+        "[::]:0", // bind to any local UDP port
+        server_addr,
+        rand::random::<u32>(),
+        #[cfg(unix)]
+        config.socket_protect.as_ref(),
+    )
+    .await?;
+    Ok(transport)
+}
+
+async fn bootstrap_wireguard_peer(
+    config: &ClientConfig,
+    device_public_key_b64: &str,
+    wireguard_public_key_b64: &str,
+) -> anyhow::Result<WireGuardBootstrapInfo> {
+    let bootstrap_address = config.client.server_public_address.trim();
+    if bootstrap_address.is_empty() {
+        anyhow::bail!("server_public_address is required for WireGuard bootstrap");
     }
+
+    let mut errors = Vec::new();
+    for scheme in bootstrap_scheme_candidates(config) {
+        let capabilities_raw = match request_bootstrap_json(
+            config,
+            scheme,
+            bootstrap_address,
+            "GET",
+            "/v1/bootstrap/capabilities",
+            None,
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(err) => {
+                errors.push(format!(
+                    "scheme={scheme:?}: capabilities request failed: {err:#}"
+                ));
+                continue;
+            }
+        };
+
+        let capabilities: WireGuardCapabilitiesResponse =
+            serde_json::from_str(&capabilities_raw)
+                .map_err(|e| anyhow::anyhow!("invalid WireGuard capabilities JSON: {e}"))?;
+        let Some(wireguard) = capabilities.wireguard else {
+            errors.push(format!(
+                "scheme={scheme:?}: server did not advertise wireguard transport"
+            ));
+            continue;
+        };
+
+        let request_body = json!({
+            "device_public_key": device_public_key_b64,
+            "wg_public_key": wireguard_public_key_b64,
+        })
+        .to_string();
+        let provision_raw = match request_bootstrap_json(
+            config,
+            scheme,
+            bootstrap_address,
+            "POST",
+            "/v1/bootstrap/wireguard/peer",
+            Some(&request_body),
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(err) => {
+                errors.push(format!(
+                    "scheme={scheme:?}: peer provisioning failed: {err:#}"
+                ));
+                continue;
+            }
+        };
+
+        let provision: WireGuardProvisionResponse = serde_json::from_str(&provision_raw)
+            .map_err(|e| anyhow::anyhow!("invalid WireGuard provision JSON: {e}"))?;
+        let server_public_key = if !provision.server_wg_public_key.is_empty() {
+            provision.server_wg_public_key
+        } else if !wireguard.server_public_key.is_empty() {
+            wireguard.server_public_key
+        } else {
+            config.client.wireguard_server_public_key.clone()
+        };
+
+        if server_public_key.is_empty() {
+            errors.push(format!(
+                "scheme={scheme:?}: server did not provide a WireGuard public key"
+            ));
+            continue;
+        }
+
+        return Ok(WireGuardBootstrapInfo {
+            endpoint: wireguard.endpoint,
+            server_public_key,
+        });
+    }
+
+    anyhow::bail!(
+        "failed to bootstrap WireGuard transport via {}: {}",
+        bootstrap_address,
+        errors.join(" | ")
+    )
+}
+
+fn bootstrap_scheme_candidates(config: &ClientConfig) -> Vec<BootstrapScheme> {
+    let websocket_address = config
+        .client
+        .server_websocket_address
+        .trim()
+        .to_ascii_lowercase();
+    if websocket_address.starts_with("ws://") {
+        vec![BootstrapScheme::Http, BootstrapScheme::Https]
+    } else if websocket_address.starts_with("wss://") {
+        vec![BootstrapScheme::Https, BootstrapScheme::Http]
+    } else {
+        vec![BootstrapScheme::Https, BootstrapScheme::Http]
+    }
+}
+
+async fn request_bootstrap_json(
+    config: &ClientConfig,
+    scheme: BootstrapScheme,
+    address: &str,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> anyhow::Result<String> {
+    let (host, port) = split_host_port(address)?;
+    match scheme {
+        BootstrapScheme::Http => {
+            request_bootstrap_json_http(config, &host, port, method, path, body).await
+        }
+        BootstrapScheme::Https => {
+            request_bootstrap_json_https(config, &host, port, method, path, body).await
+        }
+    }
+}
+
+async fn request_bootstrap_json_http(
+    config: &ClientConfig,
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> anyhow::Result<String> {
+    let mut stream = connect_bootstrap_tcp(host, port, config.socket_protect.as_ref()).await?;
+    let request = build_http_request(method, host, path, body);
+    stream.write_all(request.as_bytes()).await?;
+    stream.flush().await?;
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await?;
+    extract_http_json_body(&raw)
+}
+
+async fn request_bootstrap_json_https(
+    config: &ClientConfig,
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> anyhow::Result<String> {
+    let tls_config = if !config.client.tls_cert_fingerprint.is_empty() {
+        cert_proof::make_pinned_tls_config(&config.client.tls_cert_fingerprint)
+    } else if !config.client.server_public_key.is_empty() {
+        let fingerprint = cert_proof::fetch_and_verify_cert_proof(
+            host,
+            port,
+            &config.client.server_public_key,
+            config.socket_protect.as_ref(),
+            None,
+        )
+        .await?;
+        cert_proof::make_pinned_tls_config(&fingerprint)
+    } else {
+        anyhow::bail!(
+            "HTTPS WireGuard bootstrap requires tls_cert_fingerprint or server_public_key"
+        );
+    };
+
+    let tcp = connect_bootstrap_tcp(host, port, config.socket_protect.as_ref()).await?;
+    let server_name = if let Ok(ip) = host.parse::<IpAddr>() {
+        ServerName::IpAddress(ip.into())
+    } else {
+        ServerName::try_from(host.to_owned())
+            .map_err(|_| anyhow::anyhow!("invalid TLS server name: {host}"))?
+    };
+    let connector = TlsConnector::from(tls_config);
+    let mut tls = connector.connect(server_name, tcp).await?;
+
+    let request = build_http_request(method, host, path, body);
+    tls.write_all(request.as_bytes()).await?;
+    tls.flush().await?;
+
+    let mut raw = Vec::new();
+    tls.read_to_end(&mut raw).await?;
+    extract_http_json_body(&raw)
+}
+
+async fn connect_bootstrap_tcp(
+    host: &str,
+    port: u16,
+    socket_protect: Option<&bonded_core::config::SocketProtectFn>,
+) -> anyhow::Result<TcpStream> {
+    let target = format!("{host}:{port}");
+    let address = lookup_host(&target)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to resolve {target}: {e}"))?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no addresses resolved for {target}"))?;
+    let socket = match address {
+        SocketAddr::V4(_) => TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => TcpSocket::new_v6()?,
+    };
+    #[cfg(unix)]
+    if let Some(protect) = socket_protect {
+        use std::os::unix::io::AsRawFd;
+        let fd = socket.as_raw_fd();
+        if !protect.0(fd) {
+            anyhow::bail!("failed to protect bootstrap socket from VPN capture (fd={fd})");
+        }
+    }
+    Ok(socket.connect(address).await?)
+}
+
+fn build_http_request(method: &str, host: &str, path: &str, body: Option<&str>) -> String {
+    match body {
+        Some(body) => format!(
+            "{method} {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body,
+        ),
+        None => format!(
+            "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+        ),
+    }
+}
+
+fn extract_http_json_body(raw: &[u8]) -> anyhow::Result<String> {
+    let response = std::str::from_utf8(raw)
+        .map_err(|_| anyhow::anyhow!("bootstrap response contained non-UTF8 bytes"))?;
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| anyhow::anyhow!("bootstrap response missing header terminator"))?;
+    let status_line = headers
+        .lines()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("bootstrap response missing status line"))?;
+    if !status_line.contains(" 200 ") {
+        anyhow::bail!("bootstrap request failed: {status_line}; body={body}");
+    }
+    Ok(body.trim().to_owned())
+}
+
+fn split_host_port(address: &str) -> anyhow::Result<(String, u16)> {
+    if let Some(stripped) = address.strip_prefix('[') {
+        let end = stripped
+            .find(']')
+            .ok_or_else(|| anyhow::anyhow!("invalid bracketed address: {address}"))?;
+        let host = stripped[..end].to_owned();
+        let port = stripped[end + 1..]
+            .strip_prefix(':')
+            .ok_or_else(|| anyhow::anyhow!("missing port in address: {address}"))?
+            .parse::<u16>()?;
+        return Ok((host, port));
+    }
+
+    let (host, port) = address
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("address must be host:port: {address}"))?;
+    Ok((host.to_owned(), port.parse::<u16>()?))
+}
+
+fn decode_wireguard_public_key(
+    public_key_b64: &str,
+) -> anyhow::Result<boringtun::x25519::PublicKey> {
+    use base64::Engine as _;
+
     let server_pub_bytes: Vec<u8> = base64::engine::general_purpose::STANDARD
-        .decode(wg_server_pub_b64)
+        .decode(public_key_b64)
         .map_err(|e| anyhow::anyhow!("invalid wireguard_server_public_key base64: {e}"))?;
     if server_pub_bytes.len() != 32 {
         anyhow::bail!(
@@ -727,35 +1067,7 @@ async fn establish_wireguard_session(config: &ClientConfig) -> anyhow::Result<Wi
     }
     let mut peer_pub_bytes = [0u8; 32];
     peer_pub_bytes.copy_from_slice(&server_pub_bytes);
-    let peer_public_key = boringtun::x25519::PublicKey::from(peer_pub_bytes);
-
-    let address = &config.client.server_public_address;
-    let ws_addr = &config.client.server_websocket_address;
-    let server_addr_str = if ws_addr.trim().is_empty() {
-        address
-    } else {
-        ws_addr
-    };
-    let server_addr_str = server_addr_str
-        .trim_start_matches("wss://")
-        .trim_start_matches("ws://");
-
-    let server_addr: std::net::SocketAddr = tokio::net::lookup_host(server_addr_str)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to resolve WireGuard server {server_addr_str}: {e}"))?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no addresses resolved for {server_addr_str}"))?;
-
-    let local_keypair = WireGuardKeypair::generate();
-    let transport = WireGuardTransport::new(
-        local_keypair,
-        peer_public_key,
-        "[::]:0", // bind to any local UDP port
-        server_addr,
-        rand::random::<u32>(),
-    )
-    .await?;
-    Ok(transport)
+    Ok(boringtun::x25519::PublicKey::from(peer_pub_bytes))
 }
 
 /// Determine the TLS `Connector` to use for a `wss://` WebSocket connection.

@@ -275,8 +275,45 @@ async fn read_until_end_of_headers<S: AsyncReadExt + Unpin>(
         }
     }
 
+    let Some(header_end) = find_header_terminator(&buf) else {
+        anyhow::bail!("HTTP request headers missing terminator");
+    };
+
+    let content_length = parse_content_length(&buf[..header_end]);
+    let target_len = header_end + 4 + content_length;
+    while buf.len() < target_len {
+        let n = stream
+            .read(&mut tmp)
+            .await
+            .context("error reading HTTP request body")?;
+        if n == 0 {
+            anyhow::bail!(
+                "connection closed before HTTP request body was complete (expected {content_length} bytes)"
+            );
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+
     let is_ws = is_websocket_upgrade(&buf);
     Ok((buf, is_ws))
+}
+
+fn find_header_terminator(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+fn parse_content_length(headers: &[u8]) -> usize {
+    let text = std::str::from_utf8(headers).unwrap_or("");
+    text.lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                value.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0)
 }
 
 /// Return `true` if the buffered request contains an `Upgrade: websocket` header.
@@ -330,6 +367,7 @@ async fn handle_rest_request<S: AsyncWriteExt + Unpin>(
     );
     stream.write_all(response.as_bytes()).await?;
     stream.flush().await?;
+    stream.shutdown().await?;
     Ok(())
 }
 

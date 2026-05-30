@@ -343,8 +343,10 @@ name = "bonded-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "bonded-client",
  "bonded-core",
+ "boringtun",
  "bytes",
  "clap",
  "instant-acme",

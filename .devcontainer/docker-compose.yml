@@ -16,13 +16,13 @@ services:
       - "8081:8081"
       - "8082:8082"
       - "51820:51820/udp"
-    cap_add:
-      - NET_ADMIN
-      - SYS_PTRACE
-    devices:
-      - /dev/net/tun:/dev/net/tun
-    security_opt:
-      - seccomp:unconfined
+    # cap_add:
+    #   - NET_ADMIN
+    #   - SYS_PTRACE
+    # devices:
+    #   - /dev/net/tun:/dev/net/tun
+    # security_opt:
+    #   - seccomp:unconfined
 
 volumes:
   bonded-gradle-cache:

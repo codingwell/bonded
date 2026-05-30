@@ -7,7 +7,9 @@ description = "Bonded server binary"
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
 bonded-core = { path = "../bonded-core" }
+boringtun.workspace = true
 bytes.workspace = true
 clap.workspace = true
 notify.workspace = true

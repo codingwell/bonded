@@ -29,16 +29,21 @@ adb -s 192.168.1.140:5555 shell am start \
   --es adb_action pair \
   --es device_id "00000000-0000-0000-0000-000000000001" \
   --es server_address "127.0.0.1:8000" \
+  --es bootstrap_server_address "127.0.0.1:8000" \
   --es server_public_key "<server public key>" \
   --es invite_token "<invite token>" \
   --es supported_protocols "naive_tcp"
 ```
 
+`server_address` is the address used for native invite redemption.
+`bootstrap_server_address` is optional; when set, it is the address persisted in the paired-server record and later used by the VPN runtime for bootstrap and transport setup.
+This is useful when local tests redeem over NaiveTCP on one port and bootstrap WireGuard over a different published port.
+
 Look for `BondedMain` log lines like:
 
 ```text
 I/BondedMain: Redeeming invite token via native runtime for server=127.0.0.1:8000 ...
-I/BondedMain: ADB pair succeeded: deviceId=... server=127.0.0.1:8000 protocols=[naive_tcp]
+I/BondedMain: ADB pair succeeded: deviceId=... redeemServer=127.0.0.1:8000 bootstrapServer=127.0.0.1:8000 protocols=[naive_tcp]
 ```
 
 ### Local server over `adb reverse`

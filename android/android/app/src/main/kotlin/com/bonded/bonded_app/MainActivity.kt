@@ -26,6 +26,7 @@ class MainActivity : FlutterActivity() {
         private const val REQUEST_CODE_VPN_PREPARE = 2001
         private const val EXTRA_ADB_ACTION = "adb_action"
         private const val EXTRA_SERVER_ADDRESS = "server_address"
+        private const val EXTRA_BOOTSTRAP_SERVER_ADDRESS = "bootstrap_server_address"
         private const val EXTRA_SERVER_PUBLIC_KEY = "server_public_key"
         private const val EXTRA_INVITE_TOKEN = "invite_token"
         private const val EXTRA_DEVICE_ID = "device_id"
@@ -69,6 +70,11 @@ class MainActivity : FlutterActivity() {
         when (action) {
             "pair" -> {
                 val serverAddress = intent.getStringExtra(EXTRA_SERVER_ADDRESS)?.trim().orEmpty()
+                val bootstrapServerAddress =
+                    intent.getStringExtra(EXTRA_BOOTSTRAP_SERVER_ADDRESS)
+                        ?.trim()
+                        ?.takeIf { it.isNotEmpty() }
+                        ?: serverAddress
                 val serverPublicKey =
                         intent.getStringExtra(EXTRA_SERVER_PUBLIC_KEY)?.trim().orEmpty()
                 val inviteToken = intent.getStringExtra(EXTRA_INVITE_TOKEN)?.trim().orEmpty()
@@ -102,10 +108,15 @@ class MainActivity : FlutterActivity() {
                     return
                 }
 
-                savePairedServer(deviceId, serverAddress, serverPublicKey, supportedProtocols)
+        savePairedServer(
+            deviceId,
+            bootstrapServerAddress,
+            serverPublicKey,
+            supportedProtocols,
+        )
                 android.util.Log.i(
                         "BondedMain",
-                        "ADB pair succeeded: deviceId=$deviceId server=$serverAddress protocols=$supportedProtocols",
+            "ADB pair succeeded: deviceId=$deviceId redeemServer=$serverAddress bootstrapServer=$bootstrapServerAddress protocols=$supportedProtocols",
                 )
                 finish()
             }
