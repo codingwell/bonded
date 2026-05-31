@@ -23,8 +23,10 @@ use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 
 use anyhow::Context as _;
+use bytes::{Buf, Bytes};
 use bonded_core::session::{SessionFrame, SessionHeader, FLAG_PING, FLAG_PONG};
 use bonded_core::transport::{QuicTransport, Transport as _};
+use h3::server;
 use quinn::{Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::sync::mpsc;
@@ -32,11 +34,17 @@ use tracing::{info, warn};
 
 use crate::auth_handshake::perform_quic_auth_handshake;
 use crate::authorized_keys::AuthorizedKeysStore;
+use crate::bootstrap::{
+    advertised_endpoints_for_request, route_bootstrap_request, BootstrapContext,
+};
+use crate::peer_relay::resolve_session_binding;
 use crate::session_registry::SessionRegistry;
 use crate::smoltcp_forwarder::SmoltcpForwarder;
 
 /// Maximum frames to drain from the forwarder response queue per scheduler turn.
 const MAX_DRAIN: usize = 256;
+const RAW_QUIC_ALPN: &[u8] = b"bonded-quic";
+const H3_ALPN: &[u8] = b"h3";
 
 type ForwarderRegistry = Arc<RwLock<HashMap<u64, Arc<SmoltcpForwarder>>>>;
 
@@ -55,6 +63,8 @@ pub fn build_quic_server_config(
         .with_no_client_auth()
         .with_single_cert(vec![cert], key)
         .context("failed to build QUIC TLS config")?;
+    let mut tls_config = tls_config;
+    tls_config.alpn_protocols = vec![RAW_QUIC_ALPN.to_vec(), H3_ALPN.to_vec()];
 
     let mut server_config = ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
@@ -78,6 +88,7 @@ pub async fn run_quic_server(
     authorized_keys: AuthorizedKeysStore,
     sessions: SessionRegistry,
     forwarders: ForwarderRegistry,
+    bootstrap_ctx: Arc<BootstrapContext>,
 ) -> anyhow::Result<()> {
     let server_config = build_quic_server_config(cert_der, key_der)?;
 
@@ -103,6 +114,7 @@ pub async fn run_quic_server(
         let authorized_keys = authorized_keys.clone();
         let sessions = sessions.clone();
         let forwarders = forwarders.clone();
+        let bootstrap_ctx = bootstrap_ctx.clone();
 
         tokio::spawn(async move {
             let remote = incoming.remote_address();
@@ -111,14 +123,20 @@ pub async fn run_quic_server(
                     warn!(peer = %remote, error = %err, "QUIC handshake failed");
                 }
                 Ok(connection) => {
-                    let result = handle_quic_connection(
-                        connection,
-                        &invite_tokens_file,
-                        authorized_keys,
-                        sessions,
-                        forwarders,
-                    )
-                    .await;
+                    let protocol = negotiated_alpn(&connection);
+                    let result = if protocol.as_deref() == Some(H3_ALPN) {
+                        handle_h3_connection(connection, bootstrap_ctx).await
+                    } else {
+                        handle_quic_connection(
+                            connection,
+                            &invite_tokens_file,
+                            authorized_keys,
+                            sessions,
+                            forwarders,
+                            bootstrap_ctx,
+                        )
+                        .await
+                    };
                     if let Err(err) = result {
                         warn!(peer = %remote, error = %err, "QUIC session error");
                     }
@@ -130,12 +148,86 @@ pub async fn run_quic_server(
     Ok(())
 }
 
+fn negotiated_alpn(connection: &quinn::Connection) -> Option<Vec<u8>> {
+    connection
+        .handshake_data()
+        .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        .and_then(|data| data.protocol)
+}
+
+async fn handle_h3_connection(
+    connection: quinn::Connection,
+    bootstrap_ctx: Arc<BootstrapContext>,
+) -> anyhow::Result<()> {
+    let peer = connection.remote_address();
+    info!(peer = %peer, "HTTP/3 bootstrap connection established");
+
+    let mut h3_conn = server::builder()
+        .build(h3_quinn::Connection::new(connection))
+        .await
+        .context("failed to build HTTP/3 server connection")?;
+
+    loop {
+        let Some(resolver) = h3_conn.accept().await.context("HTTP/3 accept failed")? else {
+            break;
+        };
+        let (request, mut stream) = resolver
+            .resolve_request()
+            .await
+            .context("failed to resolve HTTP/3 request")?;
+        let path = request
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or_else(|| request.uri().path());
+        let advertised_endpoints = advertised_endpoints_for_request(
+            bootstrap_ctx.as_ref(),
+            request.uri().authority().map(|authority| authority.as_str()),
+        );
+
+        let mut body = Vec::new();
+        while let Some(mut chunk) = stream
+            .recv_data()
+            .await
+            .context("failed to read HTTP/3 request body")?
+        {
+            body.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+        }
+        let body = std::str::from_utf8(&body).unwrap_or("");
+        let (status, response_body) = route_bootstrap_request(
+            request.method().as_str(),
+            path,
+            body,
+            bootstrap_ctx.as_ref(),
+            Some(&advertised_endpoints),
+        );
+
+        let response = http::Response::builder()
+            .status(status)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(())
+            .expect("HTTP/3 bootstrap response should build");
+        stream
+            .send_response(response)
+            .await
+            .context("failed to send HTTP/3 response headers")?;
+        stream
+            .send_data(Bytes::from(response_body))
+            .await
+            .context("failed to send HTTP/3 response body")?;
+        stream.finish().await.context("failed to finish HTTP/3 response")?;
+    }
+
+    Ok(())
+}
+
 async fn handle_quic_connection(
     connection: quinn::Connection,
     invite_tokens_file: &str,
     authorized_keys: AuthorizedKeysStore,
     sessions: SessionRegistry,
     forwarders: ForwarderRegistry,
+    bootstrap_ctx: Arc<BootstrapContext>,
 ) -> anyhow::Result<()> {
     let peer = connection.remote_address();
     info!(peer = %peer, "QUIC connection established");
@@ -156,10 +248,26 @@ async fn handle_quic_connection(
         }
     };
 
-    let handle = sessions.register_client(public_key.clone());
+    let binding = match resolve_session_binding(
+        &mut transport,
+        public_key.clone(),
+        bootstrap_ctx.server_identity.as_ref(),
+    )
+    .await
+    {
+        Ok(binding) => binding,
+        Err(err) => {
+            warn!(peer = %peer, public_key = %public_key, error = %err, "failed to bind QUIC session after authentication");
+            return Ok(());
+        }
+    };
+
+    let handle = sessions.register_client(binding.client_public_key.clone());
     info!(
         peer = %peer,
-        public_key = %public_key,
+        public_key = %binding.client_public_key,
+        authenticated_public_key = %public_key,
+        relayed_via_provider = binding.relayed_via_provider,
         session_id = handle.session_id,
         "QUIC client authenticated"
     );
@@ -172,6 +280,7 @@ async fn handle_quic_connection(
         .expect("forwarder registry lock should not be poisoned")
         .insert(handle.session_id, forwarder.clone());
 
+    let mut pending_frame = binding.initial_frame;
     'session: loop {
         // Drain queued response frames before blocking.
         for _ in 0..MAX_DRAIN {
@@ -184,6 +293,27 @@ async fn handle_quic_connection(
                     "QUIC: failed to send drained response frame");
                 break 'session;
             }
+        }
+
+        if let Some(frame) = pending_frame.take() {
+            if frame.header.flags & FLAG_PING != 0 && frame.payload.is_empty() {
+                let pong = SessionFrame {
+                    header: SessionHeader {
+                        connection_id: frame.header.connection_id,
+                        sequence: frame.header.sequence,
+                        flags: FLAG_PONG,
+                    },
+                    payload: frame.payload,
+                };
+                if let Err(err) = transport.send(pong).await {
+                    warn!(peer = %peer, session_id = handle.session_id,
+                        error = %err, "QUIC: failed to send initial heartbeat pong");
+                    break 'session;
+                }
+            } else {
+                forwarder.ingest_packet(frame);
+            }
+            continue;
         }
 
         tokio::select! {
@@ -236,6 +366,6 @@ async fn handle_quic_connection(
         .write()
         .expect("forwarder registry lock should not be poisoned")
         .remove(&handle.session_id);
-    sessions.unregister_client(&public_key);
+    sessions.unregister_client(&binding.client_public_key);
     Ok(())
 }

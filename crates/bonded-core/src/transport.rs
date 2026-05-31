@@ -813,18 +813,21 @@ impl WireGuardTransport {
         }
 
         // Send handshake initiation.
-        let init_pkt: Vec<u8> = {
+        let init_pkt: Option<Vec<u8>> = {
             let result = self
                 .tunn
                 .format_handshake_initiation(&mut self.wg_buf, false);
             match result {
-                TunnResult::WriteToNetwork(pkt) => pkt.to_vec(),
+                TunnResult::WriteToNetwork(pkt) => Some(pkt.to_vec()),
+                TunnResult::Done => None,
                 other => anyhow::bail!(
                     "WireGuard: format_handshake_initiation returned unexpected result: {other:?}"
                 ),
             }
         };
-        self.socket.send(&init_pkt).await?;
+        if let Some(init_pkt) = init_pkt {
+            self.socket.send(&init_pkt).await?;
+        }
 
         // Wait up to 5 s for handshake to complete.
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
@@ -937,8 +940,10 @@ impl Transport for WireGuardTransport {
                 let pkt = pkt.to_vec();
                 self.socket.send(&pkt).await?;
             }
-            TunnResult::Err(_) => {
-                // No session established — initiate handshake then retry once.
+            TunnResult::Err(_) | TunnResult::Done => {
+                // boringtun may report either `Err(_)` or `Done` before the first
+                // data-capable session key is established. Drive the handshake, then
+                // retry the encapsulation once.
                 self.establish_session().await?;
                 let result = self.tunn.encapsulate(&ip_pkt, &mut self.wg_buf);
                 match result {

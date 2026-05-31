@@ -49,6 +49,14 @@ impl SessionRegistry {
         guard.sessions_by_client.remove(client_key);
     }
 
+    pub fn contains_client(&self, client_key: &str) -> bool {
+        self.inner
+            .read()
+            .expect("session registry read lock should not be poisoned")
+            .sessions_by_client
+            .contains_key(client_key)
+    }
+
     pub fn active_sessions(&self) -> usize {
         self.inner
             .read()
@@ -104,5 +112,17 @@ mod tests {
         let _ = registry.register_client("pub-a".to_owned());
         registry.unregister_client("pub-a");
         assert_eq!(registry.active_sessions(), 0);
+    }
+
+    #[test]
+    fn contains_client_tracks_registration_state() {
+        let registry = SessionRegistry::default();
+        assert!(!registry.contains_client("pub-a"));
+
+        let _ = registry.register_client("pub-a".to_owned());
+        assert!(registry.contains_client("pub-a"));
+
+        registry.unregister_client("pub-a");
+        assert!(!registry.contains_client("pub-a"));
     }
 }

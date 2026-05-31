@@ -13,11 +13,17 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
+use bonded_core::auth::verify_signature;
 use bonded_core::auth::{sign_bytes, DeviceKeypair};
+use bonded_core::peer_share::{
+    PeerShareIntroductionClaims, PeerShareIntroductionRequest, SignedPeerShareIntroduction,
+};
 use bonded_core::session::{SessionFrame, SessionHeader, FLAG_PING, FLAG_PONG};
 use bonded_core::transport::{PrependedStream, Transport, WebSocketTlsTransport};
+use http::StatusCode;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -27,6 +33,7 @@ use tracing::{error, info, warn};
 
 use crate::auth_handshake::perform_websocket_auth_handshake;
 use crate::authorized_keys::AuthorizedKeysStore;
+use crate::peer_relay::resolve_session_binding;
 use crate::session_registry::SessionRegistry;
 use crate::smoltcp_forwarder::SmoltcpForwarder;
 use crate::tunnel_pcap::TunnelPcapLogger;
@@ -38,6 +45,12 @@ const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_DRAIN: usize = 256;
 
 type ForwarderRegistry = Arc<RwLock<HashMap<u64, Arc<SmoltcpForwarder>>>>;
+
+#[derive(Debug, Clone)]
+pub(crate) struct AdvertisedBootstrapEndpoints {
+    pub server_public_address: String,
+    pub wireguard_public_addr: Option<String>,
+}
 
 // ── Bootstrap context ─────────────────────────────────────────────────────────
 
@@ -65,6 +78,13 @@ pub struct BootstrapContext {
     /// Public WireGuard endpoint (`hostname:port`), or `None` when WireGuard
     /// is not enabled.  Reported in capabilities alongside the provisioning URL.
     pub wireguard_public_addr: Option<String>,
+
+    /// Lease duration advertised for provisioned WireGuard peer assignments.
+    pub wireguard_peer_lease_secs: u64,
+
+    /// Authorized device store used when the server vouches for peer-sharing
+    /// introductions.
+    pub authorized_keys: AuthorizedKeysStore,
 }
 
 impl BootstrapContext {
@@ -188,6 +208,7 @@ async fn handle_tls_stream(
         handle_websocket_session(
             transport,
             peer,
+            ctx,
             invite_tokens_file,
             authorized_keys,
             sessions,
@@ -197,7 +218,17 @@ async fn handle_tls_stream(
         .await
     } else {
         let (method, path, body) = parse_request_parts(&request_bytes);
-        handle_rest_request(path, method, body, ctx, tls_stream).await
+        let advertised_endpoints =
+            advertised_endpoints_for_request(ctx, parse_host_header(&request_bytes).as_deref());
+        handle_rest_request(
+            path,
+            method,
+            body,
+            ctx,
+            Some(&advertised_endpoints),
+            tls_stream,
+        )
+        .await
     }
 }
 
@@ -221,6 +252,7 @@ async fn handle_plain_connection(
         handle_websocket_session(
             transport,
             peer,
+            ctx,
             invite_tokens_file,
             authorized_keys,
             sessions,
@@ -230,7 +262,9 @@ async fn handle_plain_connection(
         .await
     } else {
         let (method, path, body) = parse_request_parts(&request_bytes);
-        handle_rest_request(path, method, body, ctx, stream).await
+        let advertised_endpoints =
+            advertised_endpoints_for_request(ctx, parse_host_header(&request_bytes).as_deref());
+        handle_rest_request(path, method, body, ctx, Some(&advertised_endpoints), stream).await
     }
 }
 
@@ -344,6 +378,73 @@ fn parse_request_parts(headers: &[u8]) -> (&str, &str, &str) {
     (method, path, body)
 }
 
+fn parse_host_header(request: &[u8]) -> Option<String> {
+    let header_end = find_header_terminator(request)?;
+    let text = std::str::from_utf8(&request[..header_end]).ok()?;
+    text.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.trim().eq_ignore_ascii_case("host") {
+            let authority = value.trim();
+            if authority.is_empty() {
+                None
+            } else {
+                Some(authority.to_owned())
+            }
+        } else {
+            None
+        }
+    })
+}
+
+fn rewrite_endpoint_authority(configured_endpoint: &str, requested_authority: &str) -> String {
+    let requested = requested_authority.parse::<http::uri::Authority>().ok();
+    let configured = configured_endpoint.parse::<http::uri::Authority>().ok();
+
+    let host = requested
+        .as_ref()
+        .map(http::uri::Authority::host)
+        .filter(|host| !host.is_empty())
+        .unwrap_or(configured_endpoint);
+    let port = requested
+        .as_ref()
+        .and_then(http::uri::Authority::port_u16)
+        .or_else(|| configured.as_ref().and_then(http::uri::Authority::port_u16));
+
+    if host.contains(':') && !host.starts_with('[') {
+        match port {
+            Some(port) => format!("[{host}]:{port}"),
+            None => format!("[{host}]"),
+        }
+    } else {
+        match port {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_owned(),
+        }
+    }
+}
+
+pub(crate) fn advertised_endpoints_for_request(
+    ctx: &BootstrapContext,
+    requested_authority: Option<&str>,
+) -> AdvertisedBootstrapEndpoints {
+    match requested_authority.filter(|authority| !authority.trim().is_empty()) {
+        Some(authority) => AdvertisedBootstrapEndpoints {
+            server_public_address: rewrite_endpoint_authority(
+                &ctx.server_public_address,
+                authority,
+            ),
+            wireguard_public_addr: ctx
+                .wireguard_public_addr
+                .as_deref()
+                .map(|endpoint| rewrite_endpoint_authority(endpoint, authority)),
+        },
+        None => AdvertisedBootstrapEndpoints {
+            server_public_address: ctx.server_public_address.clone(),
+            wireguard_public_addr: ctx.wireguard_public_addr.clone(),
+        },
+    }
+}
+
 // ── REST routing ─────────────────────────────────────────────────────────────
 
 async fn handle_rest_request<S: AsyncWriteExt + Unpin>(
@@ -351,18 +452,17 @@ async fn handle_rest_request<S: AsyncWriteExt + Unpin>(
     method: &str,
     body: &str,
     ctx: &BootstrapContext,
+    advertised_endpoints: Option<&AdvertisedBootstrapEndpoints>,
     mut stream: S,
 ) -> anyhow::Result<()> {
-    let path_no_query = path.split('?').next().unwrap_or(path);
-    let (status, body_resp) = match (method, path_no_query) {
-        (_, "/v1/bootstrap/cert-proof") => cert_proof_response(ctx),
-        (_, "/v1/bootstrap/capabilities") => capabilities_response(ctx),
-        ("POST", "/v1/bootstrap/wireguard/peer") => wireguard_peer_response(ctx, body),
-        _ => ("404 Not Found", r#"{"error":"not found"}"#.to_owned()),
-    };
+    let (status, body_resp) =
+        route_bootstrap_request(method, path, body, ctx, advertised_endpoints);
+    let reason = status.canonical_reason().unwrap_or("Unknown");
 
     let response = format!(
-        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body_resp}",
+        "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body_resp}",
+        status.as_u16(),
+        reason,
         body_resp.len()
     );
     stream.write_all(response.as_bytes()).await?;
@@ -371,16 +471,35 @@ async fn handle_rest_request<S: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-fn cert_proof_response(ctx: &BootstrapContext) -> (&'static str, String) {
+pub(crate) fn route_bootstrap_request(
+    method: &str,
+    path: &str,
+    body: &str,
+    ctx: &BootstrapContext,
+    advertised_endpoints: Option<&AdvertisedBootstrapEndpoints>,
+) -> (StatusCode, String) {
+    let path_no_query = path.split('?').next().unwrap_or(path);
+    match (method, path_no_query) {
+        (_, "/v1/bootstrap/cert-proof") => cert_proof_response(ctx),
+        (_, "/v1/bootstrap/capabilities") => capabilities_response(ctx, advertised_endpoints),
+        ("POST", "/v1/bootstrap/wireguard/peer") => wireguard_peer_response(ctx, body),
+        ("POST", "/v1/bootstrap/peer-share/introduction") => {
+            peer_share_introduction_response(ctx, body)
+        }
+        _ => (StatusCode::NOT_FOUND, r#"{"error":"not found"}"#.to_owned()),
+    }
+}
+
+fn cert_proof_response(ctx: &BootstrapContext) -> (StatusCode, String) {
     match ctx.cert_proof() {
         None => (
-            "501 Not Implemented",
+            StatusCode::NOT_IMPLEMENTED,
             r#"{"error":"TLS not configured on this server; cert-proof requires TLS"}"#.to_owned(),
         ),
         Some(Err(err)) => {
             error!(error = %err, "failed to generate cert-proof signature");
             (
-                "500 Internal Server Error",
+                StatusCode::INTERNAL_SERVER_ERROR,
                 r#"{"error":"failed to generate cert proof"}"#.to_owned(),
             )
         }
@@ -390,7 +509,7 @@ fn cert_proof_response(ctx: &BootstrapContext) -> (&'static str, String) {
                 "ed25519_signature": signature,
             })
             .to_string();
-            ("200 OK", body)
+            (StatusCode::OK, body)
         }
     }
 }
@@ -408,30 +527,36 @@ fn cert_proof_response(ctx: &BootstrapContext) -> (&'static str, String) {
 ///   "wss": { "endpoint": "1.2.3.4:8443" }
 /// }
 /// ```
-fn capabilities_response(ctx: &BootstrapContext) -> (&'static str, String) {
+fn capabilities_response(
+    ctx: &BootstrapContext,
+    advertised_endpoints: Option<&AdvertisedBootstrapEndpoints>,
+) -> (StatusCode, String) {
+    let endpoints = advertised_endpoints
+        .cloned()
+        .unwrap_or_else(|| advertised_endpoints_for_request(ctx, None));
     let mut transports: Vec<&str> = vec!["wss"];
     let mut obj = serde_json::json!({
         "wss": {
-            "endpoint": ctx.server_public_address,
+            "endpoint": endpoints.server_public_address,
         }
     });
 
     if ctx.quic_enabled() {
         transports.push("h3");
         obj["h3"] = serde_json::json!({
-            "endpoint": ctx.server_public_address,
+            "endpoint": endpoints.server_public_address,
         });
     }
 
     if ctx.wireguard_enabled() {
         transports.push("wireguard");
-        let wg_endpoint = ctx
+        let wg_endpoint = endpoints
             .wireguard_public_addr
             .as_deref()
-            .unwrap_or(&ctx.server_public_address);
+            .unwrap_or(&endpoints.server_public_address);
         let provision_url = format!(
             "https://{}/v1/bootstrap/wireguard/peer",
-            ctx.server_public_address
+            endpoints.server_public_address
         );
         let server_wg_pubkey = ctx
             .wireguard_keypair
@@ -442,11 +567,12 @@ fn capabilities_response(ctx: &BootstrapContext) -> (&'static str, String) {
             "endpoint": wg_endpoint,
             "provision_endpoint": provision_url,
             "server_public_key": server_wg_pubkey,
+            "peer_lease_seconds": ctx.wireguard_peer_lease_secs,
         });
     }
 
     obj["transports"] = serde_json::json!(transports);
-    ("200 OK", obj.to_string())
+    (StatusCode::OK, obj.to_string())
 }
 
 /// `POST /v1/bootstrap/wireguard/peer`
@@ -463,14 +589,15 @@ fn capabilities_response(ctx: &BootstrapContext) -> (&'static str, String) {
 /// ```json
 /// {
 ///   "server_wg_public_key": "...",
-///   "peer_ip": "100.64.1.x/32"
+///   "peer_ip": "100.64.1.x/32",
+///   "lease_expires_at": 1767225600
 /// }
 /// ```
-fn wireguard_peer_response(ctx: &BootstrapContext, body: &str) -> (&'static str, String) {
+fn wireguard_peer_response(ctx: &BootstrapContext, body: &str) -> (StatusCode, String) {
     let (Some(kp), Some(peers)) = (ctx.wireguard_keypair.as_ref(), ctx.wireguard_peers.as_ref())
     else {
         return (
-            "501 Not Implemented",
+            StatusCode::NOT_IMPLEMENTED,
             r#"{"error":"WireGuard is not enabled on this server"}"#.to_owned(),
         );
     };
@@ -479,7 +606,7 @@ fn wireguard_peer_response(ctx: &BootstrapContext, body: &str) -> (&'static str,
         Ok(v) => v,
         Err(_) => {
             return (
-                "400 Bad Request",
+                StatusCode::BAD_REQUEST,
                 r#"{"error":"invalid JSON body"}"#.to_owned(),
             )
         }
@@ -494,23 +621,138 @@ fn wireguard_peer_response(ctx: &BootstrapContext, body: &str) -> (&'static str,
         .unwrap_or("");
     if device_pk.is_empty() || wg_pk.is_empty() {
         return (
-            "400 Bad Request",
+            StatusCode::BAD_REQUEST,
             r#"{"error":"device_public_key and wg_public_key are required"}"#.to_owned(),
         );
     }
 
-    let peer_ip = peers.register_peer(device_pk, wg_pk);
+    let peer = peers.register_peer_lease(device_pk, wg_pk);
     let body = serde_json::json!({
         "server_wg_public_key": kp.public_key_b64(),
-        "peer_ip": peer_ip,
+        "peer_ip": peer.peer_ip,
+        "lease_expires_at": peer.lease_expires_at,
     })
     .to_string();
-    ("200 OK", body)
+    (StatusCode::OK, body)
+}
+
+fn peer_share_introduction_response(ctx: &BootstrapContext, body: &str) -> (StatusCode, String) {
+    let request: PeerShareIntroductionRequest = match serde_json::from_str(body.trim()) {
+        Ok(request) => request,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                r#"{"error":"invalid JSON body"}"#.to_owned(),
+            )
+        }
+    };
+
+    if request.consumer_device_public_key.is_empty()
+        || request.provider_device_public_key.is_empty()
+        || request.provider_instance_nonce.is_empty()
+        || request.provider_endpoint.is_empty()
+        || request.listener_transport.is_empty()
+        || request.listener_cert_fingerprint.is_empty()
+        || request.consumer_signature.is_empty()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"consumer_device_public_key, provider_device_public_key, provider_instance_nonce, provider_endpoint, listener_transport, listener_cert_fingerprint, and consumer_signature are required"}"#.to_owned(),
+        );
+    }
+
+    if !ctx
+        .authorized_keys
+        .is_authorized(&request.consumer_device_public_key)
+        || !ctx
+            .authorized_keys
+            .is_authorized(&request.provider_device_public_key)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            r#"{"error":"peer introduction requires both devices to be authorized"}"#.to_owned(),
+        );
+    }
+
+    let signed_payload = match request.signed_payload() {
+        Ok(payload) => payload,
+        Err(err) => {
+            error!(error = %err, "failed to serialize peer introduction request payload");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"error":"failed to serialize peer introduction request"}"#.to_owned(),
+            );
+        }
+    };
+    if let Err(err) = verify_signature(
+        &request.consumer_device_public_key,
+        &signed_payload,
+        &request.consumer_signature,
+    ) {
+        warn!(error = %err, "peer introduction signature verification failed");
+        return (
+            StatusCode::UNAUTHORIZED,
+            r#"{"error":"invalid consumer signature"}"#.to_owned(),
+        );
+    }
+
+    let claims = PeerShareIntroductionClaims {
+        consumer_device_public_key: request.consumer_device_public_key,
+        provider_device_public_key: request.provider_device_public_key,
+        provider_instance_nonce: request.provider_instance_nonce,
+        provider_endpoint: request.provider_endpoint,
+        listener_transport: request.listener_transport,
+        listener_cert_fingerprint: request.listener_cert_fingerprint,
+        expires_at: unix_timestamp_after(Duration::from_secs(300)).unwrap_or(0),
+    };
+    let claims_payload = match claims.signing_payload() {
+        Ok(payload) => payload,
+        Err(err) => {
+            error!(error = %err, "failed to serialize peer introduction claims");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"error":"failed to serialize peer introduction claims"}"#.to_owned(),
+            );
+        }
+    };
+    let server_signature = match sign_bytes(&ctx.server_identity, &claims_payload) {
+        Ok(signature) => signature,
+        Err(err) => {
+            error!(error = %err, "failed to sign peer introduction claims");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"error":"failed to sign peer introduction"}"#.to_owned(),
+            );
+        }
+    };
+
+    let response = SignedPeerShareIntroduction {
+        introduction: claims,
+        server_signature,
+    };
+    match serde_json::to_string(&response) {
+        Ok(body) => (StatusCode::OK, body),
+        Err(err) => {
+            error!(error = %err, "failed to serialize peer introduction response");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"error":"failed to serialize peer introduction response"}"#.to_owned(),
+            )
+        }
+    }
+}
+
+fn unix_timestamp_after(duration: Duration) -> anyhow::Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .saturating_add(duration)
+        .as_secs())
 }
 
 async fn handle_websocket_session(
     mut transport: WebSocketTlsTransport,
     peer: SocketAddr,
+    ctx: &BootstrapContext,
     invite_tokens_file: &str,
     authorized_keys: AuthorizedKeysStore,
     sessions: SessionRegistry,
@@ -531,10 +773,26 @@ async fn handle_websocket_session(
         }
     };
 
-    let handle = sessions.register_client(public_key.clone());
+    let binding = match resolve_session_binding(
+        &mut transport,
+        public_key.clone(),
+        ctx.server_identity.as_ref(),
+    )
+    .await
+    {
+        Ok(binding) => binding,
+        Err(err) => {
+            warn!(peer = %peer, public_key = %public_key, error = %err, "failed to bind websocket session after authentication");
+            return Ok(());
+        }
+    };
+
+    let handle = sessions.register_client(binding.client_public_key.clone());
     info!(
         peer = %peer,
-        public_key = %public_key,
+        public_key = %binding.client_public_key,
+        authenticated_public_key = %public_key,
+        relayed_via_provider = binding.relayed_via_provider,
         session_id = handle.session_id,
         "websocket client authenticated via bootstrap listener"
     );
@@ -547,6 +805,7 @@ async fn handle_websocket_session(
         .expect("forwarder registry lock should not be poisoned")
         .insert(handle.session_id, forwarder.clone());
 
+    let mut pending_frame = binding.initial_frame;
     loop {
         // Drain queued response frames before blocking in select! to avoid
         // serialising bursty traffic to one frame per scheduler turn.
@@ -561,6 +820,28 @@ async fn handle_websocket_session(
                     "failed to return drained websocket frame");
                 break;
             }
+        }
+
+        if let Some(frame) = pending_frame.take() {
+            log_tunnel_packet(&tunnel_pcap, &frame.payload);
+            if frame.header.flags & FLAG_PING != 0 && frame.payload.is_empty() {
+                let pong = SessionFrame {
+                    header: SessionHeader {
+                        connection_id: frame.header.connection_id,
+                        sequence: frame.header.sequence,
+                        flags: FLAG_PONG,
+                    },
+                    payload: frame.payload,
+                };
+                if let Err(err) = transport.send(pong).await {
+                    warn!(peer = %peer, session_id = handle.session_id, error = %err,
+                        "failed to send initial heartbeat pong");
+                    break;
+                }
+            } else {
+                forwarder.ingest_packet(frame);
+            }
+            continue;
         }
 
         tokio::select! {
@@ -615,7 +896,7 @@ async fn handle_websocket_session(
         .write()
         .expect("forwarder registry lock should not be poisoned")
         .remove(&handle.session_id);
-    sessions.unregister_client(&public_key);
+    sessions.unregister_client(&binding.client_public_key);
     Ok(())
 }
 
@@ -634,9 +915,14 @@ fn log_tunnel_packet(pcap: &Option<Arc<TunnelPcapLogger>>, payload: &bytes::Byte
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bonded_core::auth::DeviceKeypair;
+    use crate::authorized_keys::{authorize_device_key, AuthorizedKeysStore};
+    use bonded_core::auth::{sign_bytes, verify_signature, DeviceKeypair};
+    use bonded_core::peer_share::{PeerShareIntroductionRequest, SignedPeerShareIntroduction};
     use std::collections::HashMap;
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::{Arc, RwLock};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     /// Build a minimal `BootstrapContext` suitable for testing.
     /// No TLS cert is configured, so cert-proof returns 501.
@@ -648,7 +934,17 @@ mod tests {
             wireguard_keypair: None,
             wireguard_peers: None,
             wireguard_public_addr: None,
+            wireguard_peer_lease_secs: 3600,
+            authorized_keys: AuthorizedKeysStore::default(),
         })
+    }
+
+    fn temp_auth_file(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        std::env::temp_dir().join(format!("bonded-auth-{name}-{stamp}.toml"))
     }
 
     /// Start a plain-TCP bootstrap server on an ephemeral port and return the
@@ -748,7 +1044,7 @@ mod tests {
         );
         assert_eq!(
             json["wss"]["endpoint"].as_str(),
-            Some("127.0.0.1:8443"),
+            Some("localhost:8443"),
             "unexpected wss endpoint"
         );
     }
@@ -776,6 +1072,8 @@ mod tests {
             wireguard_keypair: None,
             wireguard_peers: None,
             wireguard_public_addr: None,
+            wireguard_peer_lease_secs: 3600,
+            authorized_keys: AuthorizedKeysStore::default(),
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -820,5 +1118,146 @@ mod tests {
             !transports.iter().any(|t| t.as_str() == Some("wireguard")),
             "expected no 'wireguard' in transports when wireguard_keypair is None: {transports:?}"
         );
+    }
+
+    #[test]
+    fn peer_share_introduction_requires_authorized_devices() {
+        let consumer = DeviceKeypair::generate();
+        let provider = DeviceKeypair::generate();
+        let request = PeerShareIntroductionRequest {
+            consumer_device_public_key: consumer.public_key_b64.clone(),
+            provider_device_public_key: provider.public_key_b64.clone(),
+            provider_instance_nonce: "nonce-1".to_owned(),
+            provider_endpoint: "192.168.1.20:54443".to_owned(),
+            listener_transport: "quic".to_owned(),
+            listener_cert_fingerprint: "sha256:test-fingerprint".to_owned(),
+            consumer_signature: sign_bytes(
+                &consumer,
+                &serde_json::to_vec(&serde_json::json!({
+                    "consumer_device_public_key": consumer.public_key_b64,
+                    "provider_device_public_key": provider.public_key_b64,
+                    "provider_instance_nonce": "nonce-1",
+                    "provider_endpoint": "192.168.1.20:54443",
+                    "listener_transport": "quic",
+                    "listener_cert_fingerprint": "sha256:test-fingerprint",
+                }))
+                .expect("request payload should serialize"),
+            )
+            .expect("request should sign"),
+        };
+
+        let (status, _) = route_bootstrap_request(
+            "POST",
+            "/v1/bootstrap/peer-share/introduction",
+            &serde_json::to_string(&request).expect("request should serialize"),
+            test_ctx().as_ref(),
+            None,
+        );
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn peer_share_introduction_returns_server_signed_claims() {
+        let consumer = DeviceKeypair::generate();
+        let provider = DeviceKeypair::generate();
+        let auth_path = temp_auth_file("peer-intro");
+        authorize_device_key(&auth_path, &consumer.public_key_b64)
+            .expect("consumer key should authorize");
+        authorize_device_key(&auth_path, &provider.public_key_b64)
+            .expect("provider key should authorize");
+        let authorized_keys =
+            AuthorizedKeysStore::load(&auth_path).expect("authorized keys store should load");
+        let server_identity = Arc::new(DeviceKeypair::generate());
+        let ctx = Arc::new(BootstrapContext {
+            server_identity: server_identity.clone(),
+            tls_cert_der: None,
+            server_public_address: "127.0.0.1:8443".to_owned(),
+            wireguard_keypair: None,
+            wireguard_peers: None,
+            wireguard_public_addr: None,
+            wireguard_peer_lease_secs: 3600,
+            authorized_keys,
+        });
+
+        let unsigned = serde_json::json!({
+            "consumer_device_public_key": consumer.public_key_b64.clone(),
+            "provider_device_public_key": provider.public_key_b64.clone(),
+            "provider_instance_nonce": "nonce-2",
+            "provider_endpoint": "192.168.1.21:54443",
+            "listener_transport": "quic",
+            "listener_cert_fingerprint": "sha256:listener-fingerprint",
+        });
+        let request = PeerShareIntroductionRequest {
+            consumer_device_public_key: unsigned["consumer_device_public_key"]
+                .as_str()
+                .expect("consumer key should exist")
+                .to_owned(),
+            provider_device_public_key: unsigned["provider_device_public_key"]
+                .as_str()
+                .expect("provider key should exist")
+                .to_owned(),
+            provider_instance_nonce: "nonce-2".to_owned(),
+            provider_endpoint: "192.168.1.21:54443".to_owned(),
+            listener_transport: "quic".to_owned(),
+            listener_cert_fingerprint: "sha256:listener-fingerprint".to_owned(),
+            consumer_signature: sign_bytes(
+                &consumer,
+                &serde_json::to_vec(&unsigned).expect("request payload should serialize"),
+            )
+            .expect("request should sign"),
+        };
+
+        let (status, body) = route_bootstrap_request(
+            "POST",
+            "/v1/bootstrap/peer-share/introduction",
+            &serde_json::to_string(&request).expect("request should serialize"),
+            ctx.as_ref(),
+            None,
+        );
+
+        assert_eq!(status, StatusCode::OK);
+        let response: SignedPeerShareIntroduction =
+            serde_json::from_str(&body).expect("response should parse");
+        assert_eq!(
+            response.introduction.provider_device_public_key,
+            provider.public_key_b64
+        );
+        assert_eq!(response.introduction.listener_transport, "quic");
+        assert_eq!(
+            response.introduction.listener_cert_fingerprint,
+            "sha256:listener-fingerprint"
+        );
+        assert!(response.introduction.expires_at > 0);
+        verify_signature(
+            &server_identity.public_key_b64,
+            &response
+                .introduction
+                .signing_payload()
+                .expect("claims should serialize"),
+            &response.server_signature,
+        )
+        .expect("server signature should verify");
+        let _ = fs::remove_file(auth_path);
+    }
+
+    #[test]
+    fn capabilities_response_prefers_request_authority() {
+        let ctx = test_ctx();
+        let advertised =
+            advertised_endpoints_for_request(ctx.as_ref(), Some("charter.codingwell.net:443"));
+
+        let (status, body) = route_bootstrap_request(
+            "GET",
+            "/v1/bootstrap/capabilities",
+            "",
+            ctx.as_ref(),
+            Some(&advertised),
+        );
+
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value =
+            serde_json::from_str(&body).expect("capabilities should parse");
+        assert_eq!(json["wss"]["endpoint"], "charter.codingwell.net:443");
     }
 }

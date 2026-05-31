@@ -8,6 +8,8 @@ pub const DEFAULT_SERVER_CONFIG_PATH: &str = "/etc/bonded/server.toml";
 pub const DEFAULT_AUTHORIZED_KEYS_PATH: &str = "/var/lib/bonded/authorized_keys.toml";
 pub const DEFAULT_INVITE_TOKENS_PATH: &str = "/var/lib/bonded/invite_tokens.toml";
 pub const DEFAULT_SERVER_IDENTITY_KEY_PATH: &str = "/var/lib/bonded/server-identity.pem";
+pub const DEFAULT_WIREGUARD_PEERS_PATH: &str = "/var/lib/bonded/wireguard_peers.toml";
+pub const DEFAULT_WIREGUARD_PEER_LEASE_SECS: u64 = 30 * 24 * 60 * 60;
 
 pub const DEFAULT_CLIENT_CONFIG_PATH: &str = "~/.config/bonded/client.toml";
 pub const DEFAULT_CLIENT_PRIVATE_KEY_PATH: &str = "~/.local/share/bonded/device-key.pem";
@@ -92,6 +94,14 @@ pub struct ServerSection {
     /// automatically on first boot when `wireguard_bind` is set.
     #[serde(default)]
     pub wireguard_key_file: Option<String>,
+    /// Path to the persisted WireGuard peer allocation state. When set, peer
+    /// IP assignments survive server restart and existing devices keep the
+    /// same `/32` allocation across re-provisioning.
+    #[serde(default)]
+    pub wireguard_peers_file: Option<String>,
+    /// Lease duration for a provisioned WireGuard peer assignment. Expired
+    /// peers are pruned and their `/32` can be reused by a future bootstrap.
+    pub wireguard_peer_lease_secs: u64,
 
     // ── Debug NaiveTCP ───────────────────────────────────────────────────────
     /// Local address for the unencrypted NaiveTCP listener (debug/testing
@@ -160,6 +170,8 @@ impl Default for ServerSection {
             wireguard_bind: None,
             wireguard_public: None,
             wireguard_key_file: None,
+            wireguard_peers_file: None,
+            wireguard_peer_lease_secs: DEFAULT_WIREGUARD_PEER_LEASE_SECS,
             tcp_bind: None,
             tcp_public: None,
             status_bind: "0.0.0.0:8082".to_owned(),
@@ -208,6 +220,10 @@ pub struct ClientSection {
     pub server_public_key: String,
     pub invite_token: String,
     pub preferred_protocols: Vec<String>,
+    /// Explicit opt-in for insecure debug transports such as NaiveTCP.
+    /// Production configs must leave this disabled.
+    #[serde(default)]
+    pub allow_insecure_debug_transports: bool,
     pub private_key_path: String,
     pub public_key_path: String,
     /// Pinned SHA-256 fingerprint of the server TLS leaf certificate
@@ -222,6 +238,12 @@ pub struct ClientSection {
     /// `/v1/bootstrap/wireguard/peer` during pairing.
     #[serde(default)]
     pub wireguard_server_public_key: String,
+    #[serde(default)]
+    pub peer_share_enabled: bool,
+    #[serde(default)]
+    pub peer_share_bind_address: String,
+    #[serde(default)]
+    pub peer_share_advertise_ip: String,
 }
 
 impl Default for ClientSection {
@@ -235,11 +257,15 @@ impl Default for ClientSection {
             path_bind_addresses: Vec::new(),
             server_public_key: String::new(),
             invite_token: String::new(),
-            preferred_protocols: vec!["naive_tcp".to_owned(), "wss".to_owned()],
+            preferred_protocols: vec!["wss".to_owned(), "h3".to_owned(), "wireguard".to_owned()],
+            allow_insecure_debug_transports: false,
             private_key_path: DEFAULT_CLIENT_PRIVATE_KEY_PATH.to_owned(),
             public_key_path: DEFAULT_CLIENT_PUBLIC_KEY_PATH.to_owned(),
             tls_cert_fingerprint: String::new(),
             wireguard_server_public_key: String::new(),
+            peer_share_enabled: false,
+            peer_share_bind_address: "0.0.0.0:54443".to_owned(),
+            peer_share_advertise_ip: String::new(),
         }
     }
 }
@@ -256,7 +282,7 @@ pub fn load_client_config(path: &Path) -> Result<ClientConfig, ConfigError> {
 
 #[cfg(test)]
 mod tests {
-    use super::ServerConfig;
+    use super::{ClientConfig, ServerConfig};
 
     #[test]
     fn default_server_config_has_expected_values() {
@@ -330,5 +356,17 @@ https_bind = "127.0.0.1:9000"
             cfg.server.wireguard_public_addr(),
             Some("vpn.example.com:51820".to_owned())
         );
+    }
+
+    #[test]
+    fn client_defaults_exclude_insecure_debug_transports() {
+        let cfg = ClientConfig::default();
+        assert_eq!(
+            cfg.client.preferred_protocols,
+            vec!["wss", "h3", "wireguard"]
+        );
+        assert!(!cfg.client.allow_insecure_debug_transports);
+        assert!(!cfg.client.peer_share_enabled);
+        assert_eq!(cfg.client.peer_share_bind_address, "0.0.0.0:54443");
     }
 }

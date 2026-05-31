@@ -12,10 +12,13 @@ bonded-core = { path = "../bonded-core" }
 boringtun.workspace = true
 bytes.workspace = true
 clap.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
 notify.workspace = true
 qrcode.workspace = true
 serde.workspace = true
 serde_json = "1"
+http = "1"
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 tokio-rustls.workspace = true
@@ -41,5 +44,6 @@ rcgen = "0.13"
 x509-parser = { version = "0.16", default-features = false }
 
 [dev-dependencies]
+async-trait = "0.1"
 bonded-client = { path = "../bonded-client" }
 rcgen = "0.13"

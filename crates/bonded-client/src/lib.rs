@@ -1,4 +1,5 @@
 use anyhow::Context;
+use async_trait::async_trait;
 use bonded_core::auth::{sign_auth_challenge, DeviceKeypair};
 use bonded_core::config::ClientConfig;
 #[cfg(target_os = "linux")]
@@ -6,14 +7,21 @@ use bonded_core::session::SessionState;
 use bonded_core::transport::{
     NaiveTcpTransport, QuicTransport, Transport, WebSocketTlsTransport, WireGuardTransport,
 };
+use bytes::Buf;
 #[cfg(target_os = "linux")]
 use bytes::Bytes;
+use bytes::Bytes as RawBytes;
+use h3::client;
+use http::Request;
 use pnet_datalink::NetworkInterface;
+use rustls::pki_types::CertificateDer;
 use rustls::pki_types::ServerName;
+use rustls::ClientConfig as RustlsClientConfig;
 use serde::Deserialize;
 use serde_json::json;
 use std::fs;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::future::poll_fn;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -30,6 +38,9 @@ use tracing::{debug, info, warn};
 use tun::Configuration;
 
 pub mod cert_proof;
+pub mod peer_discovery;
+pub mod peer_listener;
+pub mod peer_runtime;
 
 #[cfg(test)]
 mod client_integration;
@@ -38,15 +49,43 @@ pub enum ClientTransport {
     NaiveTcp(NaiveTcpTransport),
     WebSocket(Box<WebSocketTlsTransport>),
     Quic(Box<QuicTransport>),
+    PeerRelay {
+        transport: Box<QuicTransport>,
+        peer_id: String,
+        close_notifier: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    },
     WireGuard(Box<WireGuardTransport>),
 }
 
 impl ClientTransport {
+    pub fn peer_relay(
+        transport: QuicTransport,
+        peer_id: String,
+        close_notifier: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> Self {
+        Self::PeerRelay {
+            transport: Box::new(transport),
+            peer_id,
+            close_notifier: Some(close_notifier),
+        }
+    }
+
     pub async fn send(&mut self, frame: bonded_core::session::SessionFrame) -> anyhow::Result<()> {
         match self {
             ClientTransport::NaiveTcp(inner) => inner.send(frame).await,
             ClientTransport::WebSocket(inner) => inner.send(frame).await,
             ClientTransport::Quic(inner) => inner.send(frame).await,
+            ClientTransport::PeerRelay {
+                transport,
+                peer_id,
+                close_notifier,
+            } => match transport.send(frame).await {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    notify_peer_relay_closed(close_notifier, peer_id);
+                    Err(err)
+                }
+            },
             ClientTransport::WireGuard(inner) => inner.send(frame).await,
         }
     }
@@ -56,6 +95,17 @@ impl ClientTransport {
             ClientTransport::NaiveTcp(inner) => inner.recv().await,
             ClientTransport::WebSocket(inner) => inner.recv().await,
             ClientTransport::Quic(inner) => inner.recv().await,
+            ClientTransport::PeerRelay {
+                transport,
+                peer_id,
+                close_notifier,
+            } => match transport.recv().await {
+                Ok(frame) => Ok(frame),
+                Err(err) => {
+                    notify_peer_relay_closed(close_notifier, peer_id);
+                    Err(err)
+                }
+            },
             ClientTransport::WireGuard(inner) => inner.recv().await,
         }
     }
@@ -65,7 +115,45 @@ impl ClientTransport {
             ClientTransport::NaiveTcp(inner) => inner.close().await,
             ClientTransport::WebSocket(inner) => inner.close().await,
             ClientTransport::Quic(inner) => inner.close().await,
+            ClientTransport::PeerRelay {
+                transport,
+                peer_id,
+                close_notifier,
+            } => {
+                notify_peer_relay_closed(close_notifier, peer_id);
+                transport.close().await
+            }
             ClientTransport::WireGuard(inner) => inner.close().await,
+        }
+    }
+}
+
+fn notify_peer_relay_closed(
+    close_notifier: &mut Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    peer_id: &str,
+) {
+    if let Some(notifier) = close_notifier.take() {
+        let _ = notifier.send(peer_id.to_owned());
+    }
+}
+
+#[async_trait]
+impl Transport for ClientTransport {
+    async fn send(&mut self, frame: bonded_core::session::SessionFrame) -> anyhow::Result<()> {
+        ClientTransport::send(self, frame).await
+    }
+
+    async fn recv(&mut self) -> anyhow::Result<bonded_core::session::SessionFrame> {
+        ClientTransport::recv(self).await
+    }
+
+    fn kind(&self) -> bonded_core::transport::TransportKind {
+        match self {
+            ClientTransport::NaiveTcp(_) => bonded_core::transport::TransportKind::NaiveTcp,
+            ClientTransport::WebSocket(_) => bonded_core::transport::TransportKind::WebSocketTls,
+            ClientTransport::Quic(_) => bonded_core::transport::TransportKind::Quic,
+            ClientTransport::PeerRelay { .. } => bonded_core::transport::TransportKind::Quic,
+            ClientTransport::WireGuard(_) => bonded_core::transport::TransportKind::WireGuard,
         }
     }
 }
@@ -81,6 +169,7 @@ impl ClientRuntime {
     }
 
     pub async fn start(&self) -> anyhow::Result<()> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let interfaces = enumerate_interfaces();
         info!(
             interfaces = interfaces.len(),
@@ -96,7 +185,19 @@ impl ClientRuntime {
 
         #[cfg(target_os = "linux")]
         {
-            run_linux_packet_loop(&self.config.client.tun_name, transports).await?;
+            let (peer_transport_tx, peer_transport_rx) = tokio::sync::mpsc::unbounded_channel();
+            let _peer_transport_hold = peer_transport_tx.clone();
+            let _peer_share_runtime = if self.config.client.peer_share_enabled {
+                Some(
+                    peer_runtime::start_peer_share_runtime(&self.config, peer_transport_tx)
+                        .await
+                        .context("failed to start peer-share runtime")?,
+                )
+            } else {
+                None
+            };
+            run_linux_packet_loop(&self.config.client.tun_name, transports, peer_transport_rx)
+                .await?;
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -116,11 +217,10 @@ pub async fn establish_transport_paths(
     config: &ClientConfig,
     count: usize,
 ) -> anyhow::Result<Vec<ClientTransport>> {
-    let protocols = if config.client.preferred_protocols.is_empty() {
-        vec!["naive_tcp".to_owned()]
-    } else {
-        config.client.preferred_protocols.clone()
-    };
+    let protocols = sanitize_preferred_protocols(
+        &config.client.preferred_protocols,
+        config.client.allow_insecure_debug_transports,
+    );
 
     let target = count.max(1);
     let mut paths = Vec::with_capacity(target);
@@ -231,6 +331,30 @@ pub async fn establish_transport_paths(
 
 const PATH_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(8);
 
+fn sanitize_preferred_protocols(
+    protocols: &[String],
+    allow_insecure_debug_transports: bool,
+) -> Vec<String> {
+    let source = if protocols.is_empty() {
+        vec!["wss".to_owned(), "h3".to_owned(), "wireguard".to_owned()]
+    } else {
+        protocols.to_vec()
+    };
+
+    let filtered: Vec<String> = source
+        .into_iter()
+        .filter(|protocol| {
+            allow_insecure_debug_transports || !protocol.eq_ignore_ascii_case("naive_tcp")
+        })
+        .collect();
+
+    if filtered.is_empty() {
+        vec!["wss".to_owned(), "h3".to_owned(), "wireguard".to_owned()]
+    } else {
+        filtered
+    }
+}
+
 fn rotated_protocols(protocols: &[String], start: usize) -> Vec<String> {
     if protocols.is_empty() {
         return Vec::new();
@@ -263,6 +387,7 @@ pub struct PairingPayload {
 enum BootstrapScheme {
     Http,
     Https,
+    H3,
 }
 
 #[derive(Debug, Deserialize)]
@@ -275,6 +400,8 @@ struct WireGuardCapability {
     endpoint: String,
     #[serde(default)]
     server_public_key: String,
+    #[serde(default)]
+    peer_lease_seconds: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -284,12 +411,19 @@ struct WireGuardProvisionResponse {
     #[allow(dead_code)]
     #[serde(default)]
     peer_ip: String,
+    #[allow(dead_code)]
+    #[serde(default)]
+    lease_expires_at: u64,
 }
 
 #[derive(Debug)]
 struct WireGuardBootstrapInfo {
     endpoint: String,
     server_public_key: String,
+    #[allow(dead_code)]
+    peer_lease_seconds: u64,
+    #[allow(dead_code)]
+    lease_expires_at: u64,
 }
 
 pub async fn establish_naive_tcp_session(config: &ClientConfig) -> anyhow::Result<TcpStream> {
@@ -466,24 +600,54 @@ async fn establish_websocket_session(
         debug!("socket protect callback configured but platform is not Unix");
     }
 
-    let connector = resolve_wss_tls_connector(
-        &scheme,
-        &host,
-        port,
-        config,
-        (!config.client.server_resolved_address.trim().is_empty())
-            .then_some(config.client.server_resolved_address.as_str()),
-    )
-    .await
-    .with_context(|| format!("failed to resolve WSS TLS connector for {scheme}://{host}:{port}"))?;
+    let dial_override = (!config.client.server_resolved_address.trim().is_empty())
+        .then_some(config.client.server_resolved_address.as_str());
+    let connector = resolve_wss_tls_connector(&scheme, &host, port, config, dial_override)
+        .await
+        .with_context(|| {
+            format!("failed to resolve WSS TLS connector for {scheme}://{host}:{port}")
+        })?;
 
-    let stream = socket
+    let first_stream = socket
         .connect(server_addr)
         .await
         .with_context(|| format!("failed to connect websocket TCP socket to {server_addr}"))?;
-    let (ws_stream, _response) = client_async_tls_with_config(request, stream, None, connector)
-        .await
-        .with_context(|| format!("websocket TLS/upgrade failed for {endpoint}"))?;
+    let ws_attempt = client_async_tls_with_config(request, first_stream, None, connector).await;
+    let (ws_stream, _response) = match ws_attempt {
+        Ok(result) => result,
+        Err(err) if scheme.eq_ignore_ascii_case("wss") && should_retry_tls_rotation(config) => {
+            let refreshed = refresh_tls_fingerprint_after_rotation(
+                host.as_str(),
+                port,
+                config,
+                dial_override,
+                "WSS",
+            )
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("missing refreshed fingerprint for rotated WSS cert"))?;
+            let retry_stream =
+                connect_websocket_tcp_socket(server_addr, None, config.socket_protect.as_ref())
+                    .await
+                    .with_context(|| {
+                        format!("failed to reconnect websocket TCP socket to {server_addr}")
+                    })?;
+            let retry_request = websocket_url.as_str().into_client_request()?;
+            client_async_tls_with_config(
+                retry_request,
+                retry_stream,
+                None,
+                Some(Connector::Rustls(cert_proof::make_pinned_tls_config(
+                    &refreshed,
+                ))),
+            )
+            .await
+            .with_context(|| format!("websocket TLS/upgrade retry failed for {endpoint}: {err}"))?
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("websocket TLS/upgrade failed for {endpoint}"));
+        }
+    };
 
     let mut transport = WebSocketTlsTransport::from_client_stream(ws_stream);
     perform_websocket_auth_handshake(&mut transport, &keypair, &config.client.invite_token)
@@ -567,25 +731,63 @@ async fn establish_websocket_session_with_bind(
         debug!("socket protect callback configured but platform is not Unix");
     }
 
-    let connector = resolve_wss_tls_connector(
-        &scheme,
-        &host,
-        port,
-        config,
-        (!config.client.server_resolved_address.trim().is_empty())
-            .then_some(config.client.server_resolved_address.as_str()),
-    )
-    .await
-    .with_context(|| format!("failed to resolve WSS TLS connector for {scheme}://{host}:{port}"))?;
+    let dial_override = (!config.client.server_resolved_address.trim().is_empty())
+        .then_some(config.client.server_resolved_address.as_str());
+    let connector = resolve_wss_tls_connector(&scheme, &host, port, config, dial_override)
+        .await
+        .with_context(|| {
+            format!("failed to resolve WSS TLS connector for {scheme}://{host}:{port}")
+        })?;
 
     let stream = socket.connect(server_addr).await.with_context(|| {
         format!("failed to connect websocket TCP socket to {server_addr} from bind {bind_ip}")
     })?;
-    let (ws_stream, _response) = client_async_tls_with_config(request, stream, None, connector)
-        .await
-        .with_context(|| {
-            format!("websocket TLS/upgrade failed for {endpoint} from bind {bind_ip}")
-        })?;
+    let ws_attempt = client_async_tls_with_config(request, stream, None, connector).await;
+    let (ws_stream, _response) = match ws_attempt {
+        Ok(result) => result,
+        Err(err) if scheme.eq_ignore_ascii_case("wss") && should_retry_tls_rotation(config) => {
+            let refreshed = refresh_tls_fingerprint_after_rotation(
+                host.as_str(),
+                port,
+                config,
+                dial_override,
+                "WSS",
+            )
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("missing refreshed fingerprint for rotated WSS cert"))?;
+            let retry_stream = connect_websocket_tcp_socket(
+                server_addr,
+                Some(bind_ip),
+                config.socket_protect.as_ref(),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to reconnect websocket TCP socket to {server_addr} from bind {bind_ip}"
+                )
+            })?;
+            let retry_request = websocket_url.as_str().into_client_request()?;
+            client_async_tls_with_config(
+                retry_request,
+                retry_stream,
+                None,
+                Some(Connector::Rustls(cert_proof::make_pinned_tls_config(
+                    &refreshed,
+                ))),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "websocket TLS/upgrade retry failed for {endpoint} from bind {bind_ip}: {err}"
+                )
+            })?
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("websocket TLS/upgrade failed for {endpoint} from bind {bind_ip}")
+            });
+        }
+    };
 
     let mut transport = WebSocketTlsTransport::from_client_stream(ws_stream);
     perform_websocket_auth_handshake(&mut transport, &keypair, &config.client.invite_token)
@@ -630,47 +832,59 @@ async fn establish_quic_session(config: &ClientConfig) -> anyhow::Result<QuicTra
     };
 
     // Build rustls ClientConfig with cert pinning.
+    let dial_override = (!config.client.server_resolved_address.trim().is_empty())
+        .then_some(config.client.server_resolved_address.as_str());
     let rustls_config = if !config.client.tls_cert_fingerprint.is_empty() {
-        cert_proof::make_pinned_tls_config(&config.client.tls_cert_fingerprint)
+        (*cert_proof::make_pinned_tls_config(&config.client.tls_cert_fingerprint)).clone()
     } else if !config.client.server_public_key.is_empty() {
         let fingerprint = cert_proof::fetch_and_verify_cert_proof(
             host,
             port,
             &config.client.server_public_key,
             config.socket_protect.as_ref(),
-            None,
+            dial_override,
         )
         .await
         .map_err(|e| anyhow::anyhow!("QUIC cert-proof bootstrap failed for {host}:{port}: {e}"))?;
         info!(fingerprint = %fingerprint, "QUIC cert-proof verified");
-        cert_proof::make_pinned_tls_config(&fingerprint)
+        (*cert_proof::make_pinned_tls_config(&fingerprint)).clone()
     } else {
         anyhow::bail!(
             "QUIC transport requires tls_cert_fingerprint or server_public_key in client config"
         );
     };
 
-    let quic_client_config = quinn::ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from((*rustls_config).clone())
-            .map_err(|e| anyhow::anyhow!("QUIC crypto config error: {e}"))?,
-    ));
-
-    let mut endpoint = quinn::Endpoint::client("[::]:0".parse().unwrap())
-        .map_err(|e| anyhow::anyhow!("failed to bind QUIC client endpoint: {e}"))?;
-    endpoint.set_default_client_config(quic_client_config);
-
-    let server_addr: SocketAddr = tokio::net::lookup_host(format!("{host}:{port}"))
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to resolve QUIC server {host}:{port}: {e}"))?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no addresses resolved for {host}:{port}"))?;
-
-    debug!(peer = %server_addr, "connecting QUIC endpoint");
-    let connection = endpoint
-        .connect(server_addr, host)
-        .map_err(|e| anyhow::anyhow!("QUIC connect error: {e}"))?
-        .await
-        .map_err(|e| anyhow::anyhow!("QUIC connection failed: {e}"))?;
+    let (_endpoint, connection) = match connect_quic_client(
+        host,
+        port,
+        rustls_config.clone(),
+        b"bonded-quic",
+        config.socket_protect.as_ref(),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(err) if should_retry_tls_rotation(config) => {
+            let refreshed =
+                refresh_tls_fingerprint_after_rotation(host, port, config, dial_override, "QUIC")
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("missing refreshed fingerprint for rotated QUIC cert")
+                    })?;
+            connect_quic_client(
+                host,
+                port,
+                (*cert_proof::make_pinned_tls_config(&refreshed)).clone(),
+                b"bonded-quic",
+                config.socket_protect.as_ref(),
+            )
+            .await
+            .with_context(|| {
+                format!("QUIC reconnect after cert rotation failed for {host}:{port}: {err}")
+            })?
+        }
+        Err(err) => return Err(err),
+    };
 
     let mut transport = QuicTransport::from_client_connection(connection).await?;
 
@@ -870,6 +1084,8 @@ async fn bootstrap_wireguard_peer(
         return Ok(WireGuardBootstrapInfo {
             endpoint: wireguard.endpoint,
             server_public_key,
+            peer_lease_seconds: wireguard.peer_lease_seconds,
+            lease_expires_at: provision.lease_expires_at,
         });
     }
 
@@ -880,7 +1096,7 @@ async fn bootstrap_wireguard_peer(
     )
 }
 
-fn bootstrap_scheme_candidates(config: &ClientConfig) -> Vec<BootstrapScheme> {
+pub(crate) fn bootstrap_scheme_candidates(config: &ClientConfig) -> Vec<BootstrapScheme> {
     let websocket_address = config
         .client
         .server_websocket_address
@@ -889,13 +1105,21 @@ fn bootstrap_scheme_candidates(config: &ClientConfig) -> Vec<BootstrapScheme> {
     if websocket_address.starts_with("ws://") {
         vec![BootstrapScheme::Http, BootstrapScheme::Https]
     } else if websocket_address.starts_with("wss://") {
-        vec![BootstrapScheme::Https, BootstrapScheme::Http]
+        vec![
+            BootstrapScheme::H3,
+            BootstrapScheme::Https,
+            BootstrapScheme::Http,
+        ]
     } else {
-        vec![BootstrapScheme::Https, BootstrapScheme::Http]
+        vec![
+            BootstrapScheme::H3,
+            BootstrapScheme::Https,
+            BootstrapScheme::Http,
+        ]
     }
 }
 
-async fn request_bootstrap_json(
+pub(crate) async fn request_bootstrap_json(
     config: &ClientConfig,
     scheme: BootstrapScheme,
     address: &str,
@@ -905,6 +1129,9 @@ async fn request_bootstrap_json(
 ) -> anyhow::Result<String> {
     let (host, port) = split_host_port(address)?;
     match scheme {
+        BootstrapScheme::H3 => {
+            request_bootstrap_json_h3(config, &host, port, method, path, body).await
+        }
         BootstrapScheme::Http => {
             request_bootstrap_json_http(config, &host, port, method, path, body).await
         }
@@ -912,6 +1139,103 @@ async fn request_bootstrap_json(
             request_bootstrap_json_https(config, &host, port, method, path, body).await
         }
     }
+}
+
+async fn request_bootstrap_json_h3(
+    config: &ClientConfig,
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> anyhow::Result<String> {
+    let dial_override = (!config.client.server_resolved_address.trim().is_empty())
+        .then_some(config.client.server_resolved_address.as_str());
+    let (rustls_config, require_cert_proof) = if !config.client.tls_cert_fingerprint.is_empty() {
+        (
+            (*cert_proof::make_pinned_tls_config(&config.client.tls_cert_fingerprint)).clone(),
+            false,
+        )
+    } else if !config.client.server_public_key.is_empty() {
+        (
+            (*cert_proof::make_insecure_capture_tls_config(Arc::new(std::sync::Mutex::new(None))))
+                .clone(),
+            true,
+        )
+    } else {
+        anyhow::bail!("HTTP/3 bootstrap requires tls_cert_fingerprint or server_public_key");
+    };
+
+    let (_endpoint, connection) = match connect_quic_client(
+        host,
+        port,
+        rustls_config,
+        b"h3",
+        config.socket_protect.as_ref(),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(err) if should_retry_tls_rotation(config) => {
+            let refreshed = refresh_tls_fingerprint_after_rotation(
+                host,
+                port,
+                config,
+                dial_override,
+                "HTTP/3 bootstrap",
+            )
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("missing refreshed fingerprint for rotated HTTP/3 cert")
+            })?;
+            connect_quic_client(
+                host,
+                port,
+                (*cert_proof::make_pinned_tls_config(&refreshed)).clone(),
+                b"h3",
+                config.socket_protect.as_ref(),
+            )
+            .await
+            .with_context(|| {
+                format!("HTTP/3 reconnect after cert rotation failed for {host}:{port}: {err}")
+            })?
+        }
+        Err(err) => return Err(err),
+    };
+
+    let presented_cert = if require_cert_proof {
+        Some(extract_quic_peer_certificate(&connection)?)
+    } else {
+        None
+    };
+
+    let h3_conn = h3_quinn::Connection::new(connection);
+    let (mut driver, mut send_request) = client::new(h3_conn)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to open HTTP/3 bootstrap connection: {e}"))?;
+    let driver_task = tokio::spawn(async move {
+        let _ = poll_fn(|cx| driver.poll_close(cx)).await;
+    });
+
+    if let Some(cert) = presented_cert {
+        let cert_proof_body = send_h3_json_request(
+            &mut send_request,
+            host,
+            "GET",
+            "/v1/bootstrap/cert-proof",
+            None,
+        )
+        .await?;
+        cert_proof::verify_cert_proof_response(
+            cert.as_ref(),
+            &config.client.server_public_key,
+            &cert_proof_body,
+        )?;
+    }
+
+    let result = send_h3_json_request(&mut send_request, host, method, path, body).await;
+    driver_task.abort();
+    result
 }
 
 async fn request_bootstrap_json_http(
@@ -940,6 +1264,8 @@ async fn request_bootstrap_json_https(
     path: &str,
     body: Option<&str>,
 ) -> anyhow::Result<String> {
+    let dial_override = (!config.client.server_resolved_address.trim().is_empty())
+        .then_some(config.client.server_resolved_address.as_str());
     let tls_config = if !config.client.tls_cert_fingerprint.is_empty() {
         cert_proof::make_pinned_tls_config(&config.client.tls_cert_fingerprint)
     } else if !config.client.server_public_key.is_empty() {
@@ -948,7 +1274,7 @@ async fn request_bootstrap_json_https(
             port,
             &config.client.server_public_key,
             config.socket_protect.as_ref(),
-            None,
+            dial_override,
         )
         .await?;
         cert_proof::make_pinned_tls_config(&fingerprint)
@@ -966,7 +1292,31 @@ async fn request_bootstrap_json_https(
             .map_err(|_| anyhow::anyhow!("invalid TLS server name: {host}"))?
     };
     let connector = TlsConnector::from(tls_config);
-    let mut tls = connector.connect(server_name, tcp).await?;
+    let mut tls = match connector.connect(server_name.clone(), tcp).await {
+        Ok(tls) => tls,
+        Err(err) if should_retry_tls_rotation(config) => {
+            let refreshed = refresh_tls_fingerprint_after_rotation(
+                host,
+                port,
+                config,
+                dial_override,
+                "HTTPS bootstrap",
+            )
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("missing refreshed fingerprint for rotated HTTPS cert")
+            })?;
+            let retry_tcp =
+                connect_bootstrap_tcp(host, port, config.socket_protect.as_ref()).await?;
+            let retry_connector =
+                TlsConnector::from(cert_proof::make_pinned_tls_config(&refreshed));
+            retry_connector
+                .connect(server_name, retry_tcp)
+                .await
+                .with_context(|| format!("HTTPS bootstrap reconnect after cert rotation failed for {host}:{port}: {err}"))?
+        }
+        Err(err) => return Err(err.into()),
+    };
 
     let request = build_http_request(method, host, path, body);
     tls.write_all(request.as_bytes()).await?;
@@ -1001,6 +1351,198 @@ async fn connect_bootstrap_tcp(
         }
     }
     Ok(socket.connect(address).await?)
+}
+
+async fn connect_websocket_tcp_socket(
+    server_addr: SocketAddr,
+    bind_ip: Option<IpAddr>,
+    socket_protect: Option<&bonded_core::config::SocketProtectFn>,
+) -> anyhow::Result<TcpStream> {
+    let socket = match bind_ip.unwrap_or_else(|| server_addr.ip()) {
+        IpAddr::V4(_) => TcpSocket::new_v4()?,
+        IpAddr::V6(_) => TcpSocket::new_v6()?,
+    };
+    match bind_ip {
+        Some(ip) => socket.bind(SocketAddr::new(ip, 0))?,
+        None => socket.bind(local_wildcard_bind_addr_for(server_addr))?,
+    }
+    #[cfg(unix)]
+    if let Some(protect) = socket_protect {
+        use std::os::unix::io::AsRawFd;
+        let fd = socket.as_raw_fd();
+        if !protect.0(fd) {
+            anyhow::bail!("failed to protect websocket socket from VPN capture (fd={fd})");
+        }
+    }
+
+    Ok(socket.connect(server_addr).await?)
+}
+
+fn local_wildcard_udp_bind_addr_for(remote: SocketAddr) -> SocketAddr {
+    match remote {
+        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+    }
+}
+
+fn bind_quic_udp_socket(
+    bind_addr: SocketAddr,
+    socket_protect: Option<&bonded_core::config::SocketProtectFn>,
+) -> anyhow::Result<StdUdpSocket> {
+    let socket = StdUdpSocket::bind(bind_addr)?;
+    #[cfg(unix)]
+    if let Some(protect) = socket_protect {
+        use std::os::unix::io::AsRawFd;
+        let fd = socket.as_raw_fd();
+        if !protect.0(fd) {
+            anyhow::bail!("failed to protect QUIC socket from VPN capture (fd={fd})");
+        }
+    }
+
+    Ok(socket)
+}
+
+pub(crate) async fn connect_quic_client(
+    host: &str,
+    port: u16,
+    rustls_config: RustlsClientConfig,
+    alpn: &[u8],
+    socket_protect: Option<&bonded_core::config::SocketProtectFn>,
+) -> anyhow::Result<(quinn::Endpoint, quinn::Connection)> {
+    let quic_client_config = build_quic_client_config(rustls_config, alpn)?;
+    let server_addr: SocketAddr = tokio::net::lookup_host(format!("{host}:{port}"))
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to resolve QUIC server {host}:{port}: {e}"))?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no addresses resolved for {host}:{port}"))?;
+
+    let mut endpoint = quinn::Endpoint::new(
+        Default::default(),
+        None,
+        bind_quic_udp_socket(
+            local_wildcard_udp_bind_addr_for(server_addr),
+            socket_protect,
+        )?,
+        Arc::new(quinn::TokioRuntime),
+    )
+    .map_err(|e| anyhow::anyhow!("failed to bind QUIC client endpoint: {e}"))?;
+    endpoint.set_default_client_config(quic_client_config);
+
+    debug!(peer = %server_addr, "connecting QUIC endpoint");
+    let connection = endpoint
+        .connect(server_addr, host)
+        .map_err(|e| anyhow::anyhow!("QUIC connect error: {e}"))?
+        .await
+        .map_err(|e| anyhow::anyhow!("QUIC connection failed: {e}"))?;
+    Ok((endpoint, connection))
+}
+
+fn should_retry_tls_rotation(config: &ClientConfig) -> bool {
+    !config.client.tls_cert_fingerprint.is_empty() && !config.client.server_public_key.is_empty()
+}
+
+async fn refresh_tls_fingerprint_after_rotation(
+    host: &str,
+    port: u16,
+    config: &ClientConfig,
+    dial_address: Option<&str>,
+    transport: &str,
+) -> anyhow::Result<Option<String>> {
+    if !should_retry_tls_rotation(config) {
+        return Ok(None);
+    }
+
+    warn!(
+        host,
+        port, transport, "TLS pin failed; retrying cert-proof bootstrap for rotated certificate"
+    );
+    let fingerprint = cert_proof::fetch_and_verify_cert_proof(
+        host,
+        port,
+        &config.client.server_public_key,
+        config.socket_protect.as_ref(),
+        dial_address,
+    )
+    .await
+    .with_context(|| format!("{transport} cert rotation re-proof failed for {host}:{port}"))?;
+    info!(fingerprint = %fingerprint, transport, "cert rotation re-proof succeeded");
+    Ok(Some(fingerprint))
+}
+
+fn build_quic_client_config(
+    mut rustls_config: RustlsClientConfig,
+    alpn: &[u8],
+) -> anyhow::Result<quinn::ClientConfig> {
+    rustls_config.alpn_protocols = vec![alpn.to_vec()];
+    Ok(quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(rustls_config)
+            .map_err(|e| anyhow::anyhow!("QUIC crypto config error: {e}"))?,
+    )))
+}
+
+pub(crate) fn extract_quic_peer_certificate(
+    connection: &quinn::Connection,
+) -> anyhow::Result<Vec<u8>> {
+    let certs = connection
+        .peer_identity()
+        .and_then(|identity| identity.downcast::<Vec<CertificateDer<'static>>>().ok())
+        .ok_or_else(|| anyhow::anyhow!("QUIC peer identity did not expose a certificate chain"))?;
+    certs
+        .first()
+        .map(|cert| cert.as_ref().to_vec())
+        .ok_or_else(|| anyhow::anyhow!("QUIC peer certificate chain was empty"))
+}
+
+async fn send_h3_json_request<T>(
+    send_request: &mut h3::client::SendRequest<T, RawBytes>,
+    host: &str,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> anyhow::Result<String>
+where
+    T: h3::quic::OpenStreams<RawBytes> + Clone,
+{
+    let request = Request::builder()
+        .method(method)
+        .uri(format!("https://{host}{path}"))
+        .header("content-type", "application/json")
+        .body(())
+        .map_err(|e| anyhow::anyhow!("failed to build HTTP/3 bootstrap request: {e}"))?;
+    let mut stream = send_request
+        .send_request(request)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to send HTTP/3 bootstrap request: {e}"))?;
+    if let Some(body) = body {
+        stream
+            .send_data(RawBytes::copy_from_slice(body.as_bytes()))
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to send HTTP/3 bootstrap request body: {e}"))?;
+    }
+    stream
+        .finish()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to finish HTTP/3 bootstrap request: {e}"))?;
+
+    let response = stream
+        .recv_response()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to receive HTTP/3 bootstrap response: {e}"))?;
+    let status = response.status();
+    let mut raw = Vec::new();
+    while let Some(mut chunk) = stream
+        .recv_data()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to read HTTP/3 bootstrap response body: {e}"))?
+    {
+        raw.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+    }
+    let body = String::from_utf8(raw)
+        .map_err(|_| anyhow::anyhow!("HTTP/3 bootstrap response contained non-UTF8 bytes"))?;
+    if status != http::StatusCode::OK {
+        anyhow::bail!("bootstrap request failed: {}; body={}", status, body);
+    }
+    Ok(body.trim().to_owned())
 }
 
 fn build_http_request(method: &str, host: &str, path: &str, body: Option<&str>) -> String {
@@ -1286,7 +1828,7 @@ async fn perform_websocket_auth_handshake(
     Ok(())
 }
 
-fn load_or_create_device_keypair(
+pub(crate) fn load_or_create_device_keypair(
     private_key_path: &Path,
     public_key_path: &Path,
 ) -> anyhow::Result<DeviceKeypair> {
@@ -1347,6 +1889,7 @@ fn build_tun_config(tun_name: &str) -> Configuration {
 async fn run_linux_packet_loop(
     tun_name: &str,
     transports: Vec<ClientTransport>,
+    mut peer_transport_rx: tokio::sync::mpsc::UnboundedReceiver<ClientTransport>,
 ) -> anyhow::Result<()> {
     let config = build_tun_config(tun_name);
     let device = tun::create_as_async(&config)?;
@@ -1377,6 +1920,13 @@ async fn run_linux_packet_loop(
                         }
                         info!(active_path = active_index, remaining_paths = transports.len(), "switched active path after send failure");
                     }
+                }
+            }
+            peer_transport = peer_transport_rx.recv() => {
+                if let Some(transport) = peer_transport {
+                    let kind = transport.kind();
+                    transports.push(transport);
+                    info!(kind = ?kind, total_paths = transports.len(), "added peer-share transport path");
                 }
             }
             frame_result = transports[active_index].recv() => {
@@ -1529,5 +2079,29 @@ mod tests {
         assert_eq!(cfg.client.invite_token, "token-abc");
         assert_eq!(cfg.client.server_public_key, "server-pub");
         assert_eq!(cfg.client.preferred_protocols, original_protocols);
+    }
+
+    #[test]
+    fn insecure_debug_transports_are_filtered_by_default() {
+        let mut cfg = ClientConfig::default();
+        cfg.client.preferred_protocols = vec!["naive_tcp".to_owned(), "wss".to_owned()];
+
+        assert_eq!(
+            super::sanitize_preferred_protocols(
+                &cfg.client.preferred_protocols,
+                cfg.client.allow_insecure_debug_transports,
+            ),
+            vec!["wss".to_owned()]
+        );
+    }
+
+    #[test]
+    fn insecure_debug_transports_require_explicit_opt_in() {
+        let protocols = vec!["naive_tcp".to_owned(), "wss".to_owned()];
+
+        assert_eq!(
+            super::sanitize_preferred_protocols(&protocols, true),
+            protocols
+        );
     }
 }

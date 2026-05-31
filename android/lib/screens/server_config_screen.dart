@@ -14,7 +14,10 @@ class ServerConfigScreen extends StatefulWidget {
 class _ServerConfigScreenState extends State<ServerConfigScreen> {
   late TextEditingController _serverAddressController;
   late TextEditingController _publicKeyController;
+  late TextEditingController _peerShareBindAddressController;
+  late TextEditingController _peerShareAdvertiseIpController;
   late List<String> _selectedProtocols;
+  late bool _peerShareEnabled;
   bool _isSaving = false;
 
   @override
@@ -24,15 +27,24 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
       text: widget.server.publicAddress,
     );
     _publicKeyController = TextEditingController(
-      text: widget.server.serverPublicKey,
+      text: widget.server.serverIdentityPublicKey,
+    );
+    _peerShareBindAddressController = TextEditingController(
+      text: widget.server.peerShareBindAddress,
+    );
+    _peerShareAdvertiseIpController = TextEditingController(
+      text: widget.server.peerShareAdvertiseIp,
     );
     _selectedProtocols = List.from(widget.server.supportedProtocols);
+    _peerShareEnabled = widget.server.peerShareEnabled;
   }
 
   @override
   void dispose() {
     _serverAddressController.dispose();
     _publicKeyController.dispose();
+    _peerShareBindAddressController.dispose();
+    _peerShareAdvertiseIpController.dispose();
     super.dispose();
   }
 
@@ -40,16 +52,19 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
     final updatedServer = PairedServer(
       id: widget.server.id,
       publicAddress: _serverAddressController.text.trim(),
-      serverPublicKey: _publicKeyController.text.trim(),
+      serverIdentityPublicKey: _publicKeyController.text.trim(),
       supportedProtocols: List<String>.from(_selectedProtocols),
+      peerShareEnabled: _peerShareEnabled,
+      peerShareBindAddress: _peerShareBindAddressController.text.trim(),
+      peerShareAdvertiseIp: _peerShareAdvertiseIpController.text.trim(),
       pairedAt: widget.server.pairedAt,
     );
 
     if (updatedServer.publicAddress.isEmpty ||
-        updatedServer.serverPublicKey.isEmpty) {
+        updatedServer.serverIdentityPublicKey.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('Server address and public key are required'),
+          content: Text('Server address and identity key are required'),
           backgroundColor: Colors.red,
         ),
       );
@@ -191,7 +206,7 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
             ),
             const SizedBox(height: 24),
             const Text(
-              'Server Public Key',
+              'Server Identity Key',
               style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 8),
@@ -199,7 +214,7 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
               controller: _publicKeyController,
               maxLines: 3,
               decoration: InputDecoration(
-                hintText: 'Server public key (base64)',
+                hintText: 'Trusted ed25519 identity key (base64)',
                 border: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(8),
                 ),
@@ -228,6 +243,57 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
                         ),
                       )
                       .toList(),
+            ),
+            const SizedBox(height: 24),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Enable Peer Sharing'),
+              subtitle: const Text(
+                'Advertise this device to nearby peers using the same Bonded server.',
+              ),
+              value: _peerShareEnabled,
+              onChanged:
+                  _isSaving
+                      ? null
+                      : (value) {
+                        setState(() {
+                          _peerShareEnabled = value;
+                        });
+                      },
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              'Peer Share Bind Address',
+              style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _peerShareBindAddressController,
+              decoration: InputDecoration(
+                hintText: '0.0.0.0:54443',
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                filled: true,
+                fillColor: Colors.grey[100],
+              ),
+            ),
+            const SizedBox(height: 24),
+            const Text(
+              'Peer Share Advertise IP',
+              style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _peerShareAdvertiseIpController,
+              decoration: InputDecoration(
+                hintText: 'Optional LAN IP override',
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                filled: true,
+                fillColor: Colors.grey[100],
+              ),
             ),
             const SizedBox(height: 32),
             const Text(

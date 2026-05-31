@@ -23,6 +23,9 @@ import org.json.JSONObject
 data class SessionSnapshot(
         val state: String,
         val serverAddress: String,
+    val activeTransport: String,
+    val transportCount: Int,
+    val peerRelayCount: Int,
         val outboundPackets: Long,
         val inboundPackets: Long,
         val outboundBytes: Long,
@@ -415,6 +418,9 @@ class BondedVpnService : VpnService() {
             SessionSnapshot(
                     state = json.optString("state", "unknown"),
                     serverAddress = json.optString("serverAddress", ""),
+                    activeTransport = json.optString("activeTransport", "Unknown"),
+                    transportCount = json.optInt("transportCount", 0),
+                    peerRelayCount = json.optInt("peerRelayCount", 0),
                     outboundPackets = json.optLong("outboundPackets", 0),
                     inboundPackets = json.optLong("inboundPackets", 0),
                     outboundBytes = json.optLong("outboundBytes", 0),
@@ -601,10 +607,13 @@ class BondedVpnService : VpnService() {
     private external fun nativeStartSession(
             serverAddress: String,
             resolvedServerAddress: String,
-            serverPublicKey: String,
+            serverIdentityPublicKey: String,
             protocolCsv: String,
             pathCount: Int,
             bindAddressesJson: String,
+            peerShareEnabled: Boolean,
+            peerShareBindAddress: String,
+            peerShareAdvertiseIp: String,
             storageDir: String,
     ): Boolean
 
@@ -733,12 +742,15 @@ class BondedVpnService : VpnService() {
             )
             val started =
                     nativeStartSession(
-                        server.publicAddress,
-                        resolvedServerAddr,
-                            server.serverPublicKey,
+                            server.publicAddress,
+                            resolvedServerAddr,
+                            server.serverIdentityPublicKey,
                             protocolCsv,
                             pathCount,
                             bindAddressesJson,
+                            server.peerShareEnabled,
+                            server.peerShareBindAddress,
+                            server.peerShareAdvertiseIp,
                             filesDir.absolutePath,
                     )
             android.util.Log.i("BondedVPN", "nativeStartSession returned: $started")
@@ -927,6 +939,9 @@ class BondedVpnService : VpnService() {
             return mapOf(
                     "state" to snapshot.state,
                     "serverAddress" to snapshot.serverAddress,
+                    "activeTransport" to snapshot.activeTransport,
+                    "transportCount" to snapshot.transportCount,
+                    "peerRelayCount" to snapshot.peerRelayCount,
                     "outboundPackets" to snapshot.outboundPackets,
                     "inboundPackets" to snapshot.inboundPackets,
                     "outboundBytes" to snapshot.outboundBytes,

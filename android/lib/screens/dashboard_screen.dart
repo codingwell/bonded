@@ -2,7 +2,9 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import '../models/pairing_model.dart';
 import '../services/background_service.dart';
+import '../services/pairing_service.dart';
 import '../utils/background_notification_helper.dart';
 
 class DashboardScreen extends StatefulWidget {
@@ -29,13 +31,37 @@ class _DashboardScreenState extends State<DashboardScreen> {
   int _outboundBytes = 0;
   int _inboundBytes = 0;
   int _connectedAtMs = 0;
+  int _transportCount = 0;
+  int _peerRelayCount = 0;
+  String _activeTransport = 'Unknown';
   String? _lastError;
+  PairedServer? _pairedServer;
 
   @override
   void initState() {
     super.initState();
+    _loadPairedServer();
     _refreshStatus();
     _listenToBackgroundEvents();
+  }
+
+  Future<void> _loadPairedServer() async {
+    try {
+      final pairedServers = await PairingService.getPairedServers();
+      final match = pairedServers
+          .map(PairedServer.fromJson)
+          .where((server) => server.id == widget.deviceId)
+          .cast<PairedServer?>()
+          .firstWhere((server) => server != null, orElse: () => null);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _pairedServer = match;
+      });
+    } catch (_) {
+      // Dashboard still works without paired-server metadata.
+    }
   }
 
   void _listenToBackgroundEvents() {
@@ -101,6 +127,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
           (sessionStatus?['inboundBytes'] as num?)?.toInt() ?? 0;
       final int connectedAtMs =
           (sessionStatus?['connectedAtMs'] as num?)?.toInt() ?? 0;
+        final int transportCount =
+          (sessionStatus?['transportCount'] as num?)?.toInt() ?? 0;
+        final int peerRelayCount =
+          (sessionStatus?['peerRelayCount'] as num?)?.toInt() ?? 0;
+        final String activeTransport =
+          sessionStatus?['activeTransport'] as String? ?? 'Unknown';
       final String? lastError = sessionStatus?['lastError'] as String?;
 
       if (mounted) {
@@ -116,6 +148,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
           _outboundBytes = outboundBytes;
           _inboundBytes = inboundBytes;
           _connectedAtMs = connectedAtMs;
+          _transportCount = transportCount;
+          _peerRelayCount = peerRelayCount;
+          _activeTransport = activeTransport;
           _lastError = lastError?.isNotEmpty == true ? lastError : null;
           _activePathCount = networkPathCount;
           _isBackgroundRunning = backgroundRunning;
@@ -226,11 +261,25 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     _ConnectionStatsCard(
                       server: _connectedServer,
                       activePaths: _activePathCount,
+                      activeTransport: _activeTransport,
+                      transportCount: _transportCount,
                       outboundBytes: _outboundBytes,
                       inboundBytes: _inboundBytes,
                       connectedAtMs: _connectedAtMs,
                       isConnected: isConnected,
                     ),
+                    if (_pairedServer != null) ...[
+                      const SizedBox(height: 12),
+                      _TrustStatusCard(
+                        server: _pairedServer!,
+                        activeTransport: _activeTransport,
+                      ),
+                      const SizedBox(height: 12),
+                      _PeerShareStatusCard(
+                        server: _pairedServer!,
+                        peerRelayCount: _peerRelayCount,
+                      ),
+                    ],
                     if (_lastError != null) ...[
                       const SizedBox(height: 12),
                       _ErrorBanner(message: _lastError!),
@@ -309,6 +358,8 @@ class _StatusIndicator extends StatelessWidget {
 class _ConnectionStatsCard extends StatelessWidget {
   final String server;
   final int activePaths;
+  final String activeTransport;
+  final int transportCount;
   final int outboundBytes;
   final int inboundBytes;
   final int connectedAtMs;
@@ -317,6 +368,8 @@ class _ConnectionStatsCard extends StatelessWidget {
   const _ConnectionStatsCard({
     required this.server,
     required this.activePaths,
+    required this.activeTransport,
+    required this.transportCount,
     required this.outboundBytes,
     required this.inboundBytes,
     required this.connectedAtMs,
@@ -359,6 +412,10 @@ class _ConnectionStatsCard extends StatelessWidget {
         children: [
           _Row('Server', server),
           const Divider(height: 16),
+          _Row('Active transport', activeTransport),
+          const Divider(height: 16),
+          _Row('Session transports', '$transportCount'),
+          const Divider(height: 16),
           _Row('Active paths', '$activePaths'),
           const Divider(height: 16),
           _Row('Uptime', _uptime()),
@@ -366,6 +423,95 @@ class _ConnectionStatsCard extends StatelessWidget {
           _Row('Sent', _fmtBytes(outboundBytes)),
           const Divider(height: 16),
           _Row('Received', _fmtBytes(inboundBytes)),
+        ],
+      ),
+    );
+  }
+}
+
+class _TrustStatusCard extends StatelessWidget {
+  final PairedServer server;
+  final String activeTransport;
+
+  const _TrustStatusCard({required this.server, required this.activeTransport});
+
+  String _shortKey(String value) {
+    if (value.length <= 20) {
+      return value;
+    }
+    return '${value.substring(0, 12)}...${value.substring(value.length - 8)}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.blueGrey[50],
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.blueGrey[100]!),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'Trust and Transport',
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(height: 12),
+          _Row('Trusted identity', _shortKey(server.serverIdentityPublicKey)),
+          const Divider(height: 16),
+          _Row(
+            'Advertised protocols',
+            server.supportedProtocols.isEmpty
+                ? 'Auto'
+                : server.supportedProtocols.join(', '),
+          ),
+          const Divider(height: 16),
+          _Row('Current transport', activeTransport),
+        ],
+      ),
+    );
+  }
+}
+
+class _PeerShareStatusCard extends StatelessWidget {
+  final PairedServer server;
+  final int peerRelayCount;
+
+  const _PeerShareStatusCard({
+    required this.server,
+    required this.peerRelayCount,
+  });
+
+  String _displayValue(String value) => value.isEmpty ? 'Not set' : value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.teal[50],
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.teal[100]!),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'Peer Sharing',
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(height: 12),
+          _Row('Enabled', server.peerShareEnabled ? 'Yes' : 'No'),
+          const Divider(height: 16),
+          _Row('Bind address', _displayValue(server.peerShareBindAddress)),
+          const Divider(height: 16),
+          _Row('Advertise IP', _displayValue(server.peerShareAdvertiseIp)),
+          const Divider(height: 16),
+          _Row('Active peer relays', '$peerRelayCount'),
         ],
       ),
     );

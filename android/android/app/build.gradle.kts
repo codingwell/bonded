@@ -28,6 +28,7 @@ if (keystorePropertiesFile.exists()) {
 val workspaceRootDir = rootProject.projectDir.parentFile.parentFile
 val rustBuildScript = File(workspaceRootDir, "scripts/build-android-native.sh")
 val rustArm64Output = file("src/main/jniLibs/arm64-v8a/libbonded_ffi.so")
+val rustArmV7Output = file("src/main/jniLibs/armeabi-v7a/libbonded_ffi.so")
 val rustX64Output = file("src/main/jniLibs/x86_64/libbonded_ffi.so")
 
 val buildRustAndroidNative by tasks.registering(Exec::class) {
@@ -36,7 +37,7 @@ val buildRustAndroidNative by tasks.registering(Exec::class) {
     workingDir = workspaceRootDir
     commandLine("bash", rustBuildScript.absolutePath)
     inputs.file(rustBuildScript)
-    outputs.files(rustArm64Output, rustX64Output)
+    outputs.files(rustArm64Output, rustArmV7Output, rustX64Output)
     // Cargo tracks Rust incremental state; always run this task for release builds to avoid stale JNI artifacts.
     outputs.upToDateWhen { false }
 
@@ -47,7 +48,7 @@ val buildRustAndroidNative by tasks.registering(Exec::class) {
     }
 }
 
-tasks.matching { it.name == "bundleRelease" || it.name == "assembleRelease" }.configureEach {
+tasks.matching { it.name == "preBuild" || it.name == "bundleRelease" || it.name == "assembleRelease" || it.name == "bundleDebug" || it.name == "assembleDebug" }.configureEach {
     dependsOn(buildRustAndroidNative)
 }
 

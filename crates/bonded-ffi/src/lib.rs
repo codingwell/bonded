@@ -1,5 +1,7 @@
 #[cfg(any(target_os = "android", test))]
-use bonded_client::{establish_naive_tcp_session, establish_transport_paths, ClientTransport};
+use bonded_client::{
+    establish_naive_tcp_session, establish_transport_paths, peer_runtime, ClientTransport,
+};
 #[cfg(any(target_os = "android", test))]
 use bonded_core::config::ClientConfig;
 #[cfg(target_os = "android")]
@@ -247,6 +249,9 @@ struct AndroidSessionHandle {
 struct AndroidSessionSnapshot {
     state: String,
     server_address: String,
+    active_transport: String,
+    transport_count: u32,
+    peer_relay_count: u32,
     outbound_packets: u64,
     inbound_packets: u64,
     outbound_bytes: u64,
@@ -321,7 +326,9 @@ fn android_client_config(
     config.client.server_websocket_address = server_address.to_owned();
     config.client.server_resolved_address = resolved_server_address.to_owned();
     config.client.server_public_key = server_public_key.to_owned();
-    config.client.preferred_protocols = vec!["wss".to_owned(), "naive_tcp".to_owned()];
+    config.client.preferred_protocols =
+        vec!["wss".to_owned(), "h3".to_owned(), "wireguard".to_owned()];
+    config.client.allow_insecure_debug_transports = false;
     config.client.private_key_path = storage_root
         .join("bonded-device-key.pem")
         .display()
@@ -331,6 +338,16 @@ fn android_client_config(
         .display()
         .to_string();
     config
+}
+
+#[cfg(any(target_os = "android", test))]
+fn normalize_optional_string(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -370,9 +387,12 @@ fn snapshot_json(snapshot: &AndroidSessionSnapshot) -> String {
         .unwrap_or_else(|| "null".to_owned());
 
     format!(
-        "{{\"state\":\"{}\",\"serverAddress\":\"{}\",\"outboundPackets\":{},\"inboundPackets\":{},\"outboundBytes\":{},\"inboundBytes\":{},\"connectedAtMs\":{},\"lastError\":{}}}",
+        "{{\"state\":\"{}\",\"serverAddress\":\"{}\",\"activeTransport\":\"{}\",\"transportCount\":{},\"peerRelayCount\":{},\"outboundPackets\":{},\"inboundPackets\":{},\"outboundBytes\":{},\"inboundBytes\":{},\"connectedAtMs\":{},\"lastError\":{}}}",
         escape_json(&snapshot.state),
         escape_json(&snapshot.server_address),
+        escape_json(&snapshot.active_transport),
+        snapshot.transport_count,
+        snapshot.peer_relay_count,
         snapshot.outbound_packets,
         snapshot.inbound_packets,
         snapshot.outbound_bytes,
@@ -391,6 +411,39 @@ fn update_snapshot(
         .lock()
         .expect("android session snapshot lock poisoned");
     update(&mut guard);
+}
+
+#[cfg(any(target_os = "android", test))]
+fn client_transport_kind(transport: &ClientTransport) -> &'static str {
+    match transport {
+        ClientTransport::NaiveTcp(_) => "NaiveTCP",
+        ClientTransport::WebSocket(_) => "WebSocketTLS",
+        ClientTransport::Quic(_) => "QUIC",
+        ClientTransport::PeerRelay { .. } => "PeerRelay",
+        ClientTransport::WireGuard(_) => "WireGuard",
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+fn sync_transport_snapshot(
+    snapshot: &Arc<Mutex<AndroidSessionSnapshot>>,
+    transports: &[ClientTransport],
+    active_index: usize,
+) {
+    let active_transport = transports
+        .get(active_index)
+        .map(client_transport_kind)
+        .unwrap_or("Unknown")
+        .to_owned();
+    let peer_relay_count = transports
+        .iter()
+        .filter(|transport| matches!(transport, ClientTransport::PeerRelay { .. }))
+        .count() as u32;
+    update_snapshot(snapshot, |session_snapshot| {
+        session_snapshot.active_transport = active_transport;
+        session_snapshot.transport_count = transports.len() as u32;
+        session_snapshot.peer_relay_count = peer_relay_count;
+    });
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -439,6 +492,9 @@ fn start_android_session(
     protocol_csv: &str,
     path_count: usize,
     bind_addresses_json: &str,
+    peer_share_enabled: bool,
+    peer_share_bind_address: &str,
+    peer_share_advertise_ip: &str,
     storage_dir: &str,
 ) -> anyhow::Result<()> {
     alog_info!(
@@ -458,6 +514,9 @@ fn start_android_session(
     let snapshot = Arc::new(Mutex::new(AndroidSessionSnapshot {
         state: "connecting".to_owned(),
         server_address: server_address.to_owned(),
+        active_transport: "Connecting".to_owned(),
+        transport_count: 0,
+        peer_relay_count: 0,
         outbound_packets: 0,
         inbound_packets: 0,
         outbound_bytes: 0,
@@ -478,10 +537,20 @@ fn start_android_session(
     let protocols = parse_protocol_list(protocol_csv);
     let bind_addresses = parse_bind_address_list(bind_addresses_json);
     if !protocols.is_empty() {
+        config.client.allow_insecure_debug_transports = protocols
+            .iter()
+            .any(|protocol| protocol.eq_ignore_ascii_case("naive_tcp"));
         config.client.preferred_protocols = protocols;
     }
     if !bind_addresses.is_empty() {
         config.client.path_bind_addresses = bind_addresses;
+    }
+    config.client.peer_share_enabled = peer_share_enabled;
+    if let Some(bind_address) = normalize_optional_string(peer_share_bind_address) {
+        config.client.peer_share_bind_address = bind_address;
+    }
+    if let Some(advertise_ip) = normalize_optional_string(peer_share_advertise_ip) {
+        config.client.peer_share_advertise_ip = advertise_ip;
     }
     // Wire in the socket protect callback so session sockets bypass the VPN.
     #[cfg(target_os = "android")]
@@ -518,18 +587,14 @@ fn start_android_session(
                 Ok(Ok(transports)) => {
                     alog_info!("Transport paths established: count={}", transports.len());
                     for (index, transport) in transports.iter().enumerate() {
-                        let kind = match transport {
-                            bonded_client::ClientTransport::NaiveTcp(_) => "NaiveTCP",
-                            bonded_client::ClientTransport::WebSocket(_) => "WebSocketTLS",
-                            bonded_client::ClientTransport::Quic(_) => "QUIC",
-                            bonded_client::ClientTransport::WireGuard(_) => "WireGuard",
-                        };
+                        let kind = client_transport_kind(transport);
                         alog_info!("  transport[{}] = {}", index, kind);
                     }
                     let now_ms = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
+                    sync_transport_snapshot(&worker_snapshot, &transports, 0);
                     update_snapshot(&worker_snapshot, |session_snapshot| {
                         session_snapshot.state = "connected".to_owned();
                         session_snapshot.connected_at_ms = now_ms;
@@ -558,6 +623,25 @@ fn start_android_session(
                     return;
                 }
             };
+            let (peer_transport_tx, mut peer_transport_rx) = tokio::sync::mpsc::unbounded_channel();
+            let _peer_transport_hold = peer_transport_tx.clone();
+            let _peer_share_runtime = if config.client.peer_share_enabled {
+                match peer_runtime::start_peer_share_runtime(&config, peer_transport_tx).await {
+                    Ok(runtime) => Some(runtime),
+                    Err(err) => {
+                        alog_error!("Failed to start peer-share runtime: {}", err);
+                        update_snapshot(&worker_snapshot, |session_snapshot| {
+                            session_snapshot.state = "error".to_owned();
+                            session_snapshot.last_error = Some(format!(
+                                "failed to start peer-share runtime: {err}"
+                            ));
+                        });
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
             let mut active_index = 0_usize;
             let mut session = SessionState::new(1);
             let mut ping_sequence = 0u64;
@@ -573,6 +657,18 @@ fn start_android_session(
                         alog_info!("Worker: cancellation requested");
                         close_client_transports(&mut transports).await;
                         break;
+                    }
+                    peer_transport = peer_transport_rx.recv() => {
+                        if let Some(transport) = peer_transport {
+                            let kind = client_transport_kind(&transport);
+                            transports.push(transport);
+                            sync_transport_snapshot(&worker_snapshot, &transports, active_index);
+                            alog_info!(
+                                "Worker: added peer-share transport kind={} total={}",
+                                kind,
+                                transports.len()
+                            );
+                        }
                     }
                     maybe_packet = outbound_rx.recv() => {
                         match maybe_packet {
@@ -600,6 +696,7 @@ fn start_android_session(
                                     if active_index >= transports.len() {
                                         active_index = 0;
                                     }
+                                    sync_transport_snapshot(&worker_snapshot, &transports, active_index);
                                     alog_warn!("Worker: failover from transport[{}] to transport[{}]", old_index, active_index);
                                     continue;
                                 }
@@ -730,6 +827,7 @@ fn start_android_session(
                                 if active_index >= transports.len() {
                                     active_index = 0;
                                 }
+                                sync_transport_snapshot(&worker_snapshot, &transports, active_index);
                                 alog_warn!("Worker: failover from recv error on transport[{}] to transport[{}]", old_index, active_index);
                             }
                         }
@@ -971,6 +1069,9 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeStartS
     protocol_csv: jni::objects::JString,
     path_count: jni::sys::jint,
     bind_addresses_json: jni::objects::JString,
+    peer_share_enabled: jni::sys::jboolean,
+    peer_share_bind_address: jni::objects::JString,
+    peer_share_advertise_ip: jni::objects::JString,
     storage_dir: jni::objects::JString,
 ) -> jni::sys::jboolean {
     // Store global ref to the service so protect_fd can call back into Java.
@@ -1000,6 +1101,14 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeStartS
         Ok(value) => value.into(),
         Err(_) => return 0,
     };
+    let peer_share_bind_address: String = match env.get_string(&peer_share_bind_address) {
+        Ok(value) => value.into(),
+        Err(_) => return 0,
+    };
+    let peer_share_advertise_ip: String = match env.get_string(&peer_share_advertise_ip) {
+        Ok(value) => value.into(),
+        Err(_) => return 0,
+    };
     let storage_dir: String = match env.get_string(&storage_dir) {
         Ok(value) => value.into(),
         Err(_) => return 0,
@@ -1012,6 +1121,9 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeStartS
         &protocol_csv,
         path_count.max(1) as usize,
         &bind_addresses_json,
+        peer_share_enabled != 0,
+        &peer_share_bind_address,
+        &peer_share_advertise_ip,
         &storage_dir,
     )
     .is_ok()
@@ -1279,6 +1391,9 @@ mod tests {
             "naive_tcp",
             1,
             "[\"127.0.0.2\"]",
+            false,
+            "",
+            "",
             storage_dir.to_string_lossy().as_ref(),
         )
         .expect("android session should start");

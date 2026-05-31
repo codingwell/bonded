@@ -25,6 +25,7 @@ pnet_datalink = "0.35"
 qrcode = "0.14"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
@@ -40,4 +41,7 @@ tracing-subscriber = "0.3"
 tun = { version = "0.8.6", features = ["async"] }
 sha2 = "0.10"
 quinn = "0.11"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
 boringtun = "0.7"
+mdns-sd = "0.20"

@@ -28,9 +28,13 @@ class MainActivity : FlutterActivity() {
         private const val EXTRA_SERVER_ADDRESS = "server_address"
         private const val EXTRA_BOOTSTRAP_SERVER_ADDRESS = "bootstrap_server_address"
         private const val EXTRA_SERVER_PUBLIC_KEY = "server_public_key"
+        private const val EXTRA_SERVER_IDENTITY_PUBLIC_KEY = "server_identity_public_key"
         private const val EXTRA_INVITE_TOKEN = "invite_token"
         private const val EXTRA_DEVICE_ID = "device_id"
         private const val EXTRA_SUPPORTED_PROTOCOLS = "supported_protocols"
+        private const val EXTRA_PEER_SHARE_ENABLED = "peer_share_enabled"
+        private const val EXTRA_PEER_SHARE_BIND_ADDRESS = "peer_share_bind_address"
+        private const val EXTRA_PEER_SHARE_ADVERTISE_IP = "peer_share_advertise_ip"
         private var nativeLoaded = false
 
         init {
@@ -46,7 +50,7 @@ class MainActivity : FlutterActivity() {
     private external fun nativeApiVersion(): Int
     private external fun nativeRedeemInviteToken(
             serverAddress: String,
-            serverPublicKey: String,
+            serverIdentityPublicKey: String,
             inviteToken: String,
             storageDir: String,
     ): Boolean
@@ -75,8 +79,11 @@ class MainActivity : FlutterActivity() {
                         ?.trim()
                         ?.takeIf { it.isNotEmpty() }
                         ?: serverAddress
-                val serverPublicKey =
-                        intent.getStringExtra(EXTRA_SERVER_PUBLIC_KEY)?.trim().orEmpty()
+                val serverIdentityPublicKey =
+                    intent.getStringExtra(EXTRA_SERVER_IDENTITY_PUBLIC_KEY)
+                        ?.trim()
+                        ?.takeIf { it.isNotEmpty() }
+                        ?: intent.getStringExtra(EXTRA_SERVER_PUBLIC_KEY)?.trim().orEmpty()
                 val inviteToken = intent.getStringExtra(EXTRA_INVITE_TOKEN)?.trim().orEmpty()
                 val deviceId =
                         intent.getStringExtra(EXTRA_DEVICE_ID)?.trim()?.takeIf { it.isNotEmpty() }
@@ -87,8 +94,13 @@ class MainActivity : FlutterActivity() {
                                 ?.map(String::trim)
                                 ?.filter(String::isNotEmpty)
                                 ?: emptyList()
+                val peerShareEnabled = intent.getBooleanExtra(EXTRA_PEER_SHARE_ENABLED, false)
+                val peerShareBindAddress =
+                    intent.getStringExtra(EXTRA_PEER_SHARE_BIND_ADDRESS)?.trim().orEmpty()
+                val peerShareAdvertiseIp =
+                    intent.getStringExtra(EXTRA_PEER_SHARE_ADVERTISE_IP)?.trim().orEmpty()
 
-                if (serverAddress.isEmpty() || serverPublicKey.isEmpty() || inviteToken.isEmpty()) {
+                if (serverAddress.isEmpty() || serverIdentityPublicKey.isEmpty() || inviteToken.isEmpty()) {
                     android.util.Log.e(
                             "BondedMain",
                             "ADB pair failed: server_address, server_public_key, and invite_token are required",
@@ -98,7 +110,7 @@ class MainActivity : FlutterActivity() {
                 }
 
                 val redeemed =
-                        redeemInviteTokenNative(serverAddress, serverPublicKey, inviteToken)
+                    redeemInviteTokenNative(serverAddress, serverIdentityPublicKey, inviteToken)
                 if (!redeemed.first) {
                     android.util.Log.e(
                             "BondedMain",
@@ -111,12 +123,15 @@ class MainActivity : FlutterActivity() {
         savePairedServer(
             deviceId,
             bootstrapServerAddress,
-            serverPublicKey,
+            serverIdentityPublicKey,
             supportedProtocols,
+            peerShareEnabled,
+            peerShareBindAddress,
+            peerShareAdvertiseIp,
         )
                 android.util.Log.i(
                         "BondedMain",
-            "ADB pair succeeded: deviceId=$deviceId redeemServer=$serverAddress bootstrapServer=$bootstrapServerAddress protocols=$supportedProtocols",
+            "ADB pair succeeded: deviceId=$deviceId redeemServer=$serverAddress bootstrapServer=$bootstrapServerAddress protocols=$supportedProtocols peerShareEnabled=$peerShareEnabled",
                 )
                 finish()
             }
@@ -129,7 +144,7 @@ class MainActivity : FlutterActivity() {
 
     private fun redeemInviteTokenNative(
             serverAddress: String,
-            serverPublicKey: String,
+                serverIdentityPublicKey: String,
             inviteToken: String,
     ): Pair<Boolean, String?> {
         android.util.Log.i(
@@ -142,7 +157,7 @@ class MainActivity : FlutterActivity() {
                 try {
                     nativeRedeemInviteToken(
                             serverAddress,
-                            serverPublicKey,
+                            serverIdentityPublicKey,
                             inviteToken,
                             filesDir.absolutePath,
                     )
@@ -180,16 +195,22 @@ class MainActivity : FlutterActivity() {
     private fun savePairedServer(
             deviceId: String,
             publicAddress: String,
-            serverPublicKey: String,
+            serverIdentityPublicKey: String,
             supportedProtocols: List<String>,
+            peerShareEnabled: Boolean = false,
+            peerShareBindAddress: String = "",
+            peerShareAdvertiseIp: String = "",
     ) {
         PairedServerStore.save(
                 this,
                 PairedServerRecord(
                         id = deviceId,
                         publicAddress = publicAddress,
-                        serverPublicKey = serverPublicKey,
+                    serverIdentityPublicKey = serverIdentityPublicKey,
                         supportedProtocols = supportedProtocols,
+                peerShareEnabled = peerShareEnabled,
+                peerShareBindAddress = peerShareBindAddress,
+                peerShareAdvertiseIp = peerShareAdvertiseIp,
                         pairedAt = Instant.now().toString(),
                 ),
         )
@@ -420,23 +441,25 @@ class MainActivity : FlutterActivity() {
                         "redeemInviteToken" -> {
                             val args = call.arguments as? Map<*, *>
                             val serverAddress = args?.get("serverAddress") as? String
-                            val serverPublicKey = args?.get("serverPublicKey") as? String
+                            val serverIdentityPublicKey =
+                                (args?.get("serverIdentityPublicKey") as? String)
+                                    ?: (args?.get("serverPublicKey") as? String)
                             val inviteToken = args?.get("inviteToken") as? String
 
                             if (serverAddress.isNullOrBlank() ||
-                                            serverPublicKey.isNullOrBlank() ||
+                                            serverIdentityPublicKey.isNullOrBlank() ||
                                             inviteToken.isNullOrBlank()
                             ) {
                                 result.error(
                                         "invalid_args",
-                                        "serverAddress, serverPublicKey, and inviteToken are required",
+                                        "serverAddress, serverIdentityPublicKey, and inviteToken are required",
                                         null
                                 )
                             } else {
                                 val redeemed =
                                     redeemInviteTokenNative(
                                         serverAddress,
-                                        serverPublicKey,
+                                        serverIdentityPublicKey,
                                         inviteToken,
                                     )
                                 if (!redeemed.first) {
@@ -458,28 +481,38 @@ class MainActivity : FlutterActivity() {
                             val args = call.arguments as? Map<*, *>
                             val deviceId = args?.get("deviceId") as? String
                             val publicAddress = args?.get("publicAddress") as? String
-                            val serverPublicKey = args?.get("serverPublicKey") as? String
+                            val serverIdentityPublicKey =
+                                (args?.get("serverIdentityPublicKey") as? String)
+                                    ?: (args?.get("serverPublicKey") as? String)
                             val supportedProtocols =
                                     (args?.get("supportedProtocols") as? List<*>)?.mapNotNull {
                                         it as? String
                                     }
                                             ?: emptyList()
+                                val peerShareEnabled = args?.get("peerShareEnabled") as? Boolean ?: false
+                                val peerShareBindAddress =
+                                    (args?.get("peerShareBindAddress") as? String)?.trim().orEmpty()
+                                val peerShareAdvertiseIp =
+                                    (args?.get("peerShareAdvertiseIp") as? String)?.trim().orEmpty()
 
                             if (deviceId.isNullOrBlank() ||
                                             publicAddress.isNullOrBlank() ||
-                                            serverPublicKey.isNullOrBlank()
+                                            serverIdentityPublicKey.isNullOrBlank()
                             ) {
                                 result.error(
                                         "invalid_args",
-                                        "deviceId, publicAddress, and serverPublicKey are required",
+                                        "deviceId, publicAddress, and serverIdentityPublicKey are required",
                                         null
                                 )
                             } else {
                                     savePairedServer(
                                         deviceId,
                                         publicAddress,
-                                        serverPublicKey,
+                                        serverIdentityPublicKey,
                                         supportedProtocols,
+                                        peerShareEnabled,
+                                        peerShareBindAddress,
+                                        peerShareAdvertiseIp,
                                     )
                                 result.success(null)
                             }
@@ -490,8 +523,12 @@ class MainActivity : FlutterActivity() {
                                         mapOf(
                                                 "id" to server.id,
                                                 "publicAddress" to server.publicAddress,
+                                            "serverIdentityPublicKey" to server.serverIdentityPublicKey,
                                                 "serverPublicKey" to server.serverPublicKey,
                                                 "supportedProtocols" to server.supportedProtocols,
+                                                "peerShareEnabled" to server.peerShareEnabled,
+                                                "peerShareBindAddress" to server.peerShareBindAddress,
+                                                "peerShareAdvertiseIp" to server.peerShareAdvertiseIp,
                                                 "pairedAt" to server.pairedAt,
                                         )
                                     }
@@ -501,22 +538,29 @@ class MainActivity : FlutterActivity() {
                             val args = call.arguments as? Map<*, *>
                             val deviceId = args?.get("deviceId") as? String
                             val publicAddress = args?.get("publicAddress") as? String
-                            val serverPublicKey = args?.get("serverPublicKey") as? String
+                            val serverIdentityPublicKey =
+                                (args?.get("serverIdentityPublicKey") as? String)
+                                    ?: (args?.get("serverPublicKey") as? String)
                             val supportedProtocols =
                                     (args?.get("supportedProtocols") as? List<*>)?.mapNotNull {
                                         it as? String
                                     }
                                             ?: emptyList()
+                                val peerShareEnabled = args?.get("peerShareEnabled") as? Boolean ?: false
+                                val peerShareBindAddress =
+                                    (args?.get("peerShareBindAddress") as? String)?.trim().orEmpty()
+                                val peerShareAdvertiseIp =
+                                    (args?.get("peerShareAdvertiseIp") as? String)?.trim().orEmpty()
 
                             val existing = deviceId?.let { PairedServerStore.findById(this, it) }
                             if (deviceId.isNullOrBlank() ||
                                             publicAddress.isNullOrBlank() ||
-                                            serverPublicKey.isNullOrBlank() ||
+                                            serverIdentityPublicKey.isNullOrBlank() ||
                                             existing == null
                             ) {
                                 result.error(
                                         "invalid_args",
-                                        "existing deviceId, publicAddress, and serverPublicKey are required",
+                                        "existing deviceId, publicAddress, and serverIdentityPublicKey are required",
                                         null
                                 )
                             } else {
@@ -525,8 +569,11 @@ class MainActivity : FlutterActivity() {
                                         PairedServerRecord(
                                                 id = deviceId,
                                                 publicAddress = publicAddress,
-                                                serverPublicKey = serverPublicKey,
+                                            serverIdentityPublicKey = serverIdentityPublicKey,
                                                 supportedProtocols = supportedProtocols,
+                                            peerShareEnabled = peerShareEnabled,
+                                            peerShareBindAddress = peerShareBindAddress,
+                                            peerShareAdvertiseIp = peerShareAdvertiseIp,
                                                 pairedAt = existing.pairedAt,
                                         ),
                                 )

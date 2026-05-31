@@ -9,14 +9,14 @@ class PairingService {
   /// Returns the generated device ID on success.
   static Future<String> redeemInviteToken({
     required String serverAddress,
-    required String serverPublicKey,
+    required String serverIdentityPublicKey,
     required String inviteToken,
   }) async {
     try {
       final String deviceId =
           await _channel.invokeMethod<String>('redeemInviteToken', {
             'serverAddress': serverAddress,
-            'serverPublicKey': serverPublicKey,
+            'serverIdentityPublicKey': serverIdentityPublicKey,
             'inviteToken': inviteToken,
           }) ??
           '';
@@ -30,15 +30,21 @@ class PairingService {
   static Future<void> storePairedServer({
     required String deviceId,
     required String publicAddress,
-    required String serverPublicKey,
+    required String serverIdentityPublicKey,
     List<String> supportedProtocols = const [],
+    bool peerShareEnabled = false,
+    String peerShareBindAddress = '',
+    String peerShareAdvertiseIp = '',
   }) async {
     try {
       await _channel.invokeMethod<void>('storePairedServer', {
         'deviceId': deviceId,
         'publicAddress': publicAddress,
-        'serverPublicKey': serverPublicKey,
+        'serverIdentityPublicKey': serverIdentityPublicKey,
         'supportedProtocols': supportedProtocols,
+        'peerShareEnabled': peerShareEnabled,
+        'peerShareBindAddress': peerShareBindAddress,
+        'peerShareAdvertiseIp': peerShareAdvertiseIp,
       });
     } on PlatformException catch (e) {
       throw PairingException('Failed to store paired server: ${e.message}');
@@ -63,8 +69,11 @@ class PairingService {
       await _channel.invokeMethod<void>('updatePairedServer', {
         'deviceId': server.id,
         'publicAddress': server.publicAddress,
-        'serverPublicKey': server.serverPublicKey,
+        'serverIdentityPublicKey': server.serverIdentityPublicKey,
         'supportedProtocols': server.supportedProtocols,
+        'peerShareEnabled': server.peerShareEnabled,
+        'peerShareBindAddress': server.peerShareBindAddress,
+        'peerShareAdvertiseIp': server.peerShareAdvertiseIp,
       });
     } on PlatformException catch (e) {
       throw PairingException('Failed to update paired server: ${e.message}');

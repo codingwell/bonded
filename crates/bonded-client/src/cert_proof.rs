@@ -25,9 +25,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use bonded_core::config::SocketProtectFn;
-use rustls::client::danger::{
-    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
-};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, Error as TlsError, SignatureScheme};
 use sha2::{Digest, Sha256};
@@ -67,14 +65,7 @@ pub async fn fetch_and_verify_cert_proof(
 
     // Build a TLS config that skips normal cert validation but captures the
     // leaf cert bytes.
-    let verifier = Arc::new(CapturingVerifier {
-        captured: captured_cert.clone(),
-    });
-    let client_config = ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth();
-    let connector = TlsConnector::from(Arc::new(client_config));
+    let connector = TlsConnector::from(make_insecure_capture_tls_config(captured_cert.clone()));
 
     // TCP connect — use a raw TcpSocket so we can protect the fd before
     // connecting on Android (avoids routing the cert-proof traffic through
@@ -115,8 +106,8 @@ pub async fn fetch_and_verify_cert_proof(
 
     let mut raw = Vec::new();
     tls.read_to_end(&mut raw).await?;
-    let response =
-        std::str::from_utf8(&raw).map_err(|_| anyhow::anyhow!("non-UTF8 in cert-proof response"))?;
+    let response = std::str::from_utf8(&raw)
+        .map_err(|_| anyhow::anyhow!("non-UTF8 in cert-proof response"))?;
 
     // Extract JSON body (everything after the blank line that ends the headers)
     let body = response
@@ -127,12 +118,36 @@ pub async fn fetch_and_verify_cert_proof(
     // Parse status line
     let status_line = response.lines().next().unwrap_or("");
     if !status_line.contains("200") {
-        anyhow::bail!(
-            "cert-proof endpoint returned non-200 status: {status_line} (body: {body})"
-        );
+        anyhow::bail!("cert-proof endpoint returned non-200 status: {status_line} (body: {body})");
     }
 
-    let parsed: serde_json::Value = serde_json::from_str(body.trim())
+    let captured = captured_cert.lock().unwrap().clone().ok_or_else(|| {
+        anyhow::anyhow!("no server certificate was captured during TLS handshake")
+    })?;
+
+    verify_cert_proof_response(&captured, server_public_key_b64, body.trim())
+}
+
+pub fn make_insecure_capture_tls_config(
+    captured_cert: Arc<Mutex<Option<Vec<u8>>>>,
+) -> Arc<ClientConfig> {
+    let verifier = Arc::new(CapturingVerifier {
+        captured: captured_cert,
+    });
+    Arc::new(
+        ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth(),
+    )
+}
+
+pub fn verify_cert_proof_response(
+    presented_cert_der: &[u8],
+    server_public_key_b64: &str,
+    response_body: &str,
+) -> anyhow::Result<String> {
+    let parsed: serde_json::Value = serde_json::from_str(response_body)
         .map_err(|e| anyhow::anyhow!("invalid JSON in cert-proof response: {e}"))?;
 
     let fingerprint = parsed["cert_fingerprint"]
@@ -142,29 +157,13 @@ pub async fn fetch_and_verify_cert_proof(
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("cert-proof response missing 'ed25519_signature'"))?;
 
-    // Verify ed25519 signature over the fingerprint string using the
-    // server identity key (already trusted from QR scan).
-    bonded_core::auth::verify_signature(
-        server_public_key_b64,
-        fingerprint.as_bytes(),
-        signature,
-    )
-    .map_err(|e| anyhow::anyhow!("cert-proof signature verification failed: {e}"))?;
+    bonded_core::auth::verify_signature(server_public_key_b64, fingerprint.as_bytes(), signature)
+        .map_err(|e| anyhow::anyhow!("cert-proof signature verification failed: {e}"))?;
 
-    // Verify that the cert we received matches the signed fingerprint.
-    // This detects a transparent relay / MITM that forwarded the cert-proof
-    // response without injecting its own cert.
-    let captured = captured_cert
-        .lock()
-        .unwrap()
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("no server certificate was captured during TLS handshake"))?;
-
-    let computed = compute_fingerprint(&captured);
+    let computed = compute_fingerprint(presented_cert_der);
     if computed != fingerprint {
         anyhow::bail!(
-            "cert-proof fingerprint mismatch: server presented cert with fingerprint {computed} \
-             but cert-proof response claimed {fingerprint}. This may indicate an active MITM."
+            "cert-proof fingerprint mismatch: server presented cert with fingerprint {computed} but cert-proof response claimed {fingerprint}. This may indicate an active MITM."
         );
     }
 

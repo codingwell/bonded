@@ -2,18 +2,23 @@
 //!
 //! When a client calls `POST /v1/bootstrap/wireguard/peer` it registers its
 //! WireGuard public key and receives an assigned `/32` IP from the
-//! `100.64.1.0/24` block.  The registry is in-memory only; peers that do not
-//! reconnect after a server restart will need to re-register.
+//! `100.64.1.0/24` block. Peer assignments are persisted to disk, refreshed on
+//! re-provisioning, and reclaimed after lease expiry so restart-safe WireGuard
+//! bootstrap does not leak addresses forever.
 //!
 //! The actual WireGuard handshake is handled by boringtun in a separate
 //! server-side endpoint (Phase 6.3+).
 
 use std::collections::{HashMap, VecDeque};
+use std::fs;
 use std::net::Ipv4Addr;
 use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
+use bonded_core::config::DEFAULT_WIREGUARD_PEER_LEASE_SECS;
 use base64::Engine as _;
 use bonded_core::session::{SessionFrame, SessionHeader, FLAG_PING, FLAG_PONG};
 use bonded_core::transport::WireGuardKeypair;
@@ -39,7 +44,7 @@ const IPV4_HDR_LEN: usize = 20;
 const MAX_RESPONSE_DRAIN_PER_CYCLE: usize = 256;
 
 /// Holds the per-peer allocation: the WireGuard public key and the assigned IP.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 pub struct WireGuardPeer {
     /// The client device's ed25519 public key (base64), used as the stable
     /// identifier across reconnections.
@@ -48,6 +53,16 @@ pub struct WireGuardPeer {
     pub wg_public_key: String,
     /// Allocated /32 IP from the bonded WireGuard subnet.
     pub peer_ip: Ipv4Addr,
+    /// UNIX timestamp (seconds) when this peer allocation expires unless it is
+    /// refreshed by another bootstrap provisioning call.
+    #[serde(default)]
+    pub lease_expires_at: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegisteredWireGuardPeer {
+    pub peer_ip: String,
+    pub lease_expires_at: u64,
 }
 
 /// Thread-safe registry of WireGuard peers with CIDR allocation.
@@ -55,16 +70,50 @@ pub struct WireGuardPeerRegistry {
     peers: Mutex<HashMap<String, WireGuardPeer>>,
     /// Next host octet to allocate from 100.64.1.x/24.
     next_octet: Mutex<u8>,
+    peer_lease: Duration,
+    path: Option<PathBuf>,
+}
+
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
+struct WireGuardPeersFile {
+    #[serde(default)]
+    peers: Vec<WireGuardPeer>,
 }
 
 impl WireGuardPeerRegistry {
     /// Create a new registry.  IPs will be allocated from `100.64.1.1/32`
     /// upwards (skipping .0 and .255).
     pub fn new() -> Self {
+        Self::new_with_lease(Duration::from_secs(DEFAULT_WIREGUARD_PEER_LEASE_SECS))
+    }
+
+    pub fn new_with_lease(peer_lease: Duration) -> Self {
         Self {
             peers: Mutex::new(HashMap::new()),
             next_octet: Mutex::new(1),
+            peer_lease,
+            path: None,
         }
+    }
+
+    pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        Self::load_with_lease(path, Duration::from_secs(DEFAULT_WIREGUARD_PEER_LEASE_SECS))
+    }
+
+    pub fn load_with_lease(path: impl AsRef<Path>, peer_lease: Duration) -> anyhow::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let (peers, next_octet, normalized) = load_peers_file(&path, peer_lease)?;
+        let registry = Self {
+            peers: Mutex::new(peers),
+            next_octet: Mutex::new(next_octet),
+            peer_lease,
+            path: Some(path),
+        };
+        if normalized {
+            let peers = registry.peers.lock().expect("wg peer registry lock");
+            registry.persist_locked(&peers)?;
+        }
+        Ok(registry)
     }
 
     /// Register a peer and return its allocated `"a.b.c.d/32"` CIDR string.
@@ -72,26 +121,57 @@ impl WireGuardPeerRegistry {
     /// If the `device_public_key` was already registered, the existing
     /// allocation is returned unchanged (idempotent).
     pub fn register_peer(&self, device_public_key: &str, wg_public_key: &str) -> String {
+        self.register_peer_lease(device_public_key, wg_public_key)
+            .peer_ip
+    }
+
+    pub fn register_peer_lease(
+        &self,
+        device_public_key: &str,
+        wg_public_key: &str,
+    ) -> RegisteredWireGuardPeer {
         let mut peers = self.peers.lock().expect("wg peer registry lock");
-        if let Some(existing) = peers.get(device_public_key) {
-            return format!("{}/32", existing.peer_ip);
+        self.prune_expired_locked(&mut peers)
+            .expect("pruning expired WireGuard peers should succeed");
+        let lease_expires_at = unix_timestamp_after(self.peer_lease)
+            .expect("computing WireGuard peer lease expiry should succeed");
+        if let Some(existing) = peers.get_mut(device_public_key) {
+            let peer_ip = existing.peer_ip;
+            let old_wg_public_key = existing.wg_public_key.clone();
+            let changed = old_wg_public_key != wg_public_key;
+            if changed {
+                existing.wg_public_key = wg_public_key.to_owned();
+            }
+            let lease_changed = existing.lease_expires_at != lease_expires_at;
+            existing.lease_expires_at = lease_expires_at;
+            if changed || lease_changed {
+                info!(
+                    device_pk = %device_public_key,
+                    old_wg_pk = %old_wg_public_key,
+                    new_wg_pk = %wg_public_key,
+                    peer_ip = %peer_ip,
+                    lease_expires_at,
+                    "WireGuard peer key updated"
+                );
+                self.persist_locked(&peers)
+                    .expect("persisting updated WireGuard peer should succeed");
+            }
+            return RegisteredWireGuardPeer {
+                peer_ip: format!("{peer_ip}/32"),
+                lease_expires_at,
+            };
         }
 
-        let octet = {
+        let ip = {
             let mut n = self.next_octet.lock().expect("wg octet lock");
-            let allocated = *n;
-            *n = n.wrapping_add(1);
-            if *n == 255 {
-                *n = 1; // wrap around (simple policy; collisions avoided by idempotency)
-            }
-            allocated
+            allocate_peer_ip(&peers, &mut n).expect("WireGuard peer allocation should succeed")
         };
 
-        let ip = Ipv4Addr::new(100, 64, 1, octet);
         info!(
             device_pk = %device_public_key,
             wg_pk = %wg_public_key,
             peer_ip = %ip,
+            lease_expires_at,
             "WireGuard peer registered"
         );
         peers.insert(
@@ -100,31 +180,126 @@ impl WireGuardPeerRegistry {
                 device_public_key: device_public_key.to_owned(),
                 wg_public_key: wg_public_key.to_owned(),
                 peer_ip: ip,
+                lease_expires_at,
             },
         );
-        format!("{ip}/32")
+        self.persist_locked(&peers)
+            .expect("persisting WireGuard peer registration should succeed");
+        RegisteredWireGuardPeer {
+            peer_ip: format!("{ip}/32"),
+            lease_expires_at,
+        }
     }
 
     /// Look up a peer by its WireGuard public key (for use by the WG
     /// transport when deciding whether to accept an inbound handshake).
     pub fn find_by_wg_key(&self, wg_public_key: &str) -> Option<WireGuardPeer> {
-        self.peers
-            .lock()
-            .expect("wg peer registry lock")
-            .values()
-            .find(|p| p.wg_public_key == wg_public_key)
-            .cloned()
+        let mut peers = self.peers.lock().expect("wg peer registry lock");
+        self.prune_expired_locked(&mut peers)
+            .expect("pruning expired WireGuard peers should succeed");
+        peers.values().find(|p| p.wg_public_key == wg_public_key).cloned()
     }
 
     /// Return all registered peers (for kernel WG configuration helpers).
     pub fn all_peers(&self) -> Vec<WireGuardPeer> {
-        self.peers
-            .lock()
-            .expect("wg peer registry lock")
-            .values()
-            .cloned()
-            .collect()
+        let mut peers = self.peers.lock().expect("wg peer registry lock");
+        self.prune_expired_locked(&mut peers)
+            .expect("pruning expired WireGuard peers should succeed");
+        peers.values().cloned().collect()
     }
+
+    fn persist_locked(&self, peers: &HashMap<String, WireGuardPeer>) -> anyhow::Result<()> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        persist_peers_file(path, peers)
+    }
+
+    fn prune_expired_locked(&self, peers: &mut HashMap<String, WireGuardPeer>) -> anyhow::Result<()> {
+        let now = unix_timestamp_now()?;
+        let before = peers.len();
+        peers.retain(|_, peer| peer.lease_expires_at == 0 || peer.lease_expires_at > now);
+        if peers.len() != before {
+            self.persist_locked(peers)?;
+        }
+        Ok(())
+    }
+}
+
+fn load_peers_file(
+    path: &Path,
+    peer_lease: Duration,
+) -> anyhow::Result<(HashMap<String, WireGuardPeer>, u8, bool)> {
+    if !path.exists() {
+        return Ok((HashMap::new(), 1, false));
+    }
+
+    let raw = fs::read_to_string(path)?;
+    let parsed: WireGuardPeersFile = toml::from_str(&raw)?;
+    let now = unix_timestamp_now()?;
+    let default_lease_expires_at = unix_timestamp_after(peer_lease)?;
+    let mut peers = HashMap::new();
+    let mut normalized = false;
+    let mut max_octet = 0u8;
+    for mut peer in parsed.peers {
+        if peer.lease_expires_at == 0 {
+            peer.lease_expires_at = default_lease_expires_at;
+            normalized = true;
+        }
+        if peer.lease_expires_at <= now {
+            normalized = true;
+            continue;
+        }
+        max_octet = max_octet.max(peer.peer_ip.octets()[3]);
+        peers.insert(peer.device_public_key.clone(), peer);
+    }
+    Ok((peers, normalize_octet(max_octet.saturating_add(1)), normalized))
+}
+
+fn persist_peers_file(path: &Path, peers: &HashMap<String, WireGuardPeer>) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut peer_list: Vec<_> = peers.values().cloned().collect();
+    peer_list.sort_by(|left, right| left.device_public_key.cmp(&right.device_public_key));
+    let raw = toml::to_string_pretty(&WireGuardPeersFile { peers: peer_list })?;
+    fs::write(path, raw)?;
+    Ok(())
+}
+
+fn allocate_peer_ip(peers: &HashMap<String, WireGuardPeer>, next_octet: &mut u8) -> anyhow::Result<Ipv4Addr> {
+    let start = normalize_octet(*next_octet);
+    for offset in 0..254u16 {
+        let candidate = (((start as u16 - 1 + offset) % 254) + 1) as u8;
+        let in_use = peers
+            .values()
+            .any(|peer| peer.peer_ip.octets()[3] == candidate);
+        if !in_use {
+            *next_octet = normalize_octet(candidate.saturating_add(1));
+            return Ok(Ipv4Addr::new(100, 64, 1, candidate));
+        }
+    }
+
+    anyhow::bail!("WireGuard peer allocation exhausted for 100.64.1.0/24")
+}
+
+fn normalize_octet(octet: u8) -> u8 {
+    match octet {
+        0 | 255 => 1,
+        value => value.min(254),
+    }
+}
+
+fn unix_timestamp_now() -> anyhow::Result<u64> {
+    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
+}
+
+fn unix_timestamp_after(duration: Duration) -> anyhow::Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .saturating_add(duration)
+        .as_secs())
 }
 
 /// Build a `WireGuardKeypair` from a persisted 32-byte seed file at `path`, or
@@ -386,7 +561,16 @@ async fn ensure_peer_runtime(
     tunnel_pcap: Option<Arc<TunnelPcapLogger>>,
 ) -> anyhow::Result<Arc<WireGuardServerPeer>> {
     if let Some(existing) = runtimes.get(&peer.device_public_key) {
-        return Ok(existing.clone());
+        if sessions.contains_client(&peer.device_public_key) {
+            return Ok(existing.clone());
+        }
+
+        warn!(
+            public_key = %peer.device_public_key,
+            session_id = existing.session_id,
+            "discarding stale wireguard peer runtime with missing session registration"
+        );
+        runtimes.remove(&peer.device_public_key);
     }
 
     let handle = sessions.register_client(peer.device_public_key.clone());
@@ -415,10 +599,13 @@ async fn ensure_peer_runtime(
         Some(value)
     };
 
-    let (tun_tx, mut tun_rx) = mpsc::unbounded_channel::<SessionFrame>();
-    if let Some(bridge) = &tun_bridge {
+    let mut tun_rx = if let Some(bridge) = &tun_bridge {
+        let (tun_tx, tun_rx) = mpsc::unbounded_channel::<SessionFrame>();
         bridge.register_session(handle.session_id, tun_tx).await;
-    }
+        Some(tun_rx)
+    } else {
+        None
+    };
 
     let peer_context = Arc::new(WireGuardServerPeer {
         public_key: peer.device_public_key.clone(),
@@ -434,10 +621,13 @@ async fn ensure_peer_runtime(
     tokio::spawn(async move {
         loop {
             for _ in 0..MAX_RESPONSE_DRAIN_PER_CYCLE {
-                let maybe_tun_frame = match tun_rx.try_recv() {
-                    Ok(frame) => Some(frame),
-                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
-                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                let maybe_tun_frame = match tun_rx.as_mut() {
+                    Some(tun_rx) => match tun_rx.try_recv() {
+                        Ok(frame) => Some(frame),
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                    },
+                    None => None,
                 };
                 let Some(tun_frame) = maybe_tun_frame else {
                     break;
@@ -495,45 +685,76 @@ async fn ensure_peer_runtime(
                 }
             }
 
-            tokio::select! {
-                maybe_tun_frame = tun_rx.recv() => {
-                    let Some(tun_frame) = maybe_tun_frame else {
-                        cleanup_wireguard_peer(&peer_context_for_task, &forwarders_for_task, &sessions_for_task).await;
-                        return;
-                    };
+            if let Some(tun_rx) = tun_rx.as_mut() {
+                tokio::select! {
+                    maybe_tun_frame = tun_rx.recv() => {
+                        let Some(tun_frame) = maybe_tun_frame else {
+                            warn!(
+                                session_id = peer_context_for_task.session_id,
+                                public_key = %peer_context_for_task.public_key,
+                                "wireguard peer task ending because TUN return channel closed"
+                            );
+                            cleanup_wireguard_peer(&peer_context_for_task, &forwarders_for_task, &sessions_for_task).await;
+                            return;
+                        };
 
-                    maybe_log_tunnel_packet(&tunnel_pcap, &tun_frame.payload);
-                    if let Err(err) = peer_context_for_task.runtime.send_frame(tun_frame).await {
-                        warn!(
-                            session_id = peer_context_for_task.session_id,
-                            public_key = %peer_context_for_task.public_key,
-                            error = %err,
-                            "failed to send WireGuard TUN return packet"
-                        );
-                        cleanup_wireguard_peer(&peer_context_for_task, &forwarders_for_task, &sessions_for_task).await;
-                        return;
+                        maybe_log_tunnel_packet(&tunnel_pcap, &tun_frame.payload);
+                        if let Err(err) = peer_context_for_task.runtime.send_frame(tun_frame).await {
+                            warn!(
+                                session_id = peer_context_for_task.session_id,
+                                public_key = %peer_context_for_task.public_key,
+                                error = %err,
+                                "failed to send WireGuard TUN return packet"
+                            );
+                            cleanup_wireguard_peer(&peer_context_for_task, &forwarders_for_task, &sessions_for_task).await;
+                            return;
+                        }
+                    }
+                    maybe_forwarded_frame = forward_rx.recv() => {
+                        let Some(forwarded_frame) = maybe_forwarded_frame else {
+                            warn!(
+                                session_id = peer_context_for_task.session_id,
+                                public_key = %peer_context_for_task.public_key,
+                                "wireguard peer task ending because forward response queue closed"
+                            );
+                            cleanup_wireguard_peer(&peer_context_for_task, &forwarders_for_task, &sessions_for_task).await;
+                            return;
+                        };
+
+                        maybe_log_tunnel_packet(&tunnel_pcap, &forwarded_frame.payload);
+                        if let Err(err) = peer_context_for_task.runtime.send_frame(forwarded_frame).await {
+                            warn!(
+                                session_id = peer_context_for_task.session_id,
+                                public_key = %peer_context_for_task.public_key,
+                                error = %err,
+                                "failed to return forwarded WireGuard frame"
+                            );
+                            cleanup_wireguard_peer(&peer_context_for_task, &forwarders_for_task, &sessions_for_task).await;
+                            return;
+                        }
                     }
                 }
-                maybe_forwarded_frame = forward_rx.recv() => {
-                    if peer_context_for_task.tun_bridge.is_some() {
-                        continue;
-                    }
-                    let Some(forwarded_frame) = maybe_forwarded_frame else {
-                        cleanup_wireguard_peer(&peer_context_for_task, &forwarders_for_task, &sessions_for_task).await;
-                        return;
-                    };
+            } else {
+                let Some(forwarded_frame) = forward_rx.recv().await else {
+                    warn!(
+                        session_id = peer_context_for_task.session_id,
+                        public_key = %peer_context_for_task.public_key,
+                        "wireguard peer task ending because forward response queue closed"
+                    );
+                    cleanup_wireguard_peer(&peer_context_for_task, &forwarders_for_task, &sessions_for_task).await;
+                    return;
+                };
 
-                    maybe_log_tunnel_packet(&tunnel_pcap, &forwarded_frame.payload);
-                    if let Err(err) = peer_context_for_task.runtime.send_frame(forwarded_frame).await {
-                        warn!(
-                            session_id = peer_context_for_task.session_id,
-                            public_key = %peer_context_for_task.public_key,
-                            error = %err,
-                            "failed to return forwarded WireGuard frame"
-                        );
-                        cleanup_wireguard_peer(&peer_context_for_task, &forwarders_for_task, &sessions_for_task).await;
-                        return;
-                    }
+                maybe_log_tunnel_packet(&tunnel_pcap, &forwarded_frame.payload);
+                if let Err(err) = peer_context_for_task.runtime.send_frame(forwarded_frame).await {
+                    warn!(
+                        session_id = peer_context_for_task.session_id,
+                        public_key = %peer_context_for_task.public_key,
+                        error = %err,
+                        "failed to return forwarded WireGuard frame"
+                    );
+                    cleanup_wireguard_peer(&peer_context_for_task, &forwarders_for_task, &sessions_for_task).await;
+                    return;
                 }
             }
         }
@@ -611,6 +832,13 @@ async fn cleanup_wireguard_peer(
     forwarders: &ForwarderRegistry,
     sessions: &SessionRegistry,
 ) {
+    warn!(
+        session_id = peer.session_id,
+        public_key = %peer.public_key,
+        has_tun_bridge = peer.tun_bridge.is_some(),
+        has_forwarder = peer.forwarder.is_some(),
+        "cleaning up wireguard peer runtime"
+    );
     if let Some(bridge) = &peer.tun_bridge {
         bridge.unregister_session(peer.session_id).await;
     }
@@ -778,6 +1006,8 @@ mod tests {
             device_public_key: "device-under-test".to_owned(),
             wg_public_key: client_keypair.public_key_b64(),
             peer_ip: Ipv4Addr::new(100, 64, 1, 10),
+            lease_expires_at: unix_timestamp_after(Duration::from_secs(300))
+                .expect("lease expiry should compute"),
         };
         let server_runtime = Arc::new(
             WireGuardPeerRuntime::new(&peer, &server_keypair, 7, server_socket.clone())
@@ -1054,6 +1284,172 @@ mod tests {
         bootstrap_task.abort();
         let _ = fs::remove_file(&cfg.client.private_key_path);
         let _ = fs::remove_file(&cfg.client.public_key_path);
+    }
+
+    #[tokio::test]
+    async fn stale_runtime_is_recreated_after_session_cleanup() {
+        let mut runtimes = HashMap::new();
+        let peer = WireGuardPeer {
+            device_public_key: "stale-device".to_owned(),
+            wg_public_key: WireGuardKeypair::generate().public_key_b64(),
+            peer_ip: Ipv4Addr::new(100, 64, 1, 20),
+            lease_expires_at: unix_timestamp_after(Duration::from_secs(300))
+                .expect("lease expiry should compute"),
+        };
+        let keypair = Arc::new(WireGuardKeypair::generate());
+        let socket = Arc::new(
+            UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("udp socket should bind"),
+        );
+        let sessions = SessionRegistry::default();
+        let forwarders: ForwarderRegistry = Arc::new(RwLock::new(HashMap::new()));
+
+        let first = ensure_peer_runtime(
+            &mut runtimes,
+            &peer,
+            keypair.clone(),
+            socket.clone(),
+            sessions.clone(),
+            forwarders.clone(),
+            None,
+            None,
+        )
+        .await
+        .expect("first runtime should be created");
+        assert!(sessions.contains_client(&peer.device_public_key));
+
+        cleanup_wireguard_peer(&first, &forwarders, &sessions).await;
+        assert!(!sessions.contains_client(&peer.device_public_key));
+
+        let recreated = ensure_peer_runtime(
+            &mut runtimes,
+            &peer,
+            keypair,
+            socket,
+            sessions.clone(),
+            forwarders,
+            None,
+            None,
+        )
+        .await
+        .expect("stale runtime should be recreated");
+
+        assert!(sessions.contains_client(&peer.device_public_key));
+        assert_ne!(first.session_id, recreated.session_id);
+    }
+
+    #[tokio::test]
+    async fn peer_runtime_without_tun_bridge_stays_registered() {
+        let mut runtimes = HashMap::new();
+        let peer = WireGuardPeer {
+            device_public_key: "forwarder-device".to_owned(),
+            wg_public_key: WireGuardKeypair::generate().public_key_b64(),
+            peer_ip: Ipv4Addr::new(100, 64, 1, 21),
+            lease_expires_at: unix_timestamp_after(Duration::from_secs(300))
+                .expect("lease expiry should compute"),
+        };
+        let keypair = Arc::new(WireGuardKeypair::generate());
+        let socket = Arc::new(
+            UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("udp socket should bind"),
+        );
+        let sessions = SessionRegistry::default();
+        let forwarders: ForwarderRegistry = Arc::new(RwLock::new(HashMap::new()));
+
+        let runtime = ensure_peer_runtime(
+            &mut runtimes,
+            &peer,
+            keypair,
+            socket,
+            sessions.clone(),
+            forwarders,
+            None,
+            None,
+        )
+        .await
+        .expect("runtime should be created without tun bridge");
+
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(sessions.contains_client(&peer.device_public_key));
+        assert_eq!(runtime.session_id, 0);
+    }
+
+    #[test]
+    fn persisted_registry_keeps_same_ip_and_updates_wg_key() {
+        let path = temp_test_file("wg-peer-registry");
+        let registry = WireGuardPeerRegistry::load(&path)
+            .expect("registry should load from missing path");
+
+        let first_key = WireGuardKeypair::generate().public_key_b64();
+        let second_key = WireGuardKeypair::generate().public_key_b64();
+        let first_ip = registry.register_peer("persisted-device", &first_key);
+        let second_ip = registry.register_peer("persisted-device", &second_key);
+
+        assert_eq!(first_ip, second_ip);
+
+        let reloaded = WireGuardPeerRegistry::load(&path).expect("registry should reload");
+        let peer = reloaded
+            .find_by_wg_key(&second_key)
+            .expect("reloaded registry should contain rotated wg key");
+        assert_eq!(peer.device_public_key, "persisted-device");
+        assert_eq!(format!("{}/32", peer.peer_ip), first_ip);
+        assert!(reloaded.find_by_wg_key(&first_key).is_none());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn expired_peers_are_pruned_and_ips_can_be_reused() {
+        let path = temp_test_file("wg-peer-expiry");
+        fs::write(
+            &path,
+            r#"[[peers]]
+device_public_key = "expired-device"
+wg_public_key = "expired-wg"
+peer_ip = "100.64.1.7"
+lease_expires_at = 1
+"#,
+        )
+        .expect("expired peer state should write");
+
+        let registry = WireGuardPeerRegistry::load_with_lease(&path, Duration::from_secs(60))
+            .expect("registry should load and prune expired peers");
+        assert!(registry.all_peers().is_empty());
+
+        let assigned = registry.register_peer("fresh-device", &WireGuardKeypair::generate().public_key_b64());
+        assert_eq!(assigned, "100.64.1.1/32");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn persisted_legacy_peers_are_normalized_with_new_lease() {
+        let path = temp_test_file("wg-peer-legacy");
+        fs::write(
+            &path,
+            r#"[[peers]]
+device_public_key = "legacy-device"
+wg_public_key = "legacy-wg"
+peer_ip = "100.64.1.9"
+"#,
+        )
+        .expect("legacy peer state should write");
+
+        let registry = WireGuardPeerRegistry::load_with_lease(&path, Duration::from_secs(60))
+            .expect("registry should load legacy peer state");
+        let peer = registry
+            .all_peers()
+            .into_iter()
+            .next()
+            .expect("legacy peer should remain active");
+        assert!(peer.lease_expires_at > unix_timestamp_now().expect("current time should compute"));
+
+        let _ = fs::remove_file(path);
     }
 
     fn temp_test_file(name: &str) -> PathBuf {

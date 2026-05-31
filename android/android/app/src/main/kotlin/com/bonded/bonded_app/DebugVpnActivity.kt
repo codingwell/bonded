@@ -151,7 +151,7 @@ class DebugVpnActivity : Activity() {
             log("No paired servers stored")
         } else {
             servers.forEachIndexed { i, s ->
-                log("Paired server[$i]: id=${s.id} addr=${s.publicAddress} key=${s.serverPublicKey.take(20)}…")
+                log("Paired server[$i]: id=${s.id} addr=${s.publicAddress} identity=${s.serverIdentityPublicKey.take(20)}…")
             }
         }
 
@@ -163,6 +163,9 @@ class DebugVpnActivity : Activity() {
         log(buildString {
             append("state=${snapshot["state"]}")
             append("  server=${snapshot["serverAddress"]}")
+            append("  activeTransport=${snapshot["activeTransport"]}")
+            append("  transportCount=${snapshot["transportCount"]}")
+            append("  peerRelayCount=${snapshot["peerRelayCount"]}")
             append("  out=${snapshot["outboundPackets"]}/${snapshot["outboundBytes"]}B")
             append("  in=${snapshot["inboundPackets"]}/${snapshot["inboundBytes"]}B")
             val err = snapshot["lastError"]

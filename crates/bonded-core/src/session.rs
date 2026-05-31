@@ -8,6 +8,8 @@ const HEADER_LEN: usize = 16;
 pub const FLAG_PING: u32 = 0x0001;
 /// Frame flag: sent by server in reply to a ping.
 pub const FLAG_PONG: u32 = 0x0002;
+/// Frame flag: the payload contains a signed peer-relay registration control message.
+pub const FLAG_PEER_RELAY_REGISTRATION: u32 = 0x0004;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionHeader {

@@ -1,0 +1,485 @@
+use std::collections::HashSet;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Context;
+use bonded_core::auth::{create_auth_challenge, sign_bytes, DeviceKeypair};
+use bonded_core::config::SocketProtectFn;
+use bonded_core::peer_share::{
+    PeerShareAdvertisement, PeerShareIntroductionRequest, SignedPeerShareIntroduction,
+};
+use pnet_datalink::NetworkInterface;
+use rcgen::generate_simple_self_signed;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio::task::JoinHandle;
+use tokio::time::sleep;
+use tracing::{info, warn};
+
+use crate::cert_proof;
+use crate::peer_discovery::{PeerShareAdvertiser, PeerShareBrowser};
+use crate::peer_listener::{
+    accept_peer_relay, connect_peer_relay, register_peer_relay_upstream, relay_peer_frames,
+    AcceptedPeerRelay, PeerListenerIdentity,
+};
+use crate::{
+    bootstrap_scheme_candidates, enumerate_interfaces, establish_transport_paths,
+    load_or_create_device_keypair, request_bootstrap_json, ClientConfig, ClientTransport,
+};
+
+pub struct PeerShareRuntime {
+    tasks: Vec<JoinHandle<()>>,
+    _listener_endpoint: quinn::Endpoint,
+}
+
+const PEER_RUNTIME_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+impl Drop for PeerShareRuntime {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+pub async fn start_peer_share_runtime(
+    config: &ClientConfig,
+    peer_transport_tx: tokio::sync::mpsc::UnboundedSender<ClientTransport>,
+) -> anyhow::Result<PeerShareRuntime> {
+    let private_key_path = crate::expand_home_path(&config.client.private_key_path);
+    let public_key_path = crate::expand_home_path(&config.client.public_key_path);
+    let device_keypair = load_or_create_device_keypair(&private_key_path, &public_key_path)?;
+    let (listener_endpoint, listener_identity, advertisement) =
+        build_listener_runtime(config, &device_keypair)?;
+    let advertiser = PeerShareAdvertiser::start(&advertisement)?;
+    let browser = PeerShareBrowser::start()?;
+
+    info!(
+        endpoint = %advertisement.endpoint,
+        nonce = %listener_identity.instance_nonce,
+        "peer-share runtime started"
+    );
+
+    let accept_endpoint = listener_endpoint.clone();
+    let accept_config = config.clone();
+    let accept_server_key = config.client.server_public_key.clone();
+    let accept_identity = listener_identity.clone();
+    let accept_task = tokio::spawn(async move {
+        let _advertiser = advertiser;
+        while let Some(incoming) = accept_endpoint.accept().await {
+            let connection = match incoming.await {
+                Ok(connection) => connection,
+                Err(err) => {
+                    warn!(error = %err, "peer-share QUIC accept failed");
+                    continue;
+                }
+            };
+
+            let AcceptedPeerRelay {
+                transport: mut peer,
+                introduction,
+            } = match accept_peer_relay(&accept_server_key, &accept_identity, connection).await {
+                Ok(peer) => peer,
+                Err(err) => {
+                    warn!(error = %err, "peer-share introduction verification failed");
+                    continue;
+                }
+            };
+
+            let mut upstreams = match establish_peer_upstream_paths(&accept_config).await {
+                Ok(paths) => paths,
+                Err(err) => {
+                    warn!(error = %err, "failed to establish upstream path for peer relay");
+                    sleep(PEER_RUNTIME_RETRY_DELAY).await;
+                    continue;
+                }
+            };
+
+            if upstreams.is_empty() {
+                warn!("peer-share relay accept produced no upstream transport paths");
+                sleep(PEER_RUNTIME_RETRY_DELAY).await;
+                continue;
+            }
+
+            let mut upstream = upstreams.remove(0);
+            if let Err(err) = register_peer_relay_upstream(&mut upstream, introduction).await {
+                warn!(error = %err, "failed to register peer relay upstream session");
+                sleep(PEER_RUNTIME_RETRY_DELAY).await;
+                continue;
+            }
+            if let Err(err) = relay_peer_frames(&mut peer, &mut upstream).await {
+                warn!(error = %err, "peer relay loop terminated");
+            }
+        }
+    });
+
+    let browse_config = config.clone();
+    let browse_server_key = config.client.server_public_key.clone();
+    let browse_device_keypair = device_keypair.clone();
+    let browse_self_key = device_keypair.public_key_b64.clone();
+    let (closed_peer_tx, mut closed_peer_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let browse_task = tokio::spawn(async move {
+        let browser = browser;
+        let mut connected_peers = HashSet::new();
+        loop {
+            let advertisement = tokio::select! {
+                Some(peer_id) = closed_peer_rx.recv() => {
+                    connected_peers.remove(&peer_id);
+                    info!(peer = %peer_id, "peer-share path closed; allowing rediscovery");
+                    continue;
+                }
+                advertisement = browser.recv() => {
+                    match advertisement {
+                        Ok(advertisement) => advertisement,
+                        Err(err) => {
+                            warn!(error = %err, "peer-share browser stopped");
+                            break;
+                        }
+                    }
+                }
+            };
+
+            if !should_accept_discovered_peer(&advertisement, &browse_server_key, &browse_self_key) {
+                continue;
+            }
+
+            let peer_id = format!(
+                "{}:{}",
+                advertisement.device_public_key, advertisement.instance_nonce
+            );
+            if connected_peers.contains(&peer_id) {
+                continue;
+            }
+
+            let introduction = match request_peer_share_introduction(
+                &browse_config,
+                &browse_device_keypair,
+                &advertisement,
+            )
+            .await
+            {
+                Ok(introduction) => introduction,
+                Err(err) => {
+                    warn!(error = %err, peer = %peer_id, "peer-share introduction request failed");
+                    sleep(PEER_RUNTIME_RETRY_DELAY).await;
+                    continue;
+                }
+            };
+
+            let transport = match connect_peer_relay(
+                &browse_server_key,
+                &advertisement.device_public_key,
+                &introduction,
+                browse_config.socket_protect.as_ref(),
+            )
+            .await
+            {
+                Ok(transport) => transport,
+                Err(err) => {
+                    warn!(error = %err, peer = %peer_id, "peer-share relay dial failed");
+                    sleep(PEER_RUNTIME_RETRY_DELAY).await;
+                    continue;
+                }
+            };
+
+            if peer_transport_tx
+                .send(ClientTransport::peer_relay(transport, peer_id.clone(), closed_peer_tx.clone()))
+                .is_err()
+            {
+                break;
+            }
+            connected_peers.insert(peer_id);
+        }
+    });
+
+    Ok(PeerShareRuntime {
+        tasks: vec![accept_task, browse_task],
+        _listener_endpoint: listener_endpoint,
+    })
+}
+
+async fn establish_peer_upstream_paths(config: &ClientConfig) -> anyhow::Result<Vec<ClientTransport>> {
+    let mut peer_config = config.clone();
+    let filtered: Vec<String> = peer_config
+        .client
+        .preferred_protocols
+        .iter()
+        .filter(|protocol| {
+            protocol.eq_ignore_ascii_case("wss")
+                || protocol.eq_ignore_ascii_case("websocket_tls")
+                || protocol.eq_ignore_ascii_case("h3")
+                || protocol.eq_ignore_ascii_case("quic")
+        })
+        .cloned()
+        .collect();
+    peer_config.client.preferred_protocols = if filtered.is_empty() {
+        vec!["wss".to_owned(), "h3".to_owned()]
+    } else {
+        filtered
+    };
+    establish_transport_paths(&peer_config, 1).await
+}
+
+fn build_listener_runtime(
+    config: &ClientConfig,
+    device_keypair: &DeviceKeypair,
+) -> anyhow::Result<(quinn::Endpoint, PeerListenerIdentity, PeerShareAdvertisement)> {
+    let cert = generate_simple_self_signed(vec!["127.0.0.1".to_owned()])
+        .context("failed to generate peer-share listener certificate")?;
+    let cert_der = cert.cert.der().to_vec();
+    let key_der = cert.key_pair.serialize_der();
+    let fingerprint = cert_proof::compute_fingerprint(&cert_der);
+    let bind_addr: SocketAddr = config
+        .client
+        .peer_share_bind_address
+        .parse()
+        .with_context(|| {
+            format!(
+                "invalid peer_share_bind_address: {}",
+                config.client.peer_share_bind_address
+            )
+        })?;
+    let endpoint = quinn::Endpoint::new(
+        Default::default(),
+        Some(build_peer_server_config(cert_der, key_der)),
+        bind_peer_listener_socket(bind_addr, config.socket_protect.as_ref())?,
+        Arc::new(quinn::TokioRuntime),
+    )
+    .map_err(|err| anyhow::anyhow!("failed to bind peer-share listener on {bind_addr}: {err}"))?;
+    let listen_addr = endpoint.local_addr()?;
+    let advertise_ip = resolve_advertise_ip(config, &enumerate_interfaces(), listen_addr)?;
+    let endpoint_str = SocketAddr::new(advertise_ip, listen_addr.port()).to_string();
+    let instance_nonce = create_auth_challenge();
+    let listener_identity = PeerListenerIdentity {
+        provider_device_public_key: device_keypair.public_key_b64.clone(),
+        instance_nonce: instance_nonce.clone(),
+        listener_transport: "quic".to_owned(),
+        listener_cert_fingerprint: fingerprint.clone(),
+    };
+    let advertisement = PeerShareAdvertisement {
+        version: 1,
+        device_public_key: device_keypair.public_key_b64.clone(),
+        server_public_key: config.client.server_public_key.clone(),
+        instance_nonce,
+        endpoint: endpoint_str,
+        listener_cert_fingerprint: fingerprint,
+        capabilities: vec!["relay".to_owned(), "quic".to_owned()],
+    };
+    Ok((endpoint, listener_identity, advertisement))
+}
+
+fn bind_peer_listener_socket(
+    bind_addr: SocketAddr,
+    socket_protect: Option<&SocketProtectFn>,
+) -> anyhow::Result<std::net::UdpSocket> {
+    let socket = std::net::UdpSocket::bind(bind_addr)?;
+    #[cfg(unix)]
+    if let Some(protect) = socket_protect {
+        use std::os::unix::io::AsRawFd;
+        let fd = socket.as_raw_fd();
+        if !protect.0(fd) {
+            anyhow::bail!(
+                "failed to protect peer-share listener socket from VPN capture (fd={fd})"
+            );
+        }
+    }
+
+    Ok(socket)
+}
+
+async fn request_peer_share_introduction(
+    config: &ClientConfig,
+    consumer_keypair: &DeviceKeypair,
+    advertisement: &PeerShareAdvertisement,
+) -> anyhow::Result<SignedPeerShareIntroduction> {
+    let bootstrap_address = config.client.server_public_address.trim();
+    if bootstrap_address.is_empty() {
+        anyhow::bail!("server_public_address is required for peer-share introduction bootstrap");
+    }
+
+    let request = build_peer_introduction_request(consumer_keypair, advertisement)?;
+    let request_body = serde_json::to_string(&request)?;
+    let mut errors = Vec::new();
+    for scheme in bootstrap_scheme_candidates(config) {
+        let response = match request_bootstrap_json(
+            config,
+            scheme,
+            bootstrap_address,
+            "POST",
+            "/v1/bootstrap/peer-share/introduction",
+            Some(&request_body),
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(err) => {
+                errors.push(format!("scheme={scheme:?}: {err:#}"));
+                continue;
+            }
+        };
+        return serde_json::from_str(&response)
+            .map_err(|err| anyhow::anyhow!("invalid peer-share introduction JSON: {err}"));
+    }
+
+    anyhow::bail!(
+        "failed to request peer-share introduction via {}: {}",
+        bootstrap_address,
+        errors.join(" | ")
+    )
+}
+
+fn build_peer_introduction_request(
+    consumer_keypair: &DeviceKeypair,
+    advertisement: &PeerShareAdvertisement,
+) -> anyhow::Result<PeerShareIntroductionRequest> {
+    let listener_transport = advertised_listener_transport(advertisement)?;
+    let mut request = PeerShareIntroductionRequest {
+        consumer_device_public_key: consumer_keypair.public_key_b64.clone(),
+        provider_device_public_key: advertisement.device_public_key.clone(),
+        provider_instance_nonce: advertisement.instance_nonce.clone(),
+        provider_endpoint: advertisement.endpoint.clone(),
+        listener_transport,
+        listener_cert_fingerprint: advertisement.listener_cert_fingerprint.clone(),
+        consumer_signature: String::new(),
+    };
+    request.consumer_signature = sign_bytes(consumer_keypair, &request.signed_payload()?)?;
+    Ok(request)
+}
+
+fn advertised_listener_transport(advertisement: &PeerShareAdvertisement) -> anyhow::Result<String> {
+    if advertisement
+        .capabilities
+        .iter()
+        .any(|capability| capability.eq_ignore_ascii_case("quic"))
+    {
+        Ok("quic".to_owned())
+    } else {
+        anyhow::bail!("peer advertisement did not include a supported listener transport")
+    }
+}
+
+fn should_accept_discovered_peer(
+    advertisement: &PeerShareAdvertisement,
+    expected_server_public_key: &str,
+    self_public_key: &str,
+) -> bool {
+    advertisement.server_public_key == expected_server_public_key
+        && advertisement.device_public_key != self_public_key
+}
+
+fn resolve_advertise_ip(
+    config: &ClientConfig,
+    interfaces: &[NetworkInterface],
+    listen_addr: SocketAddr,
+) -> anyhow::Result<IpAddr> {
+    if !config.client.peer_share_advertise_ip.trim().is_empty() {
+        return config
+            .client
+            .peer_share_advertise_ip
+            .parse()
+            .with_context(|| {
+                format!(
+                    "invalid peer_share_advertise_ip: {}",
+                    config.client.peer_share_advertise_ip
+                )
+            });
+    }
+
+    match listen_addr.ip() {
+        IpAddr::V4(ip) if !ip.is_unspecified() => return Ok(IpAddr::V4(ip)),
+        IpAddr::V6(ip) if !ip.is_unspecified() => return Ok(IpAddr::V6(ip)),
+        _ => {}
+    }
+
+    interfaces
+        .iter()
+        .flat_map(|interface| interface.ips.iter())
+        .map(|network| network.ip())
+        .find(|ip| !ip.is_loopback() && !ip.is_unspecified())
+        .ok_or_else(|| anyhow::anyhow!("failed to determine a non-loopback peer-share advertise IP"))
+}
+
+fn build_peer_server_config(cert_der: Vec<u8>, key_der: Vec<u8>) -> quinn::ServerConfig {
+    let cert = CertificateDer::from(cert_der);
+    let key = PrivateKeyDer::try_from(key_der).expect("valid private key DER");
+    let mut tls_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .expect("server TLS config should build");
+    tls_config.alpn_protocols = vec![b"bonded-peer".to_vec()];
+
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
+            .expect("QUIC crypto config should build"),
+    ));
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_concurrent_bidi_streams(4u32.into());
+    server_config.transport_config(Arc::new(transport));
+    server_config
+}
+
+#[cfg(test)]
+mod tests {
+    use bonded_core::auth::verify_signature;
+
+    use super::{
+        build_peer_introduction_request, resolve_advertise_ip, should_accept_discovered_peer,
+    };
+    use bonded_core::auth::DeviceKeypair;
+    use bonded_core::config::ClientConfig;
+    use bonded_core::peer_share::PeerShareAdvertisement;
+    use pnet_datalink::NetworkInterface;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn discovered_peers_ignore_self_and_other_servers() {
+        let advertisement = PeerShareAdvertisement {
+            version: 1,
+            device_public_key: "peer-a".to_owned(),
+            server_public_key: "server-a".to_owned(),
+            instance_nonce: "nonce-1".to_owned(),
+            endpoint: "192.168.1.20:54443".to_owned(),
+            listener_cert_fingerprint: "sha256:abcd".to_owned(),
+            capabilities: vec!["relay".to_owned(), "quic".to_owned()],
+        };
+        assert!(should_accept_discovered_peer(&advertisement, "server-a", "self"));
+        assert!(!should_accept_discovered_peer(&advertisement, "server-b", "self"));
+        assert!(!should_accept_discovered_peer(&advertisement, "server-a", "peer-a"));
+    }
+
+    #[test]
+    fn introduction_request_is_signed_with_consumer_key() {
+        let consumer = DeviceKeypair::generate();
+        let advertisement = PeerShareAdvertisement {
+            version: 1,
+            device_public_key: "provider".to_owned(),
+            server_public_key: "server-a".to_owned(),
+            instance_nonce: "nonce-1".to_owned(),
+            endpoint: "192.168.1.20:54443".to_owned(),
+            listener_cert_fingerprint: "sha256:abcd".to_owned(),
+            capabilities: vec!["relay".to_owned(), "quic".to_owned()],
+        };
+
+        let request = build_peer_introduction_request(&consumer, &advertisement)
+            .expect("request should build");
+        verify_signature(
+            &consumer.public_key_b64,
+            &request.signed_payload().expect("request payload should serialize"),
+            &request.consumer_signature,
+        )
+        .expect("request signature should verify");
+    }
+
+    #[test]
+    fn advertise_ip_uses_explicit_override() {
+        let mut config = ClientConfig::default();
+        config.client.peer_share_advertise_ip = "127.0.0.1".to_owned();
+        let ip = resolve_advertise_ip(
+            &config,
+            &Vec::<NetworkInterface>::new(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 54443),
+        )
+        .expect("override should parse");
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+}

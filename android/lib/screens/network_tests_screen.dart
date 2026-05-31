@@ -4,6 +4,8 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../services/pairing_service.dart';
+
 class NetworkTestsScreen extends StatefulWidget {
   const NetworkTestsScreen({super.key});
 
@@ -34,14 +36,171 @@ class _NetworkTestsScreenState extends State<NetworkTestsScreen> {
   bool _running = false;
   bool _autoRefreshLogs = true;
   bool _loadingLogs = false;
+  bool _loadingPairedServer = false;
   List<String> _logs = const [];
+  Map<String, dynamic>? _firstPairedServer;
   Timer? _logRefreshTimer;
 
   @override
   void initState() {
     super.initState();
+    _loadFirstPairedServer();
     _refreshLogs();
     _setAutoRefresh(true);
+  }
+
+  Future<void> _loadFirstPairedServer() async {
+    setState(() {
+      _loadingPairedServer = true;
+    });
+    try {
+      final pairedServers = await PairingService.getPairedServers();
+      if (!mounted) return;
+      setState(() {
+        _firstPairedServer = pairedServers.isEmpty ? null : pairedServers.first;
+      });
+    } on PairingException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _lastResult = e.message;
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _loadingPairedServer = false;
+        });
+      }
+    }
+  }
+
+  ({String host, int port})? _parseAddress(String rawAddress) {
+    final trimmed = rawAddress.trim();
+    if (trimmed.isEmpty) {
+      return null;
+    }
+
+    final uri = Uri.tryParse('https://$trimmed');
+    if (uri == null || uri.host.isEmpty) {
+      return null;
+    }
+
+    return (host: uri.host, port: uri.hasPort ? uri.port : 443);
+  }
+
+  void _applyFirstPairedServer() {
+    final server = _firstPairedServer;
+    if (server == null) {
+      setState(() {
+        _lastResult = 'No paired server available to populate connection checks.';
+      });
+      return;
+    }
+
+    final parsed = _parseAddress((server['publicAddress'] ?? '').toString());
+    if (parsed == null) {
+      setState(() {
+        _lastResult = 'Could not parse paired server address.';
+      });
+      return;
+    }
+
+    _tcpHostController.text = parsed.host;
+    _tcpPortController.text = parsed.port.toString();
+    _httpUrlController.text = 'https://${server['publicAddress']}/';
+    _dnsHostController.text = parsed.host;
+    _dnsExpectedIpController.clear();
+
+    setState(() {
+      _lastResult =
+          'Loaded paired server ${server['publicAddress']} (${_protocolSummary(server)}).';
+    });
+  }
+
+  String _protocolSummary(Map<String, dynamic> server) {
+    final protocols = (server['supportedProtocols'] as List?)
+        ?.map((value) => value.toString())
+        .where((value) => value.isNotEmpty)
+        .toList();
+
+    if (protocols == null || protocols.isEmpty) {
+      return 'protocols unknown';
+    }
+
+    return protocols.join(', ');
+  }
+
+  Future<void> _sendTestAction(
+    String action, {
+    Map<String, dynamic>? extras,
+  }) async {
+    final payload = <String, dynamic>{'action': action, ...?extras};
+    await _channel.invokeMethod<String>('runNetworkTest', payload);
+    await Future<void>.delayed(const Duration(milliseconds: 350));
+  }
+
+  Future<void> _runPairedServerChecks() async {
+    final server = _firstPairedServer;
+    if (server == null) {
+      setState(() {
+        _lastResult = 'No paired server available for connection checks.';
+      });
+      return;
+    }
+
+    final publicAddress = (server['publicAddress'] ?? '').toString();
+    final parsed = _parseAddress(publicAddress);
+    if (parsed == null) {
+      setState(() {
+        _lastResult = 'Could not parse paired server address for connection checks.';
+      });
+      return;
+    }
+
+    setState(() {
+      _running = true;
+      _lastResult = 'Running paired server checks for $publicAddress...';
+    });
+
+    try {
+      _applyFirstPairedServer();
+
+      var checksQueued = 0;
+      await _sendTestAction('com.bonded.bonded_app.TEST_VPN_STATUS');
+      checksQueued += 1;
+
+      if (InternetAddress.tryParse(parsed.host) == null) {
+        await _sendTestAction(
+          'com.bonded.bonded_app.TEST_DNS',
+          extras: {'host': parsed.host, 'expected_ip': ''},
+        );
+        checksQueued += 1;
+      }
+
+      await _sendTestAction(
+        'com.bonded.bonded_app.TEST_TCP',
+        extras: {'host': parsed.host, 'port': parsed.port},
+      );
+      checksQueued += 1;
+
+      await _refreshLogs();
+      if (!mounted) return;
+      setState(() {
+        _lastResult =
+            'Queued $checksQueued paired-server checks for $publicAddress.';
+      });
+    } on PlatformException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _lastResult =
+            'Failed paired server checks: ${e.code} ${e.message ?? ''}';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _running = false;
+        });
+      }
+    }
   }
 
   void _setAutoRefresh(bool enabled) {
@@ -103,9 +262,7 @@ class _NetworkTestsScreenState extends State<NetworkTestsScreen> {
     });
 
     try {
-      final payload = <String, dynamic>{'action': action, ...?extras};
-      await _channel.invokeMethod<String>('runNetworkTest', payload);
-      await Future<void>.delayed(const Duration(milliseconds: 350));
+      await _sendTestAction(action, extras: extras);
       await _refreshLogs();
       if (!mounted) return;
       setState(() {
@@ -207,6 +364,63 @@ class _NetworkTestsScreenState extends State<NetworkTestsScreen> {
             child: Padding(
               padding: const EdgeInsets.all(12),
               child: Text(_lastResult),
+            ),
+          ),
+          const SizedBox(height: 12),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Paired Server Checks',
+                    style: Theme.of(context).textTheme.titleMedium,
+                  ),
+                  const SizedBox(height: 8),
+                  if (_loadingPairedServer)
+                    const Text('Loading paired server details...')
+                  else if (_firstPairedServer == null)
+                    const Text(
+                      'No paired server found. Pair a server first, then use these checks to probe the real Bonded endpoint.',
+                    )
+                  else ...[
+                    Text(
+                      'Server: ${_firstPairedServer!['publicAddress']}',
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      'Protocols: ${_protocolSummary(_firstPairedServer!)}',
+                    ),
+                    const SizedBox(height: 8),
+                    const Text(
+                      'This checklist runs VPN status, optional DNS, and TCP reachability against the first paired server. It intentionally avoids HTTPS bootstrap validation because local self-signed certs fail normal platform trust checks.',
+                    ),
+                    const SizedBox(height: 12),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        ElevatedButton.icon(
+                          onPressed: _running ? null : _runPairedServerChecks,
+                          icon: const Icon(Icons.playlist_add_check),
+                          label: const Text('Run Paired Server Checks'),
+                        ),
+                        OutlinedButton.icon(
+                          onPressed: _running ? null : _applyFirstPairedServer,
+                          icon: const Icon(Icons.download),
+                          label: const Text('Use First Paired Server'),
+                        ),
+                        OutlinedButton.icon(
+                          onPressed: _running ? null : _loadFirstPairedServer,
+                          icon: const Icon(Icons.refresh),
+                          label: const Text('Reload Paired Server'),
+                        ),
+                      ],
+                    ),
+                  ],
+                ],
+              ),
             ),
           ),
           const SizedBox(height: 12),

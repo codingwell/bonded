@@ -326,6 +326,7 @@ async fn localhost_server_and_rust_client_can_probe_public_dns_udp() {
         crate::run_server(
             &bind_for_server,
             &invite_for_server,
+            Arc::new(DeviceKeypair::generate()),
             store,
             crate::session_registry::SessionRegistry::default(),
             Arc::new(RwLock::new(HashMap::new())),
@@ -525,6 +526,7 @@ async fn localhost_server_and_rust_client_can_fetch_example_com_http_over_tcp_pa
         crate::run_server(
             &bind_for_server,
             &invite_for_server,
+            Arc::new(DeviceKeypair::generate()),
             store,
             crate::session_registry::SessionRegistry::default(),
             Arc::new(RwLock::new(HashMap::new())),
@@ -748,6 +750,7 @@ async fn localhost_server_and_rust_client_can_run_smtp_commands_over_tcp_packets
         crate::run_server(
             &bind_for_server,
             &invite_for_server,
+            Arc::new(DeviceKeypair::generate()),
             store,
             crate::session_registry::SessionRegistry::default(),
             Arc::new(RwLock::new(HashMap::new())),
@@ -1233,6 +1236,7 @@ async fn localhost_server_and_rust_client_can_relay_udp_echo() {
         crate::run_server(
             &bind_for_server,
             &invite_for_server,
+            Arc::new(DeviceKeypair::generate()),
             store,
             crate::session_registry::SessionRegistry::default(),
             Arc::new(RwLock::new(HashMap::new())),
@@ -1342,6 +1346,7 @@ async fn localhost_server_and_rust_client_can_relay_icmp_echo_to_localhost() {
         crate::run_server(
             &bind_for_server,
             &invite_for_server,
+            Arc::new(DeviceKeypair::generate()),
             store,
             crate::session_registry::SessionRegistry::default(),
             Arc::new(RwLock::new(HashMap::new())),
@@ -1639,6 +1644,7 @@ async fn localhost_server_and_rust_client_can_relay_tcp_as_ipv4_packets() {
         crate::run_server(
             &bind_for_server,
             &invite_for_server,
+            Arc::new(DeviceKeypair::generate()),
             store,
             crate::session_registry::SessionRegistry::default(),
             Arc::new(RwLock::new(HashMap::new())),

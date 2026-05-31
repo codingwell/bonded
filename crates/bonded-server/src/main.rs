@@ -9,6 +9,7 @@ mod health;
 mod invite_tokens;
 mod network_runtime;
 mod pairing_qr;
+mod peer_relay;
 mod quic;
 mod session_registry;
 mod smoltcp_forwarder;
@@ -57,6 +58,7 @@ use health::run_health_server;
 use invite_tokens::ensure_startup_invite;
 use network_runtime::NetworkRuntime;
 use pairing_qr::emit_pairing_qr;
+use peer_relay::resolve_session_binding;
 use rcgen;
 use session_registry::SessionRegistry;
 use smoltcp_forwarder::SmoltcpForwarder;
@@ -207,7 +209,15 @@ async fn main() -> anyhow::Result<()> {
             .as_deref()
             .unwrap_or("bonded-server-wg.key");
         let kp = wireguard::load_or_generate_wg_keypair(key_path)?;
-        let registry = Arc::new(wireguard::WireGuardPeerRegistry::new());
+        let peers_path = cfg
+            .server
+            .wireguard_peers_file
+            .clone()
+            .unwrap_or_else(|| bonded_core::config::DEFAULT_WIREGUARD_PEERS_PATH.to_owned());
+        let registry = Arc::new(wireguard::WireGuardPeerRegistry::load_with_lease(
+            &peers_path,
+            std::time::Duration::from_secs(cfg.server.wireguard_peer_lease_secs),
+        )?);
         (Some(kp), Some(registry))
     } else {
         (None, None)
@@ -262,6 +272,8 @@ async fn main() -> anyhow::Result<()> {
         wireguard_keypair: wg_keypair,
         wireguard_peers: wg_peer_registry,
         wireguard_public_addr: cfg.server.wireguard_public_addr(),
+        wireguard_peer_lease_secs: cfg.server.wireguard_peer_lease_secs,
+        authorized_keys: authorized_keys.clone(),
     });
     if let (Some(wireguard_bind), Some(wireguard_keypair), Some(wireguard_peers)) = (
         cfg.server.wireguard_bind.clone(),
@@ -290,6 +302,7 @@ async fn main() -> anyhow::Result<()> {
     }
     if tun_bridge.is_none() {
         let bootstrap_bind = https_bind.clone();
+        let websocket_bootstrap_ctx = bootstrap_ctx.clone();
         tokio::spawn(async move {
             if let Err(err) = bootstrap::run_bootstrap_websocket_server(
                 &bootstrap_bind,
@@ -299,7 +312,7 @@ async fn main() -> anyhow::Result<()> {
                 websocket_forwarders,
                 tls_slot.clone(),
                 websocket_tunnel_pcap,
-                bootstrap_ctx,
+                websocket_bootstrap_ctx,
             )
             .await
             {
@@ -315,6 +328,7 @@ async fn main() -> anyhow::Result<()> {
             let quic_keys = authorized_keys.clone();
             let quic_sessions = sessions.clone();
             let quic_forwarders = forwarders.clone();
+            let quic_bootstrap_ctx = bootstrap_ctx.clone();
             tokio::spawn(async move {
                 if let Err(err) = quic::run_quic_server(
                     &quic_bind,
@@ -324,6 +338,7 @@ async fn main() -> anyhow::Result<()> {
                     quic_keys,
                     quic_sessions,
                     quic_forwarders,
+                    quic_bootstrap_ctx,
                 )
                 .await
                 {
@@ -341,6 +356,7 @@ async fn main() -> anyhow::Result<()> {
             result = run_server(
                 &tcp_bind,
                 &cfg.server.invite_tokens_file,
+                server_identity,
                 authorized_keys,
                 sessions,
                 forwarders,
@@ -379,6 +395,9 @@ fn ensure_server_state_files(cfg: &ServerConfig) -> anyhow::Result<()> {
         "tokens = []\n",
         "invite tokens",
     )?;
+    if let Some(path) = cfg.server.wireguard_peers_file.as_deref() {
+        ensure_state_file(path, "peers = []\n", "wireguard peers")?;
+    }
 
     Ok(())
 }
@@ -527,6 +546,7 @@ fn load_private_key(path: &str) -> anyhow::Result<rustls::pki_types::PrivateKeyD
 async fn run_server(
     bind: &str,
     invite_tokens_file: &str,
+    server_identity: Arc<bonded_core::auth::DeviceKeypair>,
     authorized_keys: AuthorizedKeysStore,
     sessions: SessionRegistry,
     forwarders: ForwarderRegistry,
@@ -550,6 +570,7 @@ async fn run_server(
         let forwarders = forwarders.clone();
         let tun_bridge = tun_bridge.clone();
         let tunnel_pcap = tunnel_pcap.clone();
+        let server_identity = server_identity.clone();
         let invite_tokens_file = invite_tokens_file.to_owned();
         tokio::spawn(async move {
             match perform_auth_handshake(
@@ -560,16 +581,31 @@ async fn run_server(
             .await
             {
                 Ok((public_key, stream)) => {
-                    let handle = sessions.register_client(public_key.clone());
+                    let mut transport = NaiveTcpTransport::from_stream(stream);
+                    let binding = match resolve_session_binding(
+                        &mut transport,
+                        public_key.clone(),
+                        server_identity.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(binding) => binding,
+                        Err(err) => {
+                            warn!(peer = %peer, public_key = %public_key, error = %err, "failed to bind session after authentication");
+                            return;
+                        }
+                    };
+
+                    let handle = sessions.register_client(binding.client_public_key.clone());
                     info!(
                         peer = %peer,
-                        public_key = %public_key,
+                        public_key = %binding.client_public_key,
+                        authenticated_public_key = %public_key,
+                        relayed_via_provider = binding.relayed_via_provider,
                         session_id = handle.session_id,
                         active_sessions = sessions.active_sessions(),
                         "client authenticated"
                     );
-
-                    let mut transport = NaiveTcpTransport::from_stream(stream);
                     info!(
                         peer = %peer,
                         session_id = handle.session_id,
@@ -592,6 +628,7 @@ async fn run_server(
                     if let Some(bridge) = &tun_bridge {
                         bridge.register_session(handle.session_id, tun_tx).await;
                     }
+                    let mut pending_frame = binding.initial_frame;
                     loop {
                         // Drain queued response frames before blocking in select! so bursty
                         // server->client traffic is not throttled by select scheduling.
@@ -647,6 +684,57 @@ async fn run_server(
                                     break;
                                 }
                             }
+                        }
+
+                        if let Some(frame) = pending_frame.take() {
+                            maybe_log_tunnel_packet(&tunnel_pcap, &frame.payload);
+                            if frame.header.flags & FLAG_PING != 0 && frame.payload.is_empty() {
+                                info!(
+                                    peer = %peer,
+                                    session_id = handle.session_id,
+                                    sequence = frame.header.sequence,
+                                    "initial heartbeat ping received, sending pong"
+                                );
+                                let pong = SessionFrame {
+                                    header: SessionHeader {
+                                        connection_id: frame.header.connection_id,
+                                        sequence: frame.header.sequence,
+                                        flags: FLAG_PONG,
+                                    },
+                                    payload: frame.payload,
+                                };
+                                if let Err(err) = transport.send(pong).await {
+                                    warn!(
+                                        peer = %peer,
+                                        session_id = handle.session_id,
+                                        error = %err,
+                                        "failed to send initial heartbeat pong"
+                                    );
+                                    break;
+                                }
+                            } else {
+                                if frame.header.flags & FLAG_PING != 0 {
+                                    warn!(
+                                        peer = %peer,
+                                        session_id = handle.session_id,
+                                        sequence = frame.header.sequence,
+                                        flags = frame.header.flags,
+                                        payload_len = frame.payload.len(),
+                                        "initial frame has ping flag with payload; forwarding as data"
+                                    );
+                                }
+                                if let Some(bridge) = &tun_bridge {
+                                    if let Err(err) =
+                                        bridge.submit_client_frame(handle.session_id, frame)
+                                    {
+                                        warn!(peer = %peer, public_key = %binding.client_public_key, session_id = handle.session_id, error = %err, "failed to enqueue initial frame into TUN bridge");
+                                        break;
+                                    }
+                                } else if let Some(f) = &forwarder {
+                                    f.ingest_packet(frame);
+                                }
+                            }
+                            continue;
                         }
 
                         tokio::select! {
@@ -779,7 +867,7 @@ async fn run_server(
                             .expect("forwarder registry lock should not be poisoned")
                             .remove(&handle.session_id);
                     }
-                    sessions.unregister_client(&public_key);
+                    sessions.unregister_client(&binding.client_public_key);
                 }
                 Err(err) => {
                     warn!(peer = %peer, error = %err, "client authentication failed");
@@ -859,6 +947,14 @@ where
     }
     if let Some(v) = read_env("BONDED_WIREGUARD_KEY_FILE") {
         cfg.server.wireguard_key_file = Some(v);
+    }
+    if let Some(v) = read_env("BONDED_WIREGUARD_PEERS_FILE") {
+        cfg.server.wireguard_peers_file = Some(v);
+    }
+    if let Some(v) = read_env("BONDED_WIREGUARD_PEER_LEASE_SECS") {
+        if let Ok(value) = v.parse::<u64>() {
+            cfg.server.wireguard_peer_lease_secs = value;
+        }
     }
     if let Some(v) = read_env("BONDED_TCP_BIND") {
         cfg.server.tcp_bind = Some(v);
@@ -941,6 +1037,8 @@ mod tests {
             ("BONDED_TLS_KEY_FILE", "/etc/bonded/server.key"),
             ("BONDED_WIREGUARD_BIND", "0.0.0.0:51820"),
             ("BONDED_WIREGUARD_PUBLIC", "51820"),
+            ("BONDED_WIREGUARD_PEERS_FILE", "/tmp/wg-peers.toml"),
+            ("BONDED_WIREGUARD_PEER_LEASE_SECS", "3600"),
             ("BONDED_TCP_BIND", "0.0.0.0:8000"),
             ("BONDED_TCP_PUBLIC", "8000"),
             ("BONDED_STATUS_BIND", "127.0.0.1:9002"),
@@ -968,6 +1066,11 @@ mod tests {
         assert_eq!(cfg.server.tls_key_file, "/etc/bonded/server.key");
         assert_eq!(cfg.server.wireguard_bind, Some("0.0.0.0:51820".to_owned()));
         assert_eq!(cfg.server.wireguard_public, Some(51820));
+        assert_eq!(
+            cfg.server.wireguard_peers_file,
+            Some("/tmp/wg-peers.toml".to_owned())
+        );
+        assert_eq!(cfg.server.wireguard_peer_lease_secs, 3600);
         assert_eq!(cfg.server.tcp_bind, Some("0.0.0.0:8000".to_owned()));
         assert_eq!(cfg.server.tcp_public, Some(8000));
         assert_eq!(cfg.server.status_bind, "127.0.0.1:9002");
@@ -1015,15 +1118,18 @@ mod tests {
         let root = temp_state_path("state-files");
         let authorized = root.join("authorized_keys.toml");
         let invites = root.join("invite_tokens.toml");
+        let wg_peers = root.join("wireguard_peers.toml");
 
         let mut cfg = ServerConfig::default();
         cfg.server.authorized_keys_file = authorized.display().to_string();
         cfg.server.invite_tokens_file = invites.display().to_string();
+        cfg.server.wireguard_peers_file = Some(wg_peers.display().to_string());
 
         ensure_server_state_files(&cfg).expect("state files should be created");
 
         assert!(authorized.exists());
         assert!(invites.exists());
+        assert!(wg_peers.exists());
         assert_eq!(
             fs::read_to_string(&authorized).expect("authorized keys should be readable"),
             "devices = []\n"
@@ -1032,9 +1138,14 @@ mod tests {
             fs::read_to_string(&invites).expect("invite tokens should be readable"),
             "tokens = []\n"
         );
+        assert_eq!(
+            fs::read_to_string(&wg_peers).expect("wireguard peers should be readable"),
+            "peers = []\n"
+        );
 
         let _ = fs::remove_file(authorized);
         let _ = fs::remove_file(invites);
+        let _ = fs::remove_file(wg_peers);
         let _ = fs::remove_dir(root);
     }
 

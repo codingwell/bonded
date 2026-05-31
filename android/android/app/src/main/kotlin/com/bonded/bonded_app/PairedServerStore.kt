@@ -8,10 +8,16 @@ import org.json.JSONObject
 data class PairedServerRecord(
         val id: String,
         val publicAddress: String,
-        val serverPublicKey: String,
+    val serverIdentityPublicKey: String,
         val supportedProtocols: List<String>,
+    val peerShareEnabled: Boolean,
+    val peerShareBindAddress: String,
+    val peerShareAdvertiseIp: String,
         val pairedAt: String,
-)
+) {
+    val serverPublicKey: String
+    get() = serverIdentityPublicKey
+}
 
 object PairedServerStore {
     private const val PREFS_NAME = "bonded.paired_servers"
@@ -19,10 +25,14 @@ object PairedServerStore {
     private const val LEGACY_KEY_DEVICE_ID = "deviceId"
     private const val LEGACY_KEY_PUBLIC_ADDRESS = "publicAddress"
     private const val LEGACY_KEY_SERVER_PUBLIC_KEY = "serverPublicKey"
+    private const val KEY_SERVER_IDENTITY_PUBLIC_KEY = "serverIdentityPublicKey"
     private const val LEGACY_KEY_PAIRED_AT = "pairedAt"
 
     fun save(context: Context, record: PairedServerRecord) {
-        val records = loadAll(context).filterNot { it.id == record.id }.toMutableList()
+        val records =
+            loadAll(context)
+                .filterNot { it.id == record.id || it.publicAddress == record.publicAddress }
+                .toMutableList()
         records.add(record)
         persist(context, records)
     }
@@ -61,8 +71,12 @@ object PairedServerStore {
                     JSONObject()
                             .put("id", record.id)
                             .put("publicAddress", record.publicAddress)
-                            .put("serverPublicKey", record.serverPublicKey)
+                            .put(KEY_SERVER_IDENTITY_PUBLIC_KEY, record.serverIdentityPublicKey)
+                            .put("serverPublicKey", record.serverIdentityPublicKey)
                             .put("supportedProtocols", JSONArray(record.supportedProtocols))
+                            .put("peerShareEnabled", record.peerShareEnabled)
+                            .put("peerShareBindAddress", record.peerShareBindAddress)
+                            .put("peerShareAdvertiseIp", record.peerShareAdvertiseIp)
                             .put("pairedAt", record.pairedAt),
             )
         }
@@ -99,8 +113,15 @@ object PairedServerStore {
 
                 val id = item.optString("id").trim()
                 val publicAddress = item.optString("publicAddress").trim()
-                val serverPublicKey = item.optString("serverPublicKey").trim()
-                if (id.isEmpty() || publicAddress.isEmpty() || serverPublicKey.isEmpty()) {
+                val serverIdentityPublicKey =
+                    item.optString(KEY_SERVER_IDENTITY_PUBLIC_KEY)
+                        .takeIf { it.isNotBlank() }
+                        ?: item.optString("serverPublicKey")
+                if (
+                    id.isEmpty() ||
+                        publicAddress.isEmpty() ||
+                        serverIdentityPublicKey.trim().isEmpty()
+                ) {
                     continue
                 }
 
@@ -108,9 +129,14 @@ object PairedServerStore {
                         PairedServerRecord(
                                 id = id,
                                 publicAddress = publicAddress,
-                                serverPublicKey = serverPublicKey,
+                                serverIdentityPublicKey = serverIdentityPublicKey.trim(),
                                 supportedProtocols =
                                         parseProtocols(item.optJSONArray("supportedProtocols")),
+                            peerShareEnabled = item.optBoolean("peerShareEnabled", false),
+                            peerShareBindAddress =
+                                item.optString("peerShareBindAddress", ""),
+                            peerShareAdvertiseIp =
+                                item.optString("peerShareAdvertiseIp", ""),
                                 pairedAt = item.optString("pairedAt", Instant.now().toString()),
                         ),
                 )
@@ -123,16 +149,22 @@ object PairedServerStore {
     ): PairedServerRecord? {
         val id = prefs.getString(LEGACY_KEY_DEVICE_ID, "")?.trim().orEmpty()
         val publicAddress = prefs.getString(LEGACY_KEY_PUBLIC_ADDRESS, "")?.trim().orEmpty()
-        val serverPublicKey = prefs.getString(LEGACY_KEY_SERVER_PUBLIC_KEY, "")?.trim().orEmpty()
-        if (id.isEmpty() || publicAddress.isEmpty() || serverPublicKey.isEmpty()) {
+        val serverIdentityPublicKey =
+            prefs.getString(KEY_SERVER_IDENTITY_PUBLIC_KEY, null)?.trim().orEmpty().ifEmpty {
+                prefs.getString(LEGACY_KEY_SERVER_PUBLIC_KEY, "")?.trim().orEmpty()
+            }
+        if (id.isEmpty() || publicAddress.isEmpty() || serverIdentityPublicKey.isEmpty()) {
             return null
         }
 
         return PairedServerRecord(
                 id = id,
                 publicAddress = publicAddress,
-                serverPublicKey = serverPublicKey,
+                serverIdentityPublicKey = serverIdentityPublicKey,
                 supportedProtocols = emptyList(),
+                peerShareEnabled = false,
+                peerShareBindAddress = "",
+                peerShareAdvertiseIp = "",
                 pairedAt = prefs.getString(LEGACY_KEY_PAIRED_AT, Instant.now().toString())
                                 ?: Instant.now().toString(),
         )

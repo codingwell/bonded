@@ -25,7 +25,7 @@ class _PairingConfirmScreenState extends State<PairingConfirmScreen> {
       // Redeem the invite token and get device ID
       final deviceId = await PairingService.redeemInviteToken(
         serverAddress: widget.payload.publicAddress,
-        serverPublicKey: widget.payload.serverPublicKey,
+        serverIdentityPublicKey: widget.payload.serverIdentityPublicKey,
         inviteToken: widget.payload.inviteToken,
       );
 
@@ -33,7 +33,7 @@ class _PairingConfirmScreenState extends State<PairingConfirmScreen> {
       await PairingService.storePairedServer(
         deviceId: deviceId,
         publicAddress: widget.payload.publicAddress,
-        serverPublicKey: widget.payload.serverPublicKey,
+        serverIdentityPublicKey: widget.payload.serverIdentityPublicKey,
       );
 
       // Success - navigate to dashboard
@@ -82,12 +82,12 @@ class _PairingConfirmScreenState extends State<PairingConfirmScreen> {
               _buildDetailRow('Server Address', widget.payload.publicAddress),
               const SizedBox(height: 16),
               _buildDetailRow(
-                'Server Key (first 16 chars)',
-                widget.payload.serverPublicKey.substring(
+                'Server Identity Key (first 16 chars)',
+                widget.payload.serverIdentityPublicKey.substring(
                   0,
-                  widget.payload.serverPublicKey.length > 16
+                  widget.payload.serverIdentityPublicKey.length > 16
                       ? 16
-                      : widget.payload.serverPublicKey.length,
+                      : widget.payload.serverIdentityPublicKey.length,
                 ),
               ),
               const SizedBox(height: 32),

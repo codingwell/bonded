@@ -12,8 +12,18 @@ void main() {
       expect(payload, isNotNull);
       expect(payload!.publicAddress, 'bonded.example.com:8080');
       expect(payload.inviteToken, 'token-123');
-      expect(payload.serverPublicKey, 'pub-key');
+      expect(payload.serverIdentityPublicKey, 'pub-key');
       expect(payload.supportedProtocols, isEmpty);
+    });
+
+    test('prefers explicit server identity public key when present', () {
+      const qrData =
+          '{"server_public_address":"bonded.example.com:8080","invite_token":"token-123","server_identity_public_key":"identity-key","server_public_key":"legacy-key"}';
+
+      final payload = ServerPairingPayload.parseQrData(qrData);
+
+      expect(payload, isNotNull);
+      expect(payload!.serverIdentityPublicKey, 'identity-key');
     });
 
     test('accepts legacy public_address key for compatibility', () {
