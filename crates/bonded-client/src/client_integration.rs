@@ -45,6 +45,7 @@ fn test_client_config(addr: String, keypair: &DeviceKeypair) -> ClientConfig {
             ..ClientConfig::default().client
         },
         socket_protect: None,
+        socket_network_bind: None,
     }
 }
 

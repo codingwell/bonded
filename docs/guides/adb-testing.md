@@ -147,7 +147,7 @@ These run in a foreground service and log results under the `NetworkTest` tag. T
 
 ### DNS resolution
 ```bash
-# Default host (unifi.g.codingwell.net → expected 34.82.88.79)
+# Default host (charter.codingwell.net → expected 97.115.185.254)
 adb -s 192.168.1.140:5555 shell am broadcast \
   -a com.bonded.bonded_app.TEST_DNS \
   com.bonded.bonded_app
@@ -168,7 +168,7 @@ adb -s 192.168.1.140:5555 shell am broadcast \
 
 ### TCP connection
 ```bash
-# Default (unifi.g.codingwell.net:443)
+# Default (charter.codingwell.net:443)
 adb -s 192.168.1.140:5555 shell am broadcast \
   -a com.bonded.bonded_app.TEST_TCP \
   com.bonded.bonded_app

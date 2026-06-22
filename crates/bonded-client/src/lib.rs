@@ -22,6 +22,8 @@ use serde_json::json;
 use std::fs;
 use std::future::poll_fn;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as StdUdpSocket};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -189,7 +191,7 @@ impl ClientRuntime {
             let _peer_transport_hold = peer_transport_tx.clone();
             let _peer_share_runtime = if self.config.client.peer_share_enabled {
                 Some(
-                    peer_runtime::start_peer_share_runtime(&self.config, peer_transport_tx)
+                    peer_runtime::start_peer_share_runtime(&self.config, peer_transport_tx, None)
                         .await
                         .context("failed to start peer-share runtime")?,
                 )
@@ -217,6 +219,17 @@ pub async fn establish_transport_paths(
     config: &ClientConfig,
     count: usize,
 ) -> anyhow::Result<Vec<ClientTransport>> {
+    establish_transport_paths_with_observer(config, count, |_| {}).await
+}
+
+pub async fn establish_transport_paths_with_observer<F>(
+    config: &ClientConfig,
+    count: usize,
+    mut observer: F,
+) -> anyhow::Result<Vec<ClientTransport>>
+where
+    F: FnMut(String),
+{
     let protocols = sanitize_preferred_protocols(
         &config.client.preferred_protocols,
         config.client.allow_insecure_debug_transports,
@@ -235,6 +248,10 @@ pub async fn establish_transport_paths(
 
         let mut connected: Option<ClientTransport> = None;
         for protocol in rotated_protocols(&protocols, path_index) {
+            observer(format!(
+                "transport attempt path_index={path_index} requested_paths={target} protocol={protocol} bind_address={}",
+                bind_address.unwrap_or("<default>")
+            ));
             let attempt = match (protocol.as_str(), bind_address) {
                 ("naive_tcp", Some(bind)) => timeout(
                     PATH_ESTABLISH_TIMEOUT,
@@ -268,14 +285,31 @@ pub async fn establish_transport_paths(
                         .and_then(|result| result)
                         .map(|transport| ClientTransport::WebSocket(Box::new(transport)))
                 }
-                ("h3" | "quic", _bind) => {
+                ("h3" | "quic", Some(bind)) => {
+                    timeout(PATH_ESTABLISH_TIMEOUT, establish_quic_session_with_bind(config, bind))
+                        .await
+                        .map_err(anyhow::Error::from)
+                        .and_then(|result| result)
+                        .map(|transport| ClientTransport::Quic(Box::new(transport)))
+                }
+                ("h3" | "quic", None) => {
                     timeout(PATH_ESTABLISH_TIMEOUT, establish_quic_session(config))
                         .await
                         .map_err(anyhow::Error::from)
                         .and_then(|result| result)
                         .map(|transport| ClientTransport::Quic(Box::new(transport)))
                 }
-                ("wireguard" | "wg", _bind) => {
+                ("wireguard" | "wg", Some(bind)) => {
+                    timeout(
+                        PATH_ESTABLISH_TIMEOUT,
+                        establish_wireguard_session_with_bind(config, bind),
+                    )
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|result| result)
+                    .map(|transport| ClientTransport::WireGuard(Box::new(transport)))
+                }
+                ("wireguard" | "wg", None) => {
                     timeout(PATH_ESTABLISH_TIMEOUT, establish_wireguard_session(config))
                         .await
                         .map_err(anyhow::Error::from)
@@ -287,6 +321,10 @@ pub async fn establish_transport_paths(
 
             match attempt {
                 Ok(path) => {
+                    observer(format!(
+                        "transport established path_index={path_index} requested_paths={target} protocol={protocol} bind_address={}",
+                        bind_address.unwrap_or("<default>")
+                    ));
                     connected = Some(path);
                     break;
                 }
@@ -294,6 +332,10 @@ pub async fn establish_transport_paths(
                     let bind_context = bind_address
                         .map(|bind| format!(", bind_address={bind}"))
                         .unwrap_or_default();
+                    observer(format!(
+                        "transport attempt failed path_index={path_index} requested_paths={target} protocol={protocol} bind_address={} error={err:#}",
+                        bind_address.unwrap_or("<default>")
+                    ));
                     attempt_errors.push(format!(
                         "protocol={protocol}, path_index={path_index}{bind_context}: {:#}",
                         err
@@ -482,24 +524,15 @@ pub async fn establish_naive_tcp_session_with_bind(
     };
     socket.bind(SocketAddr::new(bind_ip, 0))?;
     #[cfg(unix)]
-    if let Some(protect) = &config.socket_protect {
-        use std::os::unix::io::AsRawFd;
-        let fd = socket.as_raw_fd();
-        debug!(
-            "protecting NaiveTCP bind-aware socket fd={} bind_ip={}",
-            fd, bind_ip
-        );
-        if !protect.0(fd) {
-            warn!("failed to protect NaiveTCP bind-aware socket fd={}", fd);
-            anyhow::bail!("failed to protect bind-aware NaiveTCP socket from VPN capture");
-        }
-        debug!(
-            "successfully protected NaiveTCP bind-aware socket fd={}",
-            fd
-        );
-    }
+    prepare_bound_socket_for_connect(
+        socket.as_raw_fd(),
+        bind_address,
+        config.socket_network_bind.as_ref(),
+        config.socket_protect.as_ref(),
+        "NaiveTCP",
+    )?;
     #[cfg(not(unix))]
-    if config.socket_protect.is_some() {
+    if config.socket_protect.is_some() || config.socket_network_bind.is_some() {
         debug!("socket protect callback configured but platform is not Unix");
     }
     let stream = socket.connect(server_address).await?;
@@ -625,12 +658,14 @@ async fn establish_websocket_session(
             )
             .await?
             .ok_or_else(|| anyhow::anyhow!("missing refreshed fingerprint for rotated WSS cert"))?;
-            let retry_stream =
-                connect_websocket_tcp_socket(server_addr, None, config.socket_protect.as_ref())
-                    .await
-                    .with_context(|| {
-                        format!("failed to reconnect websocket TCP socket to {server_addr}")
-                    })?;
+            let retry_stream = connect_websocket_tcp_socket(
+                server_addr,
+                None,
+                config.socket_protect.as_ref(),
+                config.socket_network_bind.as_ref(),
+            )
+            .await
+            .with_context(|| format!("failed to reconnect websocket TCP socket to {server_addr}"))?;
             let retry_request = websocket_url.as_str().into_client_request()?;
             client_async_tls_with_config(
                 retry_request,
@@ -710,24 +745,15 @@ async fn establish_websocket_session_with_bind(
     };
     socket.bind(SocketAddr::new(bind_ip, 0))?;
     #[cfg(unix)]
-    if let Some(protect) = &config.socket_protect {
-        use std::os::unix::io::AsRawFd;
-        let fd = socket.as_raw_fd();
-        debug!(
-            "protecting WebSocket bind-aware socket fd={} bind_ip={} target={}://{}:{}",
-            fd, bind_ip, scheme, host, port
-        );
-        if !protect.0(fd) {
-            warn!("FAILED to protect WebSocket bind-aware socket fd={}", fd);
-            anyhow::bail!("failed to protect bind-aware WebSocket socket from VPN capture");
-        }
-        debug!(
-            "successfully protected WebSocket bind-aware socket fd={}",
-            fd
-        );
-    }
+    prepare_bound_socket_for_connect(
+        socket.as_raw_fd(),
+        bind_address,
+        config.socket_network_bind.as_ref(),
+        config.socket_protect.as_ref(),
+        "WebSocket",
+    )?;
     #[cfg(not(unix))]
-    if config.socket_protect.is_some() {
+    if config.socket_protect.is_some() || config.socket_network_bind.is_some() {
         debug!("socket protect callback configured but platform is not Unix");
     }
 
@@ -759,6 +785,7 @@ async fn establish_websocket_session_with_bind(
                 server_addr,
                 Some(bind_ip),
                 config.socket_protect.as_ref(),
+                config.socket_network_bind.as_ref(),
             )
             .await
             .with_context(|| {
@@ -897,6 +924,104 @@ async fn establish_quic_session(config: &ClientConfig) -> anyhow::Result<QuicTra
     Ok(transport)
 }
 
+async fn establish_quic_session_with_bind(
+    config: &ClientConfig,
+    bind_address: &str,
+) -> anyhow::Result<QuicTransport> {
+    let bind_ip = parse_bind_ip(bind_address)?;
+    let address = &config.client.server_public_address;
+    let ws_addr = &config.client.server_websocket_address;
+    let quic_address = if ws_addr.trim().is_empty() {
+        address
+    } else {
+        ws_addr
+    };
+
+    let quic_host_port = quic_address
+        .trim_start_matches("wss://")
+        .trim_start_matches("ws://")
+        .trim_start_matches("h3://");
+
+    let (host, port) = if let Some(pos) = quic_host_port.rfind(':') {
+        let port_str = &quic_host_port[pos + 1..];
+        if let Ok(port) = port_str.parse::<u16>() {
+            (&quic_host_port[..pos], port)
+        } else {
+            (quic_host_port, 443u16)
+        }
+    } else {
+        (quic_host_port, 443u16)
+    };
+
+    let dial_override = (!config.client.server_resolved_address.trim().is_empty())
+        .then_some(config.client.server_resolved_address.as_str());
+    let rustls_config = if !config.client.tls_cert_fingerprint.is_empty() {
+        (*cert_proof::make_pinned_tls_config(&config.client.tls_cert_fingerprint)).clone()
+    } else if !config.client.server_public_key.is_empty() {
+        let fingerprint = cert_proof::fetch_and_verify_cert_proof(
+            host,
+            port,
+            &config.client.server_public_key,
+            config.socket_protect.as_ref(),
+            dial_override,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("QUIC cert-proof bootstrap failed for {host}:{port}: {e}"))?;
+        info!(fingerprint = %fingerprint, bind_ip = %bind_ip, "QUIC cert-proof verified for bind-aware session");
+        (*cert_proof::make_pinned_tls_config(&fingerprint)).clone()
+    } else {
+        anyhow::bail!(
+            "QUIC transport requires tls_cert_fingerprint or server_public_key in client config"
+        );
+    };
+
+    let (_endpoint, connection) = match connect_quic_client_with_bind(
+        host,
+        port,
+        rustls_config.clone(),
+        b"bonded-quic",
+        config.socket_protect.as_ref(),
+        config.socket_network_bind.as_ref(),
+        Some(bind_ip),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(err) if should_retry_tls_rotation(config) => {
+            let refreshed =
+                refresh_tls_fingerprint_after_rotation(host, port, config, dial_override, "QUIC")
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("missing refreshed fingerprint for rotated QUIC cert")
+                    })?;
+            connect_quic_client_with_bind(
+                host,
+                port,
+                (*cert_proof::make_pinned_tls_config(&refreshed)).clone(),
+                b"bonded-quic",
+                config.socket_protect.as_ref(),
+                config.socket_network_bind.as_ref(),
+                Some(bind_ip),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "QUIC reconnect after cert rotation failed for {host}:{port} from bind {bind_ip}: {err}"
+                )
+            })?
+        }
+        Err(err) => return Err(err),
+    };
+
+    let mut transport = QuicTransport::from_client_connection(connection).await?;
+    let keypair = load_or_create_device_keypair(
+        &expand_home_path(&config.client.private_key_path),
+        &expand_home_path(&config.client.public_key_path),
+    )?;
+    perform_quic_auth_handshake(&mut transport, &keypair, &config.client.invite_token).await?;
+    Ok(transport)
+}
+
 /// Perform the challenge-response auth handshake over a QUIC transport.
 async fn perform_quic_auth_handshake(
     transport: &mut QuicTransport,
@@ -990,6 +1115,40 @@ async fn establish_wireguard_session(config: &ClientConfig) -> anyhow::Result<Wi
         local_keypair,
         peer_public_key,
         "[::]:0", // bind to any local UDP port
+        server_addr,
+        rand::random::<u32>(),
+        #[cfg(unix)]
+        config.socket_protect.as_ref(),
+    )
+    .await?;
+    Ok(transport)
+}
+
+async fn establish_wireguard_session_with_bind(
+    config: &ClientConfig,
+    bind_address: &str,
+) -> anyhow::Result<WireGuardTransport> {
+    use bonded_core::transport::WireGuardKeypair;
+
+    let bind_ip = parse_bind_ip(bind_address)?;
+    let private_key_path = expand_home_path(&config.client.private_key_path);
+    let public_key_path = expand_home_path(&config.client.public_key_path);
+    let device_keypair = load_or_create_device_keypair(&private_key_path, &public_key_path)?;
+    let local_keypair = WireGuardKeypair::generate();
+    let bootstrap = bootstrap_wireguard_peer(
+        config,
+        &device_keypair.public_key_b64,
+        &local_keypair.public_key_b64(),
+    )
+    .await?;
+    let peer_public_key = decode_wireguard_public_key(&bootstrap.server_public_key)?;
+    let server_addr = resolve_server_address(&bootstrap.endpoint, Some(bind_ip)).await?;
+    let bind_addr = SocketAddr::new(bind_ip, 0).to_string();
+
+    let transport = WireGuardTransport::new(
+        local_keypair,
+        peer_public_key,
+        &bind_addr,
         server_addr,
         rand::random::<u32>(),
         #[cfg(unix)]
@@ -1353,10 +1512,46 @@ async fn connect_bootstrap_tcp(
     Ok(socket.connect(address).await?)
 }
 
+#[cfg(unix)]
+fn prepare_bound_socket_for_connect(
+    fd: i32,
+    bind_address: &str,
+    socket_network_bind: Option<&bonded_core::config::SocketNetworkBindFn>,
+    socket_protect: Option<&bonded_core::config::SocketProtectFn>,
+    transport_name: &str,
+) -> anyhow::Result<()> {
+    if let Some(bind_network) = socket_network_bind {
+        debug!(
+            "binding {} socket fd={} to Android network for bind_address={}",
+            transport_name, fd, bind_address
+        );
+        if !bind_network.0(fd, bind_address) {
+            anyhow::bail!(
+                "failed to bind {transport_name} socket to Android network for bind address {bind_address} (fd={fd})"
+            );
+        }
+    }
+
+    if let Some(protect) = socket_protect {
+        debug!(
+            "protecting {} socket fd={} bind_address={}",
+            transport_name, fd, bind_address
+        );
+        if !protect.0(fd) {
+            anyhow::bail!(
+                "failed to protect {transport_name} socket from VPN capture for bind address {bind_address} (fd={fd})"
+            );
+        }
+    }
+
+    Ok(())
+}
+
 async fn connect_websocket_tcp_socket(
     server_addr: SocketAddr,
     bind_ip: Option<IpAddr>,
     socket_protect: Option<&bonded_core::config::SocketProtectFn>,
+    socket_network_bind: Option<&bonded_core::config::SocketNetworkBindFn>,
 ) -> anyhow::Result<TcpStream> {
     let socket = match bind_ip.unwrap_or_else(|| server_addr.ip()) {
         IpAddr::V4(_) => TcpSocket::new_v4()?,
@@ -1367,8 +1562,15 @@ async fn connect_websocket_tcp_socket(
         None => socket.bind(local_wildcard_bind_addr_for(server_addr))?,
     }
     #[cfg(unix)]
-    if let Some(protect) = socket_protect {
-        use std::os::unix::io::AsRawFd;
+    if let Some(ip) = bind_ip {
+        prepare_bound_socket_for_connect(
+            socket.as_raw_fd(),
+            &ip.to_string(),
+            socket_network_bind,
+            socket_protect,
+            "WebSocket",
+        )?;
+    } else if let Some(protect) = socket_protect {
         let fd = socket.as_raw_fd();
         if !protect.0(fd) {
             anyhow::bail!("failed to protect websocket socket from VPN capture (fd={fd})");
@@ -1388,11 +1590,19 @@ fn local_wildcard_udp_bind_addr_for(remote: SocketAddr) -> SocketAddr {
 fn bind_quic_udp_socket(
     bind_addr: SocketAddr,
     socket_protect: Option<&bonded_core::config::SocketProtectFn>,
+    socket_network_bind: Option<&bonded_core::config::SocketNetworkBindFn>,
 ) -> anyhow::Result<StdUdpSocket> {
     let socket = StdUdpSocket::bind(bind_addr)?;
     #[cfg(unix)]
-    if let Some(protect) = socket_protect {
-        use std::os::unix::io::AsRawFd;
+    if !bind_addr.ip().is_unspecified() {
+        prepare_bound_socket_for_connect(
+            socket.as_raw_fd(),
+            &bind_addr.ip().to_string(),
+            socket_network_bind,
+            socket_protect,
+            "QUIC",
+        )?;
+    } else if let Some(protect) = socket_protect {
         let fd = socket.as_raw_fd();
         if !protect.0(fd) {
             anyhow::bail!("failed to protect QUIC socket from VPN capture (fd={fd})");
@@ -1409,6 +1619,19 @@ pub(crate) async fn connect_quic_client(
     alpn: &[u8],
     socket_protect: Option<&bonded_core::config::SocketProtectFn>,
 ) -> anyhow::Result<(quinn::Endpoint, quinn::Connection)> {
+    connect_quic_client_with_bind(host, port, rustls_config, alpn, socket_protect, None, None)
+        .await
+}
+
+pub(crate) async fn connect_quic_client_with_bind(
+    host: &str,
+    port: u16,
+    rustls_config: RustlsClientConfig,
+    alpn: &[u8],
+    socket_protect: Option<&bonded_core::config::SocketProtectFn>,
+    socket_network_bind: Option<&bonded_core::config::SocketNetworkBindFn>,
+    bind_ip: Option<IpAddr>,
+) -> anyhow::Result<(quinn::Endpoint, quinn::Connection)> {
     let quic_client_config = build_quic_client_config(rustls_config, alpn)?;
     let server_addr: SocketAddr = tokio::net::lookup_host(format!("{host}:{port}"))
         .await
@@ -1420,8 +1643,11 @@ pub(crate) async fn connect_quic_client(
         Default::default(),
         None,
         bind_quic_udp_socket(
-            local_wildcard_udp_bind_addr_for(server_addr),
+            bind_ip
+                .map(|ip| SocketAddr::new(ip, 0))
+                .unwrap_or_else(|| local_wildcard_udp_bind_addr_for(server_addr)),
             socket_protect,
+            socket_network_bind,
         )?,
         Arc::new(quinn::TokioRuntime),
     )

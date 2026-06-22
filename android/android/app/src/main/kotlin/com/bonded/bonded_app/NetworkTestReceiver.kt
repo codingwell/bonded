@@ -32,7 +32,7 @@ import kotlin.concurrent.thread
  * -a com.bonded.bonded_app.TEST_VPN_STATUS adb shell am broadcast -a
  * com.bonded.bonded_app.TEST_VPN_CONNECT adb shell am broadcast -a
  * com.bonded.bonded_app.TEST_VPN_DISCONNECT adb shell am broadcast -a
- * com.bonded.bonded_app.TEST_DNS -e host unifi.g.codingwell.net -e expected_ip 34.82.88.79 adb
+ * com.bonded.bonded_app.TEST_DNS -e host charter.codingwell.net -e expected_ip 97.115.185.254 adb
  * shell am broadcast -a com.bonded.bonded_app.TEST_TCP -e host example.com -e port 443 adb shell am
  * broadcast -a com.bonded.bonded_app.TEST_HTTP -e url https://example.com adb shell am broadcast -a
  * com.bonded.bonded_app.TEST_HTTP_CODINGWELL adb shell am broadcast -a
@@ -42,8 +42,8 @@ import kotlin.concurrent.thread
  */
 class NetworkTestReceiver : BroadcastReceiver() {
     companion object {
-        private const val DEFAULT_DNS_HOST = "unifi.g.codingwell.net"
-        private const val DEFAULT_DNS_EXPECTED_IP = "34.82.88.79"
+        private const val DEFAULT_DNS_HOST = "charter.codingwell.net"
+        private const val DEFAULT_DNS_EXPECTED_IP = "97.115.185.254"
         private const val MAX_LOG_LINES = 300
         private val logBuffer = ArrayDeque<String>()
 
@@ -188,7 +188,7 @@ class NetworkTestReceiver : BroadcastReceiver() {
             "com.bonded.bonded_app.TEST_VPN_CONNECT" -> {
                 logI(">>> Requesting VPN Connect")
                 // Start VPN with the first available paired device
-                val pairedServer = PairedServerStore.loadAll(context).firstOrNull()
+                val pairedServer = PairedServerStore.selectPreferredRecord(PairedServerStore.loadAll(context))
                 if (pairedServer != null) {
                     BondedVpnService.start(context, pairedServer.id, runInBackground = false)
                     logI("VPN connect requested for device: ${pairedServer.id}")

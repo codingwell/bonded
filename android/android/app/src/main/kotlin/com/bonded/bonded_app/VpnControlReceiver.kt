@@ -27,13 +27,13 @@ class VpnControlReceiver : BroadcastReceiver() {
                     BondedVpnService.start(context, deviceId, runBackground)
                 } else {
                     // Try to find first paired device
-                    val firstPaired = PairedServerStore.loadAll(context).firstOrNull()
-                    if (firstPaired != null) {
+                    val preferred = PairedServerStore.selectPreferredRecord(PairedServerStore.loadAll(context))
+                    if (preferred != null) {
                         android.util.Log.i(
                             "VpnControlReceiver",
-                            "Starting VPN with first paired device: ${firstPaired.id}",
+                            "Starting VPN with preferred paired device: ${preferred.id}",
                         )
-                        BondedVpnService.start(context, firstPaired.id, runBackground)
+                        BondedVpnService.start(context, preferred.id, runBackground)
                     } else {
                         android.util.Log.w("VpnControlReceiver", "No paired devices found")
                     }

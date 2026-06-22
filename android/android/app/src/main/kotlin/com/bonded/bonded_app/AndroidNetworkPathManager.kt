@@ -6,7 +6,13 @@ import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.os.ParcelFileDescriptor
+import android.util.Log
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.net.Inet4Address
+import java.net.Inet6Address
+import java.net.NetworkInterface
 
 data class NetworkPathBinding(
         val transport: Int,
@@ -60,8 +66,10 @@ class AndroidNetworkPathManager(
     }
 
     fun activePathCount(): Int {
-        val uniqueTransports = trackedNetworks.values.map { it.transport }.toSet().size
-        return uniqueTransports.coerceIn(1, 2)
+        // Only advertise paths we can actually bind. Otherwise Rust will try to
+        // create an extra path with no bind address, which collapses back onto
+        // the default network instead of using a second interface.
+        return activeBindAddresses().size.coerceIn(1, 2)
     }
 
     fun activeBindAddresses(limit: Int = 2): List<String> {
@@ -71,6 +79,78 @@ class AndroidNetworkPathManager(
                 .mapNotNull { binding -> binding.bindAddress }
                 .distinct()
                 .take(limit)
+    }
+
+    fun activePathSummaries(limit: Int = 4): List<String> {
+        return trackedNetworks
+                .values
+                .sortedBy { binding -> transportPriority(binding.transport) }
+                .map { binding ->
+                    val transportName =
+                            when (binding.transport) {
+                                NetworkCapabilities.TRANSPORT_WIFI -> "wifi"
+                                NetworkCapabilities.TRANSPORT_CELLULAR -> "cellular"
+                                NetworkCapabilities.TRANSPORT_ETHERNET -> "ethernet"
+                                else -> "unknown"
+                            }
+                    "$transportName:${binding.bindAddress ?: "<no-bind-address>"}"
+                }
+                .distinct()
+                .take(limit)
+    }
+
+    fun bindSocketToTrackedNetwork(fd: Int, bindAddress: String): Boolean {
+        val entry =
+                trackedNetworks.entries
+                        .sortedBy { entry -> transportPriority(entry.value.transport) }
+                        .firstOrNull { entry -> entry.value.bindAddress == bindAddress }
+
+        if (entry == null) {
+            Log.w(
+                "BondedVPN",
+                "bindSocketToTrackedNetwork(fd=$fd, bindAddress=$bindAddress) found no matching tracked network; tracked=${activePathSummaries(limit = 8)}",
+            )
+            return false
+        }
+
+        var parcelFd: ParcelFileDescriptor? = null
+        return try {
+            parcelFd = ParcelFileDescriptor.fromFd(fd)
+            entry.key.bindSocket(parcelFd.fileDescriptor)
+            parcelFd.detachFd()
+            true
+        } catch (e: Exception) {
+            Log.e(
+                "BondedVPN",
+                "bindSocketToTrackedNetwork(fd=$fd, bindAddress=$bindAddress, tracked=${activePathSummaries(limit = 8)}) failed: ${e.message}",
+                e,
+            )
+            false
+        } finally {
+            try {
+                parcelFd?.close()
+            } catch (_: Exception) {
+                // Ignore cleanup failure; the raw socket fd remains owned by the caller.
+            }
+        }
+    }
+
+    fun connectTcpViaTrackedNetwork(
+            bindAddress: String,
+            targetIp: String,
+            port: Int,
+            timeoutMs: Int,
+    ): Socket {
+        val entry =
+                trackedNetworks.entries
+                        .sortedBy { entry -> transportPriority(entry.value.transport) }
+                        .firstOrNull { entry -> entry.value.bindAddress == bindAddress }
+                        ?: error("No tracked network for bindAddress=$bindAddress; tracked=${activePathSummaries(limit = 8)}")
+
+        return entry.key.socketFactory.createSocket().apply {
+            bind(InetSocketAddress(bindAddress, 0))
+            connect(InetSocketAddress(targetIp, port), timeoutMs)
+        }
     }
 
     private fun registerTransportRequest(transportType: Int) {
@@ -116,6 +196,12 @@ class AndroidNetworkPathManager(
         val resolvedCapabilities =
                 capabilities ?: connectivityManager?.getNetworkCapabilities(network) ?: return
 
+        if (!resolvedCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
+            trackedNetworks.remove(network)
+            notifyPathCountChanged()
+            return
+        }
+
         val transport =
                 when {
                     resolvedCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> {
@@ -144,7 +230,13 @@ class AndroidNetworkPathManager(
     }
 
     private fun pickBindAddress(linkProperties: LinkProperties): String? {
-        val addresses =
+        val addresses = collectBindAddresses(linkProperties)
+
+        return addresses.firstOrNull { !it.contains(':') } ?: addresses.firstOrNull()
+    }
+
+    private fun collectBindAddresses(linkProperties: LinkProperties): List<String> {
+        val directAddresses =
                 linkProperties.linkAddresses.mapNotNull { linkAddress ->
                     val address = linkAddress.address ?: return@mapNotNull null
                     when {
@@ -152,11 +244,35 @@ class AndroidNetworkPathManager(
                                 address.isLinkLocalAddress ||
                                 address.isAnyLocalAddress -> null
                         address is Inet4Address -> address.hostAddress
+                        address is Inet6Address ->
+                                address.hostAddress
+                                        ?.substringBefore('%')
+                                        ?.takeUnless { it.isBlank() }
                         else -> null
                     }
                 }
 
-        return addresses.firstOrNull()
+        val clatAddresses =
+                resolveClatIpv4Addresses(linkProperties.interfaceName)
+
+        return (directAddresses + clatAddresses).distinct()
+    }
+
+    private fun resolveClatIpv4Addresses(interfaceName: String?): List<String> {
+        if (interfaceName.isNullOrBlank()) {
+            return emptyList()
+        }
+
+        val clatInterface = NetworkInterface.getByName("v4-$interfaceName") ?: return emptyList()
+        return clatInterface.inetAddresses.toList().mapNotNull { address ->
+            when {
+                address.isLoopbackAddress ||
+                        address.isLinkLocalAddress ||
+                        address.isAnyLocalAddress -> null
+                address is Inet4Address -> address.hostAddress
+                else -> null
+            }
+        }
     }
 
     private fun transportPriority(transport: Int): Int {

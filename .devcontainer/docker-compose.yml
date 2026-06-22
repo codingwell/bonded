@@ -8,6 +8,7 @@ services:
       - ./.history:/commandhistory
       - bonded-gradle-cache:/home/vscode/.gradle
       - bonded-android-cache:/home/vscode/.android
+      - ./.opencode:/home/vscode/.local/share/opencode/
     command: sleep infinity
     ports:
       - "443:443"

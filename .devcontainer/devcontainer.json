@@ -27,7 +27,7 @@
             "settings": {
                 "rust-analyzer.cargo.features": "all",
                 "editor.formatOnSave": true,
-                "terminal.integrated.defaultProfile.linux": "bash",
+                "terminal.integrated.defaultProfile.linux": "bash"
                 // "[rust]": {
                 //     "editor.defaultFormatter": "rust-lang.rust-analyzer"
                 // },
@@ -38,29 +38,29 @@
         }
     },
     "forwardPorts": [
-        443,
-        8000,
-        8081,
-        8082,
-        51820
+        // 443,
+        // 8000,
+        // 8081,
+        // 8082,
+        // 51820
     ],
     "portsAttributes": {
-        "443": {
-            "label": "Bonded bootstrap/WSS",
-            "onAutoForward": "notify"
-        },
-        "8000": {
-            "label": "Bonded NaiveTCP debug"
-        },
-        "8081": {
-            "label": "Bonded health"
-        },
-        "8082": {
-            "label": "Bonded status"
-        },
-        "51820": {
-            "label": "Bonded WireGuard"
-        }
+        // "443": {
+        //     "label": "Bonded bootstrap/WSS",
+        //     "onAutoForward": "notify"
+        // },
+        // "8000": {
+        //     "label": "Bonded NaiveTCP debug"
+        // },
+        // "8081": {
+        //     "label": "Bonded health"
+        // },
+        // "8082": {
+        //     "label": "Bonded status"
+        // },
+        // "51820": {
+        //     "label": "Bonded WireGuard"
+        // }
     },
     "postCreateCommand": ".devcontainer/post-create.sh",
     "remoteEnv": {

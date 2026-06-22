@@ -3,12 +3,12 @@ use bonded_core::config::SocketProtectFn;
 use bonded_core::peer_share::{PeerRelayRegistration, SignedPeerShareIntroduction};
 use bonded_core::transport::{QuicTransport, Transport};
 use serde::Deserialize;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::select;
 
 use crate::cert_proof;
-use crate::{connect_quic_client, extract_quic_peer_certificate};
+use crate::{connect_quic_client_with_bind, extract_quic_peer_certificate};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerListenerIdentity {
@@ -72,6 +72,7 @@ pub async fn connect_peer_relay(
     expected_provider_device_public_key: &str,
     introduction: &SignedPeerShareIntroduction,
     socket_protect: Option<&SocketProtectFn>,
+    bind_ip: Option<IpAddr>,
 ) -> anyhow::Result<QuicTransport> {
     verify_consumer_introduction(
         server_public_key,
@@ -92,12 +93,14 @@ pub async fn connect_peer_relay(
         &claims.listener_cert_fingerprint,
     ))
     .clone();
-    let (_endpoint, connection) = connect_quic_client(
+    let (_endpoint, connection) = connect_quic_client_with_bind(
         &endpoint.ip().to_string(),
         endpoint.port(),
         rustls_config,
         b"bonded-peer",
         socket_protect,
+        None,
+        bind_ip,
     )
     .await?;
 
@@ -373,6 +376,7 @@ mod tests {
             &provider_key,
             &introduction,
             None,
+            None,
         )
         .await
         .expect("consumer should connect peer relay");
@@ -462,6 +466,7 @@ mod tests {
             &server_identity.public_key_b64,
             &provider_key,
             &introduction,
+            None,
             None,
         )
         .await

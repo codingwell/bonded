@@ -35,8 +35,8 @@ class NetworkTestForegroundService : Service() {
 
         private const val CHANNEL_ID = "bonded_network_tests"
         private const val NOTIFICATION_ID = 1002
-        private const val DEFAULT_DNS_HOST = "unifi.g.codingwell.net"
-        private const val DEFAULT_DNS_EXPECTED_IP = "34.82.88.79"
+        private const val DEFAULT_DNS_HOST = "charter.codingwell.net"
+        private const val DEFAULT_DNS_EXPECTED_IP = "97.115.185.254"
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -187,7 +187,7 @@ class NetworkTestForegroundService : Service() {
 
     private fun testVpnConnect() {
         logI(">>> Requesting VPN Connect")
-        val pairedServer = PairedServerStore.loadAll(this).firstOrNull()
+        val pairedServer = PairedServerStore.selectPreferredRecord(PairedServerStore.loadAll(this))
         if (pairedServer != null) {
             BondedVpnService.start(this, pairedServer.id, runInBackground = false)
             logI("VPN connect requested for device: ${pairedServer.id}")

@@ -13,6 +13,9 @@ sudo chown -R $(whoami): /home/vscode/.gradle/
 mkdir -p /home/vscode/.android/
 sudo chown -R $(whoami): /home/vscode/.android/
 
+mkdir -p /home/vscode/.local/share/opencode/
+sudo chown -R $(whoami): /home/vscode/.local/share/opencode/
+
 if ! grep -q "# Bonded persistent bash history" "$HOME/.bashrc"; then
     cat <<'EOF' >> "$HOME/.bashrc"
 
@@ -47,3 +50,7 @@ cd /workspace/server
 cargo fetch || echo "No server dependencies to fetch yet"
 
 echo "=== Setup complete ==="
+
+echo "=== Fixing VS Code Server Permissions ==="
+sudo chown -R vscode:vscode /home/vscode/.vscode-server 2>/dev/null || true
+sudo chown -R vscode:vscode /workspaces/.cache/vscode-server 2>/dev/null || true

@@ -38,9 +38,22 @@ impl TransportKind {
 #[derive(Clone)]
 pub struct SocketProtectFn(pub Arc<dyn Fn(i32) -> bool + Send + Sync>);
 
+/// Callback called with a raw socket file-descriptor plus the selected local
+/// bind address just before the socket connects. On Android this is used to
+/// bind the socket to the specific `Network` that owns that address so a
+/// cellular path does not silently follow the default Wi-Fi route.
+#[derive(Clone)]
+pub struct SocketNetworkBindFn(pub Arc<dyn Fn(i32, &str) -> bool + Send + Sync>);
+
 impl std::fmt::Debug for SocketProtectFn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("SocketProtectFn(..)")
+    }
+}
+
+impl std::fmt::Debug for SocketNetworkBindFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SocketNetworkBindFn(..)")
     }
 }
 
@@ -199,6 +212,10 @@ pub struct ClientConfig {
     /// protection (e.g. Android VPN services).
     #[serde(skip)]
     pub socket_protect: Option<SocketProtectFn>,
+    /// Not serialised – set at runtime on Android so sockets can be bound to
+    /// the specific `Network` that owns a chosen bind address.
+    #[serde(skip)]
+    pub socket_network_bind: Option<SocketNetworkBindFn>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

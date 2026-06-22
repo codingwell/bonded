@@ -1,11 +1,14 @@
 #[cfg(any(target_os = "android", test))]
 use bonded_client::{
-    establish_naive_tcp_session, establish_transport_paths, peer_runtime, ClientTransport,
+    establish_naive_tcp_session, establish_transport_paths_with_observer, peer_runtime,
+    ClientTransport,
 };
 #[cfg(any(target_os = "android", test))]
 use bonded_core::config::ClientConfig;
 #[cfg(target_os = "android")]
 use bonded_core::config::SocketProtectFn;
+#[cfg(target_os = "android")]
+use bonded_core::config::SocketNetworkBindFn;
 use bonded_core::session::SessionFrame;
 #[cfg(any(target_os = "android", test))]
 use bonded_core::session::{SessionState, FLAG_PING, FLAG_PONG};
@@ -185,6 +188,42 @@ fn protect_fd(fd: i32) -> bool {
 }
 
 #[cfg(target_os = "android")]
+fn bind_socket_to_network(fd: i32, bind_address: &str) -> bool {
+    let Some(jvm) = ANDROID_JVM.get() else {
+        return false;
+    };
+    let mut guard = match jvm.attach_current_thread_as_daemon() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    let service = match ANDROID_VPN_SERVICE.lock() {
+        Ok(lock) => match lock.as_ref() {
+            Some(r) => r.clone(),
+            None => return false,
+        },
+        Err(_) => return false,
+    };
+    let bind_address_text = bind_address.to_owned();
+    let bind_address_java = match guard.new_string(bind_address) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let bind_address_object = jni::objects::JObject::from(bind_address_java);
+    let call_args = [
+        jni::objects::JValue::Int(fd),
+        jni::objects::JValue::Object(&bind_address_object),
+    ];
+
+    let result = guard
+        .call_method(&service, "bindSocketToNetworkForNative", "(ILjava/lang/String;)Z", &call_args)
+        .ok()
+        .and_then(|v| v.z().ok())
+        .unwrap_or(false);
+    alog_info!("bind_socket_to_network(fd={fd}, bind_address={bind_address_text}) -> {result}");
+    result
+}
+
+#[cfg(target_os = "android")]
 fn android_tun_writer_slot() -> &'static Mutex<Option<File>> {
     ANDROID_TUN_WRITER.get_or_init(|| Mutex::new(None))
 }
@@ -252,6 +291,7 @@ struct AndroidSessionSnapshot {
     active_transport: String,
     transport_count: u32,
     peer_relay_count: u32,
+    accepted_peer_relay_count: u32,
     outbound_packets: u64,
     inbound_packets: u64,
     outbound_bytes: u64,
@@ -442,7 +482,8 @@ fn sync_transport_snapshot(
     update_snapshot(snapshot, |session_snapshot| {
         session_snapshot.active_transport = active_transport;
         session_snapshot.transport_count = transports.len() as u32;
-        session_snapshot.peer_relay_count = peer_relay_count;
+        session_snapshot.peer_relay_count =
+            peer_relay_count.max(session_snapshot.accepted_peer_relay_count);
     });
 }
 
@@ -517,6 +558,7 @@ fn start_android_session(
         active_transport: "Connecting".to_owned(),
         transport_count: 0,
         peer_relay_count: 0,
+        accepted_peer_relay_count: 0,
         outbound_packets: 0,
         inbound_packets: 0,
         outbound_bytes: 0,
@@ -556,6 +598,9 @@ fn start_android_session(
     #[cfg(target_os = "android")]
     {
         config.socket_protect = Some(SocketProtectFn(Arc::new(|fd| protect_fd(fd))));
+        config.socket_network_bind = Some(SocketNetworkBindFn(Arc::new(|fd, bind_address| {
+            bind_socket_to_network(fd, bind_address)
+        })));
     }
 
     let worker = thread::spawn(move || {
@@ -580,7 +625,9 @@ fn start_android_session(
             alog_info!("Worker: establishing transport paths");
             let mut transports = match tokio::time::timeout(
                 ANDROID_PATH_ESTABLISH_TIMEOUT,
-                establish_transport_paths(&config, path_count.max(1)),
+                establish_transport_paths_with_observer(&config, path_count.max(1), |message| {
+                    alog_info!("Worker: {message}");
+                }),
             )
             .await
             {
@@ -626,7 +673,23 @@ fn start_android_session(
             let (peer_transport_tx, mut peer_transport_rx) = tokio::sync::mpsc::unbounded_channel();
             let _peer_transport_hold = peer_transport_tx.clone();
             let _peer_share_runtime = if config.client.peer_share_enabled {
-                match peer_runtime::start_peer_share_runtime(&config, peer_transport_tx).await {
+                let peer_snapshot = Arc::clone(&worker_snapshot);
+                let peer_logger = Arc::new(move |message: String| {
+                    alog_info!("PeerShare: {}", message);
+                    update_snapshot(&peer_snapshot, |session_snapshot| {
+                        if message == "registered upstream relay session" {
+                            session_snapshot.accepted_peer_relay_count =
+                                session_snapshot.accepted_peer_relay_count.saturating_add(1);
+                        } else if message.starts_with("relay loop terminated:") {
+                            session_snapshot.accepted_peer_relay_count =
+                                session_snapshot.accepted_peer_relay_count.saturating_sub(1);
+                        }
+                        session_snapshot.peer_relay_count = session_snapshot
+                            .peer_relay_count
+                            .max(session_snapshot.accepted_peer_relay_count);
+                    });
+                });
+                match peer_runtime::start_peer_share_runtime(&config, peer_transport_tx, Some(peer_logger)).await {
                     Ok(runtime) => Some(runtime),
                     Err(err) => {
                         alog_error!("Failed to start peer-share runtime: {}", err);

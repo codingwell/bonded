@@ -56,7 +56,24 @@ object PairedServerStore {
     }
 
     fun findById(context: Context, id: String): PairedServerRecord? {
-        return loadAll(context).firstOrNull { it.id == id }
+        return selectPreferredRecord(loadAll(context), id)
+    }
+
+    fun selectPreferredRecord(
+        records: List<PairedServerRecord>,
+        preferredDeviceId: String? = null,
+    ): PairedServerRecord? {
+        val exactMatch = preferredDeviceId?.trim()?.takeIf { it.isNotEmpty() }
+            ?.let { requestedId ->
+                records.firstOrNull { it.id == requestedId }
+            }
+        if (exactMatch != null) {
+            return exactMatch
+        }
+
+        return records.maxWithOrNull(compareBy<PairedServerRecord> { record ->
+            runCatching { Instant.parse(record.pairedAt) }.getOrDefault(Instant.EPOCH)
+        })
     }
 
     fun delete(context: Context, id: String) {

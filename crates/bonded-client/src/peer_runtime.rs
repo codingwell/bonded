@@ -32,6 +32,8 @@ pub struct PeerShareRuntime {
     _listener_endpoint: quinn::Endpoint,
 }
 
+pub type PeerShareEventLogger = Arc<dyn Fn(String) + Send + Sync>;
+
 const PEER_RUNTIME_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 impl Drop for PeerShareRuntime {
@@ -45,6 +47,7 @@ impl Drop for PeerShareRuntime {
 pub async fn start_peer_share_runtime(
     config: &ClientConfig,
     peer_transport_tx: tokio::sync::mpsc::UnboundedSender<ClientTransport>,
+    event_logger: Option<PeerShareEventLogger>,
 ) -> anyhow::Result<PeerShareRuntime> {
     let private_key_path = crate::expand_home_path(&config.client.private_key_path);
     let public_key_path = crate::expand_home_path(&config.client.public_key_path);
@@ -59,11 +62,19 @@ pub async fn start_peer_share_runtime(
         nonce = %listener_identity.instance_nonce,
         "peer-share runtime started"
     );
+    emit_peer_share_event(
+        event_logger.as_ref(),
+        format!(
+            "runtime started endpoint={} nonce={}",
+            advertisement.endpoint, listener_identity.instance_nonce
+        ),
+    );
 
     let accept_endpoint = listener_endpoint.clone();
     let accept_config = config.clone();
     let accept_server_key = config.client.server_public_key.clone();
     let accept_identity = listener_identity.clone();
+    let accept_logger = event_logger.clone();
     let accept_task = tokio::spawn(async move {
         let _advertiser = advertiser;
         while let Some(incoming) = accept_endpoint.accept().await {
@@ -71,6 +82,10 @@ pub async fn start_peer_share_runtime(
                 Ok(connection) => connection,
                 Err(err) => {
                     warn!(error = %err, "peer-share QUIC accept failed");
+                    emit_peer_share_event(
+                        accept_logger.as_ref(),
+                        format!("QUIC accept failed: {err}"),
+                    );
                     continue;
                 }
             };
@@ -82,14 +97,30 @@ pub async fn start_peer_share_runtime(
                 Ok(peer) => peer,
                 Err(err) => {
                     warn!(error = %err, "peer-share introduction verification failed");
+                    emit_peer_share_event(
+                        accept_logger.as_ref(),
+                        format!("introduction verification failed: {err}"),
+                    );
                     continue;
                 }
             };
+            emit_peer_share_event(
+                accept_logger.as_ref(),
+                format!(
+                    "accepted relay for consumer={} provider_nonce={}",
+                    introduction.introduction.consumer_device_public_key,
+                    introduction.introduction.provider_instance_nonce,
+                ),
+            );
 
             let mut upstreams = match establish_peer_upstream_paths(&accept_config).await {
                 Ok(paths) => paths,
                 Err(err) => {
                     warn!(error = %err, "failed to establish upstream path for peer relay");
+                    emit_peer_share_event(
+                        accept_logger.as_ref(),
+                        format!("failed to establish upstream path: {err}"),
+                    );
                     sleep(PEER_RUNTIME_RETRY_DELAY).await;
                     continue;
                 }
@@ -97,6 +128,10 @@ pub async fn start_peer_share_runtime(
 
             if upstreams.is_empty() {
                 warn!("peer-share relay accept produced no upstream transport paths");
+                emit_peer_share_event(
+                    accept_logger.as_ref(),
+                    "relay accept produced no upstream transport paths".to_owned(),
+                );
                 sleep(PEER_RUNTIME_RETRY_DELAY).await;
                 continue;
             }
@@ -104,11 +139,23 @@ pub async fn start_peer_share_runtime(
             let mut upstream = upstreams.remove(0);
             if let Err(err) = register_peer_relay_upstream(&mut upstream, introduction).await {
                 warn!(error = %err, "failed to register peer relay upstream session");
+                emit_peer_share_event(
+                    accept_logger.as_ref(),
+                    format!("failed to register upstream relay session: {err}"),
+                );
                 sleep(PEER_RUNTIME_RETRY_DELAY).await;
                 continue;
             }
+            emit_peer_share_event(
+                accept_logger.as_ref(),
+                "registered upstream relay session".to_owned(),
+            );
             if let Err(err) = relay_peer_frames(&mut peer, &mut upstream).await {
                 warn!(error = %err, "peer relay loop terminated");
+                emit_peer_share_event(
+                    accept_logger.as_ref(),
+                    format!("relay loop terminated: {err}"),
+                );
             }
         }
     });
@@ -117,6 +164,8 @@ pub async fn start_peer_share_runtime(
     let browse_server_key = config.client.server_public_key.clone();
     let browse_device_keypair = device_keypair.clone();
     let browse_self_key = device_keypair.public_key_b64.clone();
+    let browse_bind_ip = peer_relay_bind_ip(config)?;
+    let browse_logger = event_logger.clone();
     let (closed_peer_tx, mut closed_peer_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let browse_task = tokio::spawn(async move {
         let browser = browser;
@@ -126,6 +175,10 @@ pub async fn start_peer_share_runtime(
                 Some(peer_id) = closed_peer_rx.recv() => {
                     connected_peers.remove(&peer_id);
                     info!(peer = %peer_id, "peer-share path closed; allowing rediscovery");
+                    emit_peer_share_event(
+                        browse_logger.as_ref(),
+                        format!("path closed for peer={peer_id}; allowing rediscovery"),
+                    );
                     continue;
                 }
                 advertisement = browser.recv() => {
@@ -133,6 +186,10 @@ pub async fn start_peer_share_runtime(
                         Ok(advertisement) => advertisement,
                         Err(err) => {
                             warn!(error = %err, "peer-share browser stopped");
+                            emit_peer_share_event(
+                                browse_logger.as_ref(),
+                                format!("browser stopped: {err}"),
+                            );
                             break;
                         }
                     }
@@ -150,6 +207,10 @@ pub async fn start_peer_share_runtime(
             if connected_peers.contains(&peer_id) {
                 continue;
             }
+            emit_peer_share_event(
+                browse_logger.as_ref(),
+                format!("discovered peer={peer_id} endpoint={}", advertisement.endpoint),
+            );
 
             let introduction = match request_peer_share_introduction(
                 &browse_config,
@@ -161,26 +222,43 @@ pub async fn start_peer_share_runtime(
                 Ok(introduction) => introduction,
                 Err(err) => {
                     warn!(error = %err, peer = %peer_id, "peer-share introduction request failed");
+                    emit_peer_share_event(
+                        browse_logger.as_ref(),
+                        format!("introduction request failed for peer={peer_id}: {err}"),
+                    );
                     sleep(PEER_RUNTIME_RETRY_DELAY).await;
                     continue;
                 }
             };
+            emit_peer_share_event(
+                browse_logger.as_ref(),
+                format!("introduction issued for peer={peer_id}"),
+            );
 
             let transport = match connect_peer_relay(
                 &browse_server_key,
                 &advertisement.device_public_key,
                 &introduction,
                 browse_config.socket_protect.as_ref(),
+                browse_bind_ip,
             )
             .await
             {
                 Ok(transport) => transport,
                 Err(err) => {
                     warn!(error = %err, peer = %peer_id, "peer-share relay dial failed");
+                    emit_peer_share_event(
+                        browse_logger.as_ref(),
+                        format!("relay dial failed for peer={peer_id}: {err}"),
+                    );
                     sleep(PEER_RUNTIME_RETRY_DELAY).await;
                     continue;
                 }
             };
+            emit_peer_share_event(
+                browse_logger.as_ref(),
+                format!("relay dial succeeded for peer={peer_id}"),
+            );
 
             if peer_transport_tx
                 .send(ClientTransport::peer_relay(transport, peer_id.clone(), closed_peer_tx.clone()))
@@ -239,15 +317,20 @@ fn build_listener_runtime(
                 config.client.peer_share_bind_address
             )
         })?;
+    let advertise_ip = resolve_advertise_ip(config, &enumerate_interfaces(), bind_addr)?;
+    let listener_bind_addr = match bind_addr.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => SocketAddr::new(advertise_ip, bind_addr.port()),
+        IpAddr::V6(ip) if ip.is_unspecified() => SocketAddr::new(advertise_ip, bind_addr.port()),
+        _ => bind_addr,
+    };
     let endpoint = quinn::Endpoint::new(
         Default::default(),
         Some(build_peer_server_config(cert_der, key_der)),
-        bind_peer_listener_socket(bind_addr, config.socket_protect.as_ref())?,
+        bind_peer_listener_socket(listener_bind_addr, config.socket_protect.as_ref())?,
         Arc::new(quinn::TokioRuntime),
     )
-    .map_err(|err| anyhow::anyhow!("failed to bind peer-share listener on {bind_addr}: {err}"))?;
+    .map_err(|err| anyhow::anyhow!("failed to bind peer-share listener on {listener_bind_addr}: {err}"))?;
     let listen_addr = endpoint.local_addr()?;
-    let advertise_ip = resolve_advertise_ip(config, &enumerate_interfaces(), listen_addr)?;
     let endpoint_str = SocketAddr::new(advertise_ip, listen_addr.port()).to_string();
     let instance_nonce = create_auth_challenge();
     let listener_identity = PeerListenerIdentity {
@@ -285,6 +368,26 @@ fn bind_peer_listener_socket(
     }
 
     Ok(socket)
+}
+
+fn peer_relay_bind_ip(config: &ClientConfig) -> anyhow::Result<Option<IpAddr>> {
+    let bind_ip = config.client.peer_share_advertise_ip.trim();
+    if bind_ip.is_empty() {
+        return Ok(None);
+    }
+
+    bind_ip.parse().with_context(|| {
+        format!(
+            "invalid peer_share_advertise_ip for peer relay dial: {}",
+            config.client.peer_share_advertise_ip
+        )
+    }).map(Some)
+}
+
+fn emit_peer_share_event(logger: Option<&PeerShareEventLogger>, message: String) {
+    if let Some(logger) = logger {
+        logger(message);
+    }
 }
 
 async fn request_peer_share_introduction(

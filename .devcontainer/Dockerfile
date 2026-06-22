@@ -63,6 +63,8 @@ RUN dpkg --add-architecture amd64 \
     && apt-get -y install --no-install-recommends \
     curl \
     git \
+    nodejs \
+    npm \
     unzip \
     xz-utils \
     zip \
@@ -75,13 +77,21 @@ RUN dpkg --add-architecture amd64 \
     && apt-get clean -y \
     && rm -rf /var/lib/apt/lists/*
 
+RUN npm install -g opencode-ai
+
 # Create a non-root user
 RUN groupadd --gid ${USER_GID} ${USERNAME} \
     && useradd --uid ${USER_UID} --gid ${USER_GID} -m ${USERNAME} \
     && echo ${USERNAME} ALL=\(root\) NOPASSWD:ALL > /etc/sudoers.d/${USERNAME} \
     && chmod 0440 /etc/sudoers.d/${USERNAME}
 
+RUN chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}
+
 USER ${USERNAME}
+
+# Setup vscode
+RUN mkdir -p /home/${USERNAME}/.vscode-server/extensions && \
+    mkdir -p /home/${USERNAME}/.vscode-server-insiders/extensions
 
 # Copy SDKs from the builder stage to the user's home directory
 COPY --from=builder --chown=${USERNAME}:${USERNAME} /android-sdk ${ANDROID_SDK_ROOT}

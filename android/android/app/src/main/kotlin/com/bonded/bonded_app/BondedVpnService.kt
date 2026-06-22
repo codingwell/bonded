@@ -7,12 +7,14 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.VpnService
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import androidx.annotation.Keep
 import androidx.core.app.NotificationCompat
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.net.DatagramSocket
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.util.ArrayDeque
@@ -40,6 +42,7 @@ class BondedVpnService : VpnService() {
     private var inboundDrainThread: Thread? = null
     private var sessionMonitorThread: Thread? = null
     private var networkPathManager: AndroidNetworkPathManager? = null
+    private var multicastLock: WifiManager.MulticastLock? = null
     private var activeDeviceId: String? = null
 
     @Volatile private var packetIoRunning = false
@@ -71,6 +74,11 @@ class BondedVpnService : VpnService() {
 
     @Volatile private var shutdownInProgress = false
 
+    override fun onCreate() {
+        super.onCreate()
+        activeInstance = this
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
             android.util.Log.i("BondedVPN", "Received ACTION_STOP; shutting down VPN now")
@@ -96,7 +104,7 @@ class BondedVpnService : VpnService() {
         }
 
         backgroundRunning = runInBackground
-        if (backgroundRunning) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             ensureNotificationChannel()
             val notification = buildForegroundNotification()
             try {
@@ -125,6 +133,9 @@ class BondedVpnService : VpnService() {
         sessionStartupInProgress = true
         val pathManager = ensureNetworkPathManager()
         val networkPathCount = pathManager.start()
+        val bindAddresses = pathManager.activeBindAddresses()
+        setActiveNetworkBindings(bindAddresses, pathManager.activePathSummaries())
+        acquireMulticastLockIfNeeded()
 
         if (vpnInterface == null) {
             try {
@@ -177,8 +188,7 @@ class BondedVpnService : VpnService() {
             }
         }
 
-        if (!startNativeSession(pairedServer, networkPathCount, pathManager.activeBindAddresses())
-        ) {
+        if (!startNativeSession(pairedServer, networkPathCount, bindAddresses)) {
             sessionStartupInProgress = false
             emitEvent("error", "Failed to start native VPN session")
             stopSelf()
@@ -201,6 +211,9 @@ class BondedVpnService : VpnService() {
     }
 
     override fun onDestroy() {
+        if (activeInstance === this) {
+            activeInstance = null
+        }
         shutdownVpnNow()
         super.onDestroy()
     }
@@ -222,6 +235,7 @@ class BondedVpnService : VpnService() {
         lastRecoveryAttemptMs = 0L
         synchronized(pendingOutboundLock) { pendingOutboundPackets.clear() }
         cachedServerAddress = null
+        releaseMulticastLock()
         stopNativeSession()
         try {
             vpnInterface?.close()
@@ -261,6 +275,36 @@ class BondedVpnService : VpnService() {
                 .setSmallIcon(R.mipmap.ic_launcher)
                 .setOngoing(true)
                 .build()
+    }
+
+    private fun acquireMulticastLockIfNeeded() {
+        if (multicastLock?.isHeld == true) {
+            return
+        }
+
+        try {
+            val wifiManager = applicationContext.getSystemService(WIFI_SERVICE) as? WifiManager
+            val lock = wifiManager?.createMulticastLock("bonded:peer-share") ?: return
+            lock.setReferenceCounted(false)
+            lock.acquire()
+            multicastLock = lock
+            android.util.Log.i("BondedVPN", "Acquired Wi-Fi multicast lock for peer discovery")
+        } catch (e: Exception) {
+            android.util.Log.w("BondedVPN", "Failed to acquire multicast lock: ${e.message}")
+        }
+    }
+
+    private fun releaseMulticastLock() {
+        val lock = multicastLock ?: return
+        try {
+            if (lock.isHeld) {
+                lock.release()
+                android.util.Log.i("BondedVPN", "Released Wi-Fi multicast lock")
+            }
+        } catch (e: Exception) {
+            android.util.Log.w("BondedVPN", "Failed to release multicast lock: ${e.message}")
+        }
+        multicastLock = null
     }
 
     private fun startPacketIoLoopIfNeeded() {
@@ -808,8 +852,15 @@ class BondedVpnService : VpnService() {
     private fun ensureNetworkPathManager(): AndroidNetworkPathManager {
         return networkPathManager
                 ?: AndroidNetworkPathManager(this) { count ->
+                val manager = networkPathManager
+                val bindAddresses = manager?.activeBindAddresses().orEmpty()
+                val summaries = manager?.activePathSummaries().orEmpty()
                     setActiveNetworkPathCount(count)
-                    emitEvent("network_paths", "Active network paths: $count")
+                setActiveNetworkBindings(bindAddresses, summaries)
+                emitEvent(
+                    "network_paths",
+                    "Active network paths: $count, bindAddresses=${JSONArray(bindAddresses).toString()}, summaries=${JSONArray(summaries).toString()}"
+                )
                     handleNetworkPathChange(count)
                 }
                         .also { manager -> networkPathManager = manager }
@@ -827,6 +878,8 @@ class BondedVpnService : VpnService() {
         val deviceId = activeDeviceId ?: return
         val manager = networkPathManager ?: return
         val bindAddresses = manager.activeBindAddresses()
+        val pathSummaries = manager.activePathSummaries()
+        setActiveNetworkBindings(bindAddresses, pathSummaries)
         val bindingSignature = JSONArray(bindAddresses).toString()
         if (bindingSignature == lastNetworkBindingSignature) {
             return
@@ -844,7 +897,7 @@ class BondedVpnService : VpnService() {
             if (startNativeSession(server, count, bindAddresses)) {
                 emitEvent(
                         "network_paths",
-                        "Rebound VPN session across ${bindAddresses.size.coerceAtLeast(count)} network path(s)"
+                        "Rebound VPN session across ${bindAddresses.size.coerceAtLeast(count)} network path(s); bindAddresses=${JSONArray(bindAddresses).toString()}, summaries=${JSONArray(pathSummaries).toString()}"
                 )
             } else {
                 emitEvent("error", "Failed to rebind VPN session after network change")
@@ -868,6 +921,26 @@ class BondedVpnService : VpnService() {
             protected
         } catch (e: Exception) {
             android.util.Log.e("BondedVPN", "protect(fd=$fd) threw ${e.message}", e)
+            false
+        }
+    }
+
+    @Keep
+    fun bindSocketToNetworkForNative(fd: Int, bindAddress: String): Boolean {
+        val manager = networkPathManager ?: return false
+        return try {
+            val bound = manager.bindSocketToTrackedNetwork(fd, bindAddress)
+            android.util.Log.i(
+                "BondedVPN",
+                "bindSocketToNetworkForNative(fd=$fd, bindAddress=$bindAddress) returned $bound"
+            )
+            bound
+        } catch (e: Exception) {
+            android.util.Log.e(
+                "BondedVPN",
+                "bindSocketToNetworkForNative(fd=$fd, bindAddress=$bindAddress) threw ${e.message}",
+                e
+            )
             false
         }
     }
@@ -900,11 +973,17 @@ class BondedVpnService : VpnService() {
 
         @Volatile private var backgroundRunning = false
 
+        @Volatile private var activeInstance: BondedVpnService? = null
+
         @Volatile private var statusListener: ((String, String?) -> Unit)? = null
 
         @Volatile private var lastSessionSnapshot: SessionSnapshot? = null
 
         @Volatile private var activeNetworkPathCount: Int = 1
+
+        @Volatile private var activeNetworkBindAddresses: List<String> = emptyList()
+
+        @Volatile private var activeNetworkPathSummaries: List<String> = emptyList()
 
         fun start(context: Context, deviceId: String, runInBackground: Boolean = false) {
             val intent =
@@ -913,7 +992,7 @@ class BondedVpnService : VpnService() {
                             .putExtra(EXTRA_DEVICE_ID, deviceId)
                             .putExtra(EXTRA_RUN_IN_BACKGROUND, runInBackground)
 
-            if (runInBackground && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent)
             } else {
                 context.startService(intent)
@@ -934,6 +1013,18 @@ class BondedVpnService : VpnService() {
 
         fun isBackgroundRunning(): Boolean = running && backgroundRunning
 
+        fun protectDatagramSocketForDebug(socket: DatagramSocket): Boolean {
+            val service = activeInstance ?: return false
+            return try {
+                val protected = service.protect(socket)
+                android.util.Log.i("BondedVPN", "protect(datagramSocket) returned $protected")
+                protected
+            } catch (e: Exception) {
+                android.util.Log.e("BondedVPN", "protect(datagramSocket) threw ${e.message}", e)
+                false
+            }
+        }
+
         fun getSessionSnapshot(): Map<String, Any?>? {
             val snapshot = lastSessionSnapshot ?: return null
             return mapOf(
@@ -949,6 +1040,8 @@ class BondedVpnService : VpnService() {
                     "connectedAtMs" to snapshot.connectedAtMs,
                     "lastError" to snapshot.lastError,
                     "networkPathCount" to activeNetworkPathCount,
+                    "networkBindAddresses" to activeNetworkBindAddresses,
+                    "networkPathSummaries" to activeNetworkPathSummaries,
             )
         }
 
@@ -962,6 +1055,11 @@ class BondedVpnService : VpnService() {
 
         private fun setActiveNetworkPathCount(count: Int) {
             activeNetworkPathCount = count
+        }
+
+        private fun setActiveNetworkBindings(bindAddresses: List<String>, summaries: List<String>) {
+            activeNetworkBindAddresses = bindAddresses
+            activeNetworkPathSummaries = summaries
         }
 
         private fun emitEvent(type: String, message: String?) {

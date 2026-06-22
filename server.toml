@@ -1,0 +1,31 @@
+[server]
+hostname = "localhost"
+https_bind = "0.0.0.0:443"
+https_public = 443
+
+# TLS certificate files (auto-generated self-signed if not present)
+tls_cert_file = "/tmp/bonded-server.crt"
+tls_key_file = "/tmp/bonded-server.key"
+
+# Optional: WireGuard for multi-transport testing
+wireguard_bind = "0.0.0.0:51820"
+wireguard_public = 51820
+wireguard_key_file = "/tmp/bonded-server-wg.key"
+wireguard_peers_file = "/tmp/wg-peers.toml"
+
+# Optional: Debug NaiveTCP for unencrypted testing
+tcp_bind = "0.0.0.0:8000"
+tcp_public = 8000
+
+status_bind = "0.0.0.0:8082"
+health_bind = "0.0.0.0:8081"
+log_level = "info"
+
+forwarding_mode = "proxy"
+tun_name = "bonded0"
+tun_cidr = "100.64.0.1/24"
+tun_mtu = 1420
+
+authorized_keys_file = "/tmp/auth.toml"
+invite_tokens_file = "/tmp/tokens.toml"
+identity_key_file = "/tmp/server-identity.pem"
