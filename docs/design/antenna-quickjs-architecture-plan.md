@@ -64,8 +64,8 @@
 ## Phase 6: 918 MHz directional templates (4–6 days)
 - Ship starter scripts:
   - `patch_918_petg.js`
-  - `yagi_918.js`
-  - `patch_parasitic_918.js`
+  - `yagi_918_directional.js`
+  - `patch_parasitic_918_petg.js`
 - Each template includes:
   - parameter schema
   - default sweep band (e.g., 850–980 MHz)
@@ -75,7 +75,7 @@
 - Generic sweep runner powered by schema:
   - single param, grid, random
 - Objective DSL:
-  - maximize `gain@918`
+  - maximize `gain@918MHz [dBi]`
   - constrain `S11(918) < -10 dB`
   - optional band constraints (902–928 MHz)
 - Save run history, best candidate, and param provenance.
@@ -117,7 +117,7 @@
 - `packages/mesh-bridge` (IR→Gmsh)
 - `packages/solver-client` (FEM job interface)
 - `apps/web` (UI: editor, params, plots, runs)
-- `examples/` (918 MHz templates)
+- `examples/` (top-level template scripts for quick discovery and copy/use)
 
 ---
 
