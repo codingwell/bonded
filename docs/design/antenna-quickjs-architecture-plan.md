@@ -2,6 +2,7 @@
 
 ## Phase 0: Define scope (1–2 days)
 - Target: **918 MHz directional antenna design workflow**
+- Note: **918 MHz is the explicit design target** within the broader 902–928 MHz ISM band.
 - v1 capabilities:
   - QuickJS-WASM parametric geometry
   - FEM-ready IR export
